@@ -1,0 +1,5 @@
+# Extra high-impact US releases, UTC, one per line: YYYY-MM-DD HH:MM  name
+# NFP (first Friday) is added automatically; use --no-nfp to turn that off.
+# Fill these from the month's economic calendar (ForexFactory / Investing.com), times in UTC.
+2026-10-14 12:30  CPI (example - verify date)
+2026-10-28 18:00  FOMC statement (example - verify date)

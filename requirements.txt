@@ -1,0 +1,8 @@
+pandas
+numpy
+matplotlib
+requests
+pyfiglet
+discord.py
+python_dotenv
+MetaTrader5 ; platform_system == "Windows"

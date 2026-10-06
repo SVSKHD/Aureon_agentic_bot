@@ -1,0 +1,18 @@
+# runtime output — never commit
+logs/
+out/
+*.log
+guardian_state.json
+# secrets
+.env
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+# editors / os
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
