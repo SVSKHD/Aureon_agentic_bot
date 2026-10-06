@@ -18,7 +18,7 @@ import numpy as np
 from . import broker, telemetry
 from .config import Config
 from .journal import Journal
-from .notify import Notifier
+from .notify import Notifier, signal_fields, position_fields, field, EVENT_COLOURS
 from .strategies import Strategy
 from .common.source import Bars
 from .common.timeutil import IST, bar_key, ist_str as ist
@@ -43,8 +43,9 @@ class SymbolAgent(threading.Thread):
         self._stop = threading.Event()
         for t, st in list(self.state.items()):
             if st.get("mode") and st["mode"] != strategy.name:
-                notify.raw(f"⚠️ **MODE MISMATCH** · {symbol} #{t} was managed by {st['mode']} · runtime mode {strategy.name} · "
-                           f"guardian will only keep the existing SL (never loosened); no cross-strategy rules applied")
+                notify.card(f"⚠️ MODE MISMATCH — {symbol}", "Guardian keeps the existing SL (never loosened); no cross-strategy rules applied.",
+                            fields=[field("Ticket", f"#{t}"), field("Managed by", st["mode"]), field("Runtime mode", strategy.name)],
+                            color=EVENT_COLOURS["flip"], footer=f"{strategy.display_name} · {symbol}")
                 st["frozen"] = True
 
     def stop(self): self._stop.set()
@@ -64,11 +65,11 @@ class SymbolAgent(threading.Thread):
                     self.health["status"] = "market closed"
                     if not announced_closed:
                         announced_closed = True
-                        self.notify.send(self.key("MARKET", f"closed-{datetime.now(IST):%Y-%m-%d}"), f"⏸ {self.symbol} market closed", ["agent sleeping"])
+                        self.notify.send(self.key("MARKET", f"closed-{datetime.now(IST):%Y-%m-%d}"), f"⏸ {self.symbol} market closed", ["agent sleeping"], color=EVENT_COLOURS["market"], footer=f"{self.S.display_name} · {self.symbol}")
                     _time.sleep(30); continue
                 if announced_closed:
                     announced_closed = False
-                    self.notify.send(self.key("MARKET", f"open-{datetime.now(IST):%Y-%m-%d-%H}"), f"▶ {self.symbol} market open", ["Aureon resumed"])
+                    self.notify.send(self.key("MARKET", f"open-{datetime.now(IST):%Y-%m-%d-%H}"), f"▶ {self.symbol} market open", ["Aureon resumed"], color=EVENT_COLOURS["secured"], footer=f"{self.S.display_name} · {self.symbol}")
                 self.health["status"] = "running"
                 m5 = broker.bars(self.symbol, self.cfg.bars, self.cfg.source, self.off)
                 closed = m5.df[m5.df["time"] + 300 <= broker.now_server(self.off)].reset_index(drop=True)
@@ -107,12 +108,14 @@ class SymbolAgent(threading.Thread):
             self.health["last_signal"] = f"{side} {kind} @ {ist(bar_t, self.off)}"
             self.journal.log("signal", symbol=self.symbol, mode=self.S.name, side=side, signal_kind=kind, price=close, bar=bar_t)
             g = self.g
-            lines = [f"**{side} {kind.upper()}** · {ist(bar_t, self.off)} IST · price **{close:.2f}** · EMA{self.S.fast} {ef:.2f} · EMA{self.S.slow} {es:.2f}"]
-            if g:
-                lines.append(f"stop {close - s * g.pre_stop:.2f} until the lines cross, then EMA {self.S.slow} · secure at {close + s * g.secure_at:.2f} (+{g.secure_at:g}) — place it, I manage it")
-            else:
-                lines.append("signal only — no guardian profile for this mode/symbol")
-            self.notify.send(self.key(f"{kind.upper()}_{side}", bar_key(bar_t, self.off)), f"🔫 {self.symbol} · {self.S.display_name}", lines)
+            fields = signal_fields(side=side, kind={"P": "P · pre-cross", "cross": "50/80 cross confirmed", "late": "late entry", "pullback": "pullback entry"}.get(kind, kind),
+                                   price=close, ema_fast=ef, ema_slow=es, fast=self.S.fast, slow=self.S.slow,
+                                   stop=(close - s * g.pre_stop) if g else None, secure_at=(close + s * g.secure_at) if g else None,
+                                   bar_ist=ist(bar_t, self.off))
+            note = "place it — I manage it" if g else "signal only — no guardian profile for this mode/symbol"
+            self.notify.send(self.key(f"{kind.upper()}_{side}", bar_key(bar_t, self.off)), f"🔫 {self.symbol} {side} · {self.S.display_name}", [note],
+                             fields=fields, color=EVENT_COLOURS["signal_long" if side == "LONG" else "signal_short"],
+                             footer=f"{self.S.display_name} · {self.symbol} · {kind}")
 
     # ------------------------------------------------------------------ guardian helpers
     def _locked(self, p: dict) -> float:
@@ -144,7 +147,10 @@ class SymbolAgent(threading.Thread):
         self.journal.log("exit", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], points=p["points"],
                          reason=journal_reason or reason, auto=bool(r.ok))
         if r.ok:
-            self.notify.send(key, title, [f"{reason} · result {p['points']:+.2f} · peak +{st['peak']:.2f}"])
+            self.notify.send(key, title, [reason],
+                             fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"],
+                                                    points=p["points"], secured=st.get("secured"), peak=st["peak"]),
+                             color=EVENT_COLOURS["closed_win" if p["points"] > 0 else "closed_loss"], footer=f"{self.S.display_name} · {self.symbol}")
         else:
             telemetry.failure(self.notify, self.journal, title="AUREON GUARDIAN FAILURE", key=self.key("ERROR", f"close-{p['ticket']}-{r.retcode}"),
                               mode=self.S.name, symbol=self.symbol, ticket=p["ticket"], action=f"CLOSE ({reason})", bid=r.bid, ask=r.ask,
@@ -180,7 +186,9 @@ class SymbolAgent(threading.Thread):
                 sl = p["price_open"] - s * g.pre_stop
                 if self._move_sl(p, sl, "PROTECT"):
                     self.journal.log("protected", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], sl=sl)
-                    self.notify.send(self.key("PROTECTED", p["ticket"]), f"🛡 PROTECTED — {tag}", [f"initial SL {sl:.2f} (−{g.pre_stop:g})"])
+                    self.notify.send(self.key("PROTECTED", p["ticket"]), f"🛡 PROTECTED — {self.symbol}", [f"initial stop −{g.pre_stop:g}"],
+                                     fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"], points=p["points"], sl=sl),
+                                     color=EVENT_COLOURS["protected"], footer=f"{self.S.display_name} · {self.symbol}")
 
             # 1) opposite P → close (flip). The replacement trade is yours to place.
             if sig and not sig["consumed"] and sig["kind"] == "P" and sig["bar_time"] == bar_t and sig["direction"] != p["direction"].upper():
@@ -194,8 +202,11 @@ class SymbolAgent(threading.Thread):
                 sl = es - s * g.ema_slow_sl_buffer
                 ok = self._move_sl(p, sl, "CROSS SL")
                 self.journal.log("cross_confirmed", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], sl=sl, ok=ok)
-                self.notify.send(self.key("CROSS", p["ticket"]), f"✅ CROSS CONFIRMED — {tag}",
-                                 [f"{self.S.fast} crossed {'above' if s > 0 else 'below'} {self.S.slow} · {p['points']:+.2f} · SL → EMA {self.S.slow} {sl:.2f}" + ("" if ok else " (SL move pending — see failure alert)")])
+                self.notify.send(self.key("CROSS", p["ticket"]), f"✅ CROSS CONFIRMED — {self.symbol}",
+                                 [f"EMA {self.S.fast} crossed {'above' if s > 0 else 'below'} EMA {self.S.slow}" + ("" if ok else " · SL move pending — see failure alert")],
+                                 fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"], points=p["points"], sl=sl,
+                                                        extra={"Next": f"secure at {p['price_open'] + s * g.secure_at:.2f} (+{g.secure_at:g})"}),
+                                 color=EVENT_COLOURS["cross"], footer=f"{self.S.display_name} · {self.symbol}")
             elif not st["pre"] and st["secured"] < g.secure_level and new_bar:
                 self._move_sl(p, es - s * g.ema_slow_sl_buffer, "FOLLOW EMA80", quiet=True)   # same safe path: retcode, telemetry, never-loosen
 
@@ -205,8 +216,9 @@ class SymbolAgent(threading.Thread):
                 if self._move_sl(p, sl, f"SECURE +{g.secure_level:g}"):
                     st["secured"] = g.secure_level                                             # 1. state
                     self.journal.log("secured", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], level=g.secure_level, step=g.secure_level, price=p["current"])  # 2. journal
-                    self.notify.send(self.key("SECURED", f"{p['ticket']}-{g.secure_level:g}"), f"🔒 SECURED +{g.secure_level:g} — {tag}",       # 3. discord
-                                     [f"now {p['current']:.2f} ({p['points']:+.2f}) · SL → {sl:.2f} · riding"])
+                    self.notify.send(self.key("SECURED", f"{p['ticket']}-{g.secure_level:g}"), f"🔒 SECURED +{g.secure_level:g} — {self.symbol}", ["riding — lock steps up every +" + f"{g.ride_step:g}"],
+                                     fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"], points=p["points"], sl=sl, secured=g.secure_level, peak=st["peak"]),
+                                     color=EVENT_COLOURS["secured"], footer=f"{self.S.display_name} · {self.symbol}")
             # 4) ride
             elif st["secured"] >= g.secure_level:
                 nxt = st["secured"] + g.ride_step
@@ -215,8 +227,9 @@ class SymbolAgent(threading.Thread):
                     if self._move_sl(p, sl, f"RIDE +{nxt:g}"):
                         st["secured"] = nxt
                         self.journal.log("secured", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], level=nxt, step=g.ride_step, price=p["current"])
-                        self.notify.send(self.key("SECURED", f"{p['ticket']}-{nxt:g}"), f"🔒 SECURED +{nxt:g} — {tag}",
-                                         [f"now {p['current']:.2f} ({p['points']:+.2f}) · SL → {sl:.2f} · peak +{st['peak']:.2f}"])
+                        self.notify.send(self.key("SECURED", f"{p['ticket']}-{nxt:g}"), f"🔒 SECURED +{nxt:g} — {self.symbol}", [],
+                                         fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"], points=p["points"], sl=sl, secured=nxt, peak=st["peak"]),
+                                         color=EVENT_COLOURS["secured"], footer=f"{self.S.display_name} · {self.symbol}")
 
             # 5) exits on bar close
             if new_bar:
@@ -246,7 +259,9 @@ class SymbolAgent(threading.Thread):
                     self._close(p, "news in <15 min", f"📰 BANKED before news — {tag}", self.key("NEWS", p["ticket"]), st, "news_flat", bar_t)
                 elif st["secured"] == 0:
                     if self._move_sl(p, p["price_open"] - s * g.pre_stop, "NEWS CAP"):
-                        self.notify.send(self.key("NEWS", p["ticket"]), f"📰 NEWS <{g.news_flat_min} min — {tag}", [f"{p['points']:+.2f} · loss capped at −{g.pre_stop:g}"])
+                        self.notify.send(self.key("NEWS", p["ticket"]), f"📰 NEWS in <{g.news_flat_min} min — {self.symbol}", [f"loss capped at −{g.pre_stop:g}"],
+                                         fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"], points=p["points"], sl=p["price_open"] - s * g.pre_stop),
+                                         color=EVENT_COLOURS["news"], footer=f"{self.S.display_name} · {self.symbol}")
         if sig and not sig["consumed"] and sig["bar_time"] == bar_t:
             sig["consumed"] = True                       # nothing to flip; signal spent
         self.journal.save_state(self.symbol, self.state)
