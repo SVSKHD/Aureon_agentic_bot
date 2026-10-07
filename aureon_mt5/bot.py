@@ -173,9 +173,103 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float):
     def as_embed(card: dict):
         return discord.Embed.from_dict(card)
 
+    pending: dict[str, dict] = {}          # last asks by key, for /take /skip without buttons
+
+    def _ask_embed(item):
+        em = discord.Embed(title=item["title"][:256], description=item["description"][:4096], color=item.get("color") or BLUE,
+                           timestamp=datetime.now(timezone.utc))
+        for f in item.get("fields") or []:
+            em.add_field(name=str(f["name"])[:256], value=str(f["value"])[:1024], inline=bool(f.get("inline", True)))
+        em.set_footer(text=(item.get("footer") or "Aureon MT5")[:2048])
+        return em
+
+    def _decide(item, decision, user):
+        m = item.get("meta", {})
+        journal.log("decision", symbol=m.get("symbol"), mode=m.get("mode"), side=m.get("side"), signal_kind=m.get("kind"),
+                    price=m.get("price"), bar=m.get("bar"), decision=decision, by=str(user))
+        item["decided"] = decision
+
+    class AskView(discord.ui.View):
+        def __init__(self, item):
+            super().__init__(timeout=cfg.ask_ttl_min * 60); self.item = item
+
+        async def _answer(self, inter, decision):
+            if self.item.get("decided"):
+                await inter.response.send_message(f"already answered: {self.item['decided']}", ephemeral=True); return
+            _decide(self.item, decision, inter.user)
+            for c in self.children: c.disabled = True
+            em = _ask_embed(self.item)
+            m = self.item.get("meta", {})
+            if decision == "TAKE":
+                em.add_field(name="Decision", value=f"✅ **TAKING {m.get('side')}** · {inter.user.display_name} · {datetime.now(IST):%H:%M} IST — "
+                                                    f"place it in MT5; I'll start managing the moment the ticket appears", inline=False)
+                em.color = GREEN
+            else:
+                em.add_field(name="Decision", value=f"⏭ skipped · {inter.user.display_name} · {datetime.now(IST):%H:%M} IST", inline=False)
+                em.color = GREY
+            await inter.response.edit_message(embed=em, view=self)
+
+        @discord.ui.button(label="TAKE", style=discord.ButtonStyle.success, emoji="✅")
+        async def take(self, inter, button): await self._answer(inter, "TAKE")
+
+        @discord.ui.button(label="SKIP", style=discord.ButtonStyle.secondary, emoji="⏭")
+        async def skip(self, inter, button): await self._answer(inter, "SKIP")
+
+        async def on_timeout(self):
+            if not self.item.get("decided"):
+                _decide(self.item, "EXPIRED", "timeout")
+                for c in self.children: c.disabled = True
+                try:
+                    em = _ask_embed(self.item); em.color = GREY
+                    em.add_field(name="Decision", value=f"⌛ expired after {cfg.ask_ttl_min} min", inline=False)
+                    await self.item["message"].edit(embed=em, view=self)
+                except Exception:
+                    pass
+
+    async def _ask_pump():
+        await client.wait_until_ready()
+        ch = client.get_channel(cfg.channel_id) if cfg.channel_id else None
+        if ch is None:
+            print("DISCORD_CHANNEL not set or not visible — asks fall back to webhook cards"); notify.bot_ready = False; return
+        notify.bot_ready = True
+        while not client.is_closed():
+            try:
+                item = await asyncio.to_thread(notify.ask_queue.get, True, 2.0)
+            except Exception:
+                continue
+            try:
+                em = _ask_embed(item); view = AskView(item); files = []
+                if item.get("png") and os.path.exists(item["png"]):
+                    fname = os.path.basename(item["png"]); em.set_image(url=f"attachment://{fname}"); files = [discord.File(item["png"], filename=fname)]
+                msg = await ch.send(embed=em, view=view, files=files)
+                item["message"] = msg; pending[item["key"]] = item
+                while len(pending) > 50: pending.pop(next(iter(pending)))
+            except Exception as e:
+                print("  (ask post failed:", e, ") — falling back to webhook")
+                notify.sent.discard(item["key"]); notify.bot_ready = False
+                notify.send(item["key"], item["title"], [item["description"]], item.get("png"), fields=item.get("fields"), color=item.get("color"), footer=item.get("footer"))
+                notify.bot_ready = True
+
+    @tree.command(name="take", description="Take the latest open trade question")
+    async def take_cmd(inter: discord.Interaction):
+        item = next((i for i in reversed(list(pending.values())) if not i.get("decided")), None)
+        if not item:
+            await inter.response.send_message("no open trade question"); return
+        _decide(item, "TAKE", inter.user)
+        await inter.response.send_message(f"✅ taking **{item['meta'].get('side')}** {item['meta'].get('symbol')} — place it in MT5, I manage it from there")
+
+    @tree.command(name="skip", description="Skip the latest open trade question")
+    async def skip_cmd(inter: discord.Interaction):
+        item = next((i for i in reversed(list(pending.values())) if not i.get("decided")), None)
+        if not item:
+            await inter.response.send_message("no open trade question"); return
+        _decide(item, "SKIP", inter.user)
+        await inter.response.send_message(f"⏭ skipped {item['meta'].get('side')} {item['meta'].get('symbol')}")
+
     @client.event
     async def on_ready():
-        await tree.sync(); print(f"discord bot ready as {client.user}")
+        await tree.sync()
+        client.loop.create_task(_ask_pump()); print(f"discord bot ready as {client.user}")
 
     @tree.command(name="status", description="Aureon status for the primary symbol")
     async def status(inter: discord.Interaction):

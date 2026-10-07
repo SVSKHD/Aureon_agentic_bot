@@ -24,6 +24,7 @@ from .common.source import Bars
 from .common.timeutil import IST, bar_key, ist_str as ist
 from .common.news import session_of
 from .common.context_chart import context_chart
+from .strategies.ema5080.trend import find_reentries, state_of
 import os
 import numpy as np
 
@@ -45,6 +46,11 @@ class SymbolAgent(threading.Thread):
         self.leg: dict | None = None      # the move since the last P / cross signal (progress updates)
         self.MOVE_STEP = 10.0 if not symbol.upper().startswith("XAG") else 0.15   # progress card every +step of move
         self.SNAPSHOT_BARS = 6            # open-position snapshot every 6 closed bars (30 min)
+        self.trend_state: str | None = None
+        self.last_trend_note: dict = {}   # state -> bar_time of last card (6-bar cooldown per state)
+        self.last_session: str | None = None
+        self.session_open: dict | None = None
+        self.seen_re: set = set()
         self.chart_dir = os.path.join(cfg.log_dir, "charts")
         self.last_df = None               # last closed-bar frame with EMAs (for /chart)
         self.health = {"status": "starting", "last_bar": None, "last_poll": None, "errors": 0, "managed": 0,
@@ -102,6 +108,9 @@ class SymbolAgent(threading.Thread):
                             telemetry.failure(self.notify, self.journal, title="AUREON CATCH-UP ERROR", key=self.key("ERROR", "catchup"),
                                               mode=self.S.name, symbol=self.symbol, action="catch-up", exc=e)
                     self._detect(closed, df, bar_t, close, ef, es)
+                    if self.S.name == "ema5080":
+                        self._trend_and_reentry(df, bar_t, close, ef, es)
+                    self._session(df, bar_t, close, ef, es)
                 self._track_leg(df, bar_t, new_bar, sgn)
                 if self.g is not None:
                     self._guard(new_bar, bar_t, df, close, ef, es, sgn)
@@ -202,6 +211,90 @@ class SymbolAgent(threading.Thread):
                          [f"{sum(not lg['before_day'] for lg in legs)} cross(es) since 00:00 IST · available move today **{total:+.1f}** · "
                           f"shaded on the chart: cross → peak of each leg"],
                          png2, fields=fields, color=EVENT_COLOURS["info"], footer=cfooter(self.S.display_name, "late-start catch-up"))
+
+    # ------------------------------------------------------------------ trend states + re-entries (ema5080)
+    def _trend_and_reentry(self, df, bar_t, close, ef, es):
+        g = self.g
+        st = state_of(close, ef, es)
+        prev = self.trend_state; self.trend_state = st
+        self.health["trend"] = st
+        if prev and st != prev and prev.split(" ·")[0] == st.split(" ·")[0]:        # sub-state change inside the same trend
+            last = self.last_trend_note.get(st, -10**12)
+            if bar_t - last >= 6 * 300:
+                self.last_trend_note[st] = bar_t
+                bear = st.startswith("BEARISH")
+                if st.endswith("PULLBACK"):
+                    text = f"price back between EMA {self.S.fast} and EMA {self.S.slow} — **watch for a re-entry {'SHORT' if bear else 'LONG'}**"
+                    colour = EVENT_COLOURS["news"]
+                elif st.endswith("CHALLENGED"):
+                    text = (f"price closed {'above' if bear else 'below'} EMA {self.S.slow} — {'bearish' if bear else 'bullish'} trend at risk, "
+                            f"**{'bullish' if bear else 'bearish'} turn forming** (needs the 50/80 cross)")
+                    colour = EVENT_COLOURS["signal_long" if bear else "signal_short"]
+                else:
+                    text = f"price back {'below' if bear else 'above'} EMA {self.S.fast} — trend resumed"
+                    colour = EVENT_COLOURS["signal_short" if bear else "signal_long"]
+                self.notify.send(self.key("TREND", f"{st}-{bar_key(bar_t, self.off)}"), ctitle(self.symbol, f"TREND · {st}"), [text],
+                                 fields=[field("Price", f"**{close:.2f}**"), field(f"EMA {self.S.fast}", f"{ef:.2f}"), field(f"EMA {self.S.slow}", f"{es:.2f}"),
+                                         field("Was", prev), field("Bar", f"{ist(bar_t, self.off)} IST")],
+                                 color=colour, footer=cfooter(self.S.display_name, "trend"))
+        elif prev and prev.split(" ·")[0] != st.split(" ·")[0]:
+            self.notify.send(self.key("TREND", f"flip-{bar_key(bar_t, self.off)}"), ctitle(self.symbol, f"TREND FLIPPED · {st.split(' ·')[0]}"),
+                             [f"EMA {self.S.fast} crossed {'above' if st.startswith('BULLISH') else 'below'} EMA {self.S.slow} — new trend"],
+                             fields=[field("Price", f"**{close:.2f}**"), field(f"EMA {self.S.fast}", f"{ef:.2f}"), field(f"EMA {self.S.slow}", f"{es:.2f}")],
+                             color=EVENT_COLOURS["signal_long" if st.startswith("BULLISH") else "signal_short"], footer=cfooter(self.S.display_name, "trend"))
+        # re-entry on THIS closed bar
+        res = find_reentries(df, *self.S.ema_cols)
+        if res and res[-1].index == len(df) - 1 and res[-1].time not in self.seen_re:
+            r = res[-1]; self.seen_re.add(r.time)
+            s_ = 1 if r.side == "LONG" else -1
+            self.health["last_signal"] = f"{r.side} RE @ {ist(bar_t, self.off)}"
+            self.journal.log("signal", symbol=self.symbol, mode=self.S.name, side=r.side, signal_kind="reentry", price=r.price, bar=bar_t)
+            self.latest_signal = {"bar_time": bar_t, "symbol": self.symbol, "strategy": self.S.name, "kind": "reentry", "direction": r.side, "consumed": False}
+            if not self.leg or self.leg["side"] != r.side:
+                self.leg = {"side": r.side, "kind": "reentry", "start_t": bar_t, "start_i_time": bar_t, "start_px": r.price,
+                            "best": 0.0, "best_px": r.price, "best_t": bar_t, "against": 0.0, "steps_sent": 0}
+            stop = r.pullback_extreme - s_ * 0.5                       # just beyond the pullback extreme
+            png = context_chart(df, self.symbol, self.S.display_name, self.S.fast, self.S.slow, self.S.ema_cols, self.off, self.chart_dir,
+                                bars=120, title_extra="re-entry", reentries=[{"index": r.index, "side": r.side}],
+                                marker={"index": r.index, "side": r.side, "label": "RE", "stop": stop,
+                                        "secure": (r.price + s_ * g.secure_at) if g else None})
+            self.notify.ask(self.key(f"RE_{r.side}", bar_key(bar_t, self.off)), ctitle(self.symbol, "RE-ENTRY", r.side),
+                            [f"pullback to EMA {self.S.fast} rejected — trend continues", f"**Trade {r.side} now?**"], png=png,
+                            fields=[field("Side", f"**{r.side}**"), field("Price", f"**{r.price:.2f}**"), field("Bar", f"{ist(bar_t, self.off)} IST"),
+                                    field(f"EMA {self.S.fast}", f"{r.ema50:.2f}"), field(f"EMA {self.S.slow}", f"{r.ema80:.2f}"),
+                                    field("Pullback reached", f"{r.pullback_extreme:.2f}"),
+                                    field("Stop", f"{stop:.2f} (beyond the pullback)", inline=False)]
+                                   + ([field("Secure", f"at {r.price + s_ * g.secure_at:.2f} (+{g.secure_at:g}) → then ride", inline=False)] if g else []),
+                            color=EVENT_COLOURS["signal_long" if r.side == "LONG" else "signal_short"], footer=cfooter(self.S.display_name, "re-entry"),
+                            meta={"symbol": self.symbol, "side": r.side, "kind": "reentry", "price": r.price, "bar": bar_t, "mode": self.S.name})
+
+    # ------------------------------------------------------------------ session dividers as cards
+    def _session(self, df, bar_t, close, ef, es):
+        name = session_of(bar_t, self.off)
+        o = float(df["open"].iloc[-1]); h = float(df["high"].iloc[-1]); l = float(df["low"].iloc[-1])
+        so = self.session_open
+        if so and so["name"] == name:
+            so["high"] = max(so["high"], h); so["low"] = min(so["low"], l); so["last"] = close
+        if name == self.last_session:
+            return
+        prev, self.last_session = self.last_session, name
+        names = {"asia": "ASIA", "london": "LONDON", "ny": "NEW YORK", "off": "OFF-HOURS"}
+        label = names.get(name, name.upper())
+        fields = [field("Price", f"**{close:.2f}**"), field(f"EMA {self.S.fast}", f"{ef:.2f}"), field(f"EMA {self.S.slow}", f"{es:.2f}"),
+                  field("Trend", self.trend_state or state_of(close, ef, es), inline=False)]
+        if so and prev is not None:
+            mv = so["last"] - so["open"]
+            fields.append(field(f"{names.get(so['name'], so['name']).title()} session",
+                                f"open {so['open']:.2f} → close {so['last']:.2f} (**{mv:+.1f}**) · range {so['high'] - so['low']:.1f} "
+                                f"(H {so['high']:.2f} / L {so['low']:.2f})", inline=False))
+        self.session_open = {"name": name, "t": bar_t, "open": o, "high": h, "low": l, "last": close}
+        if prev is None:
+            return                                  # first bar after start: the start-up cards already cover it
+        png = context_chart(df, self.symbol, self.S.display_name, self.S.fast, self.S.slow, self.S.ema_cols, self.off, self.chart_dir,
+                            bars=160, title_extra=f"{label.lower()} open")
+        self.notify.send(self.key("SESSION", f"{name}-{bar_key(bar_t, self.off)}"), ctitle(self.symbol, f"{label} OPEN"),
+                         [f"session divider · {ist(bar_t, self.off)} IST"], png, fields=fields,
+                         color=EVENT_COLOURS["info"], footer=cfooter(self.S.display_name, "session"))
 
     # ------------------------------------------------------------------ move since the signal
     def _track_leg(self, df, bar_t, new_bar, sgn):
@@ -330,7 +423,8 @@ class SymbolAgent(threading.Thread):
             png = context_chart(df, self.symbol, self.S.display_name, self.S.fast, self.S.slow, self.S.ema_cols, self.off, self.chart_dir,
                                 marker={"index": last, "side": side, "label": kind.upper(),
                                         "stop": (close - s * g.pre_stop) if g else None, "secure": (close + s * g.secure_at) if g else None})
-            self.notify.send(self.key(f"{kind.upper()}_{side}", bar_key(bar_t, self.off)), ctitle(self.symbol, {"P": "P PRE-CROSS", "cross": "CONFIRMED CROSS", "late": "LATE ENTRY", "pullback": "PULLBACK ENTRY"}.get(kind, kind), side), [note], png,
+            self.notify.ask(self.key(f"{kind.upper()}_{side}", bar_key(bar_t, self.off)), ctitle(self.symbol, {"P": "P PRE-CROSS", "cross": "CONFIRMED CROSS", "late": "LATE ENTRY", "pullback": "PULLBACK ENTRY"}.get(kind, kind), side), [note, f"**Trade {side} now?**"], png=png,
+                             meta={"symbol": self.symbol, "side": side, "kind": kind, "price": close, "bar": bar_t, "mode": self.S.name},
                              fields=fields, color=EVENT_COLOURS["signal_long" if side == "LONG" else "signal_short"],
                              footer=cfooter(self.S.display_name, f"bar {ist(bar_t, self.off)}"))
 
