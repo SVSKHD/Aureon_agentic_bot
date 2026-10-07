@@ -18,10 +18,14 @@ import numpy as np
 from . import broker, telemetry
 from .config import Config
 from .journal import Journal
-from .notify import Notifier, signal_fields, position_fields, field, EVENT_COLOURS
+from .notify import Notifier, signal_fields, position_fields, field, title as ctitle, footer as cfooter, EVENT_COLOURS
 from .strategies import Strategy
 from .common.source import Bars
 from .common.timeutil import IST, bar_key, ist_str as ist
+from .common.news import session_of
+from .common.context_chart import context_chart
+import os
+import numpy as np
 
 
 class SymbolAgent(threading.Thread):
@@ -37,15 +41,18 @@ class SymbolAgent(threading.Thread):
         self.state: dict[int, dict] = journal.load_state(symbol)
         self.latest_signal: dict | None = None
         self.last_bar: int | None = None
+        self.caught_up = False            # late-start catch-up card sent once
+        self.chart_dir = os.path.join(cfg.log_dir, "charts")
+        self.last_df = None               # last closed-bar frame with EMAs (for /chart)
         self.health = {"status": "starting", "last_bar": None, "last_poll": None, "errors": 0, "managed": 0,
                        "close": None, "ema_fast": None, "ema_slow": None, "offset_h": self.off, "last_signal": None,
                        "last_broker_action": None, "guardian": "ON" if g else "OFF (no profile for this mode/symbol)"}
         self._stop = threading.Event()
         for t, st in list(self.state.items()):
             if st.get("mode") and st["mode"] != strategy.name:
-                notify.card(f"⚠️ MODE MISMATCH — {symbol}", "Guardian keeps the existing SL (never loosened); no cross-strategy rules applied.",
+                notify.card(ctitle(symbol, "MODE MISMATCH"), "Guardian keeps the existing SL (never loosened); no cross-strategy rules applied.",
                             fields=[field("Ticket", f"#{t}"), field("Managed by", st["mode"]), field("Runtime mode", strategy.name)],
-                            color=EVENT_COLOURS["flip"], footer=f"{strategy.display_name} · {symbol}")
+                            color=EVENT_COLOURS["flip"], footer=cfooter(strategy.display_name))
                 st["frozen"] = True
 
     def stop(self): self._stop.set()
@@ -65,11 +72,11 @@ class SymbolAgent(threading.Thread):
                     self.health["status"] = "market closed"
                     if not announced_closed:
                         announced_closed = True
-                        self.notify.send(self.key("MARKET", f"closed-{datetime.now(IST):%Y-%m-%d}"), f"⏸ {self.symbol} market closed", ["agent sleeping"], color=EVENT_COLOURS["market"], footer=f"{self.S.display_name} · {self.symbol}")
+                        self.notify.send(self.key("MARKET", f"closed-{datetime.now(IST):%Y-%m-%d}"), ctitle(self.symbol, "MARKET CLOSED"), ["agent sleeping"], color=EVENT_COLOURS["market"], footer=cfooter(self.S.display_name))
                     _time.sleep(30); continue
                 if announced_closed:
                     announced_closed = False
-                    self.notify.send(self.key("MARKET", f"open-{datetime.now(IST):%Y-%m-%d-%H}"), f"▶ {self.symbol} market open", ["Aureon resumed"], color=EVENT_COLOURS["secured"], footer=f"{self.S.display_name} · {self.symbol}")
+                    self.notify.send(self.key("MARKET", f"open-{datetime.now(IST):%Y-%m-%d-%H}"), ctitle(self.symbol, "MARKET OPEN"), ["Aureon resumed"], color=EVENT_COLOURS["secured"], footer=cfooter(self.S.display_name))
                 self.health["status"] = "running"
                 m5 = broker.bars(self.symbol, self.cfg.bars, self.cfg.source, self.off)
                 closed = m5.df[m5.df["time"] + 300 <= broker.now_server(self.off)].reset_index(drop=True)
@@ -77,12 +84,20 @@ class SymbolAgent(threading.Thread):
                     _time.sleep(self.cfg.poll_seconds); continue
                 bar_t = int(closed["time"].iloc[-1]); new_bar = bar_t != self.last_bar
                 df = self.S.add_emas(closed)
+                self.last_df = df
                 cf, cs = self.S.ema_cols
                 ef = float(df[cf].iloc[-1]); es = float(df[cs].iloc[-1]); close = float(df["close"].iloc[-1])
                 sgn = 1 if ef > es else -1
                 self.health.update(last_poll=datetime.now(IST).strftime("%H:%M:%S"), close=close, ema_fast=ef, ema_slow=es)
                 if new_bar:
                     self.last_bar = bar_t; self.health["last_bar"] = ist(bar_t, self.off)
+                    if not self.caught_up:
+                        self.caught_up = True
+                        try:
+                            self._catch_up(closed, df, bar_t, close, ef, es)
+                        except Exception as e:
+                            telemetry.failure(self.notify, self.journal, title="AUREON CATCH-UP ERROR", key=self.key("ERROR", "catchup"),
+                                              mode=self.S.name, symbol=self.symbol, action="catch-up", exc=e)
                     self._detect(closed, df, bar_t, close, ef, es)
                 if self.g is not None:
                     self._guard(new_bar, bar_t, df, close, ef, es, sgn)
@@ -91,6 +106,98 @@ class SymbolAgent(threading.Thread):
                 telemetry.failure(self.notify, self.journal, title="AUREON AGENT ERROR", key=self.key("ERROR", f"loop-{type(e).__name__}"),
                                   mode=self.S.name, symbol=self.symbol, action="loop", exc=e)
             _time.sleep(self.cfg.poll_seconds)
+
+    def chart_now(self) -> str | None:
+        """Context chart of the latest closed bars (used by /chart)."""
+        if self.last_df is None:
+            return None
+        return context_chart(self.last_df, self.symbol, self.S.display_name, self.S.fast, self.S.slow, self.S.ema_cols, self.off,
+                             self.chart_dir, bars=120, title_extra="on request")
+
+    # ------------------------------------------------------------------ late-start catch-up (once)
+    def _catch_up(self, closed, df, bar_t, close, ef, es):
+        """We may have started mid-day. 1) say where the lines are RIGHT NOW (pre-cross forming / cross confirmed / nothing),
+        2) then list what already happened today: every 50/80 cross and P since 00:00 IST, with time and session."""
+        off = self.off
+        ist_midnight = datetime.now(IST).replace(hour=0, minute=0, second=0, microsecond=0)
+        day_start_srv = int(ist_midnight.timestamp() + off * 3600)
+        cf, cs = self.S.ema_cols
+        t = df["time"].to_numpy(); c = df["close"].to_numpy(); e_f = df[cf].to_numpy(); e_s = df[cs].to_numpy()
+        sign = np.sign(e_f - e_s)
+        res = self.S.analyse({"M5": Bars(self.symbol, "M5", closed)}, self.symbol, off, self.news)["M5"]
+        pres = {p.index: p for p in res.get("pre", [])}
+        sess = lambda ts: {"asia": "Asia", "london": "London", "ny": "New York", "off": "off-hours"}.get(session_of(int(ts), off), "—")
+        start = int(np.searchsorted(t, day_start_srv))
+        n = len(df) - 1
+
+        # ---- 1) current state at start-up
+        order = f"EMA {self.S.fast} {'above' if sign[n] > 0 else 'below'} EMA {self.S.slow} (gap {e_f[n] - e_s[n]:+.2f})"
+        last_cross = next((i for i in range(n, max(start, 1) - 1, -1) if sign[i] != 0 and sign[i - 1] != 0 and sign[i] != sign[i - 1]), None)
+        last_p = next((i for i in range(n, max(start, 1) - 1, -1) if i in pres), None)
+        if last_p is not None and (last_cross is None or last_p > last_cross) and n - last_p <= 12:
+            state = f"**PRE-CROSS forming** — P {'LONG' if pres[last_p].label == 'PB' else 'SHORT'} at {ist(int(t[last_p]), off)} IST, {n - last_p} bars ago, lines not crossed yet"
+            colour = EVENT_COLOURS["signal_long" if pres[last_p].label == "PB" else "signal_short"]
+        elif last_cross is not None and n - last_cross <= 24:
+            side = "LONG" if sign[last_cross] > 0 else "SHORT"
+            state = f"**CROSS confirmed {n - last_cross} bars ago** — {side} at {ist(int(t[last_cross]), off)} IST @ {c[last_cross]:.2f} · {sess(t[last_cross])}"
+            colour = EVENT_COLOURS["cross"]
+        else:
+            state = "no setup right now — waiting for the next approach"; colour = EVENT_COLOURS["info"]
+        png = context_chart(df, self.symbol, self.S.display_name, self.S.fast, self.S.slow, self.S.ema_cols, off, self.chart_dir,
+                            marker=({"index": last_p, "side": "LONG" if pres[last_p].label == "PB" else "SHORT", "label": "P"} if (last_p is not None and (last_cross is None or last_p > last_cross)) else
+                                    ({"index": last_cross, "side": "LONG" if sign[last_cross] > 0 else "SHORT", "label": "CROSS"} if last_cross is not None else None)),
+                            bars=160, title_extra="start-up")
+        self.notify.send(self.key("STARTUP", bar_key(bar_t, off)), ctitle(self.symbol, "STARTED · WHERE WE ARE"), [state], png,
+                         fields=[field("Started", f"{datetime.now(IST):%d %b %H:%M} IST"), field("Session", sess(bar_t)),
+                                 field("Last bar", f"{ist(bar_t, off)} IST"), field("Price", f"**{close:.2f}**"),
+                                 field(f"EMA {self.S.fast}", f"{ef:.2f}"), field(f"EMA {self.S.slow}", f"{es:.2f}"),
+                                 field("Lines", order, inline=False)],
+                         color=colour, footer=cfooter(self.S.display_name, "late-start catch-up"))
+
+        # ---- 2) what already happened: the leg we OPENED the day in + every leg since 00:00 IST, with how far each moved
+        cross_idx = [i for i in range(1, n + 1) if sign[i] != 0 and sign[i - 1] != 0 and sign[i] != sign[i - 1]]
+        before = [i for i in cross_idx if i < start]
+        legs_from = ([before[-1]] if before else []) + [i for i in cross_idx if i >= start]
+        h_ = df["high"].to_numpy(); l_ = df["low"].to_numpy()
+        legs = []
+        for k, ci in enumerate(legs_from):
+            nxt = next((j for j in cross_idx if j > ci), n)
+            seg = slice(ci, nxt + 1 if nxt < n else n + 1)
+            long = sign[ci] > 0
+            if long:
+                pk = ci + int(np.argmax(h_[seg])); move = float(h_[pk] - c[ci]); adverse = float(c[ci] - l_[seg].min())
+            else:
+                pk = ci + int(np.argmin(l_[seg])); move = float(c[ci] - l_[pk]); adverse = float(h_[seg].max() - c[ci])
+            legs.append({"start": ci, "end": min(nxt, n), "side": "LONG" if long else "SHORT", "move": move, "adverse": adverse,
+                         "peak_idx": pk, "open": nxt >= n, "label": "CROSS", "before_day": ci < start})
+        ps_today = [(i, "LONG" if pres[i].label == "PB" else "SHORT") for i in sorted(pres) if i >= start]
+        if not legs and not ps_today:
+            return
+        fields = []
+        for lg in legs[-8:]:
+            ci, pk = lg["start"], lg["peak_idx"]
+            long = lg["side"] == "LONG"
+            till_px = float(h_[pk] if long else l_[pk])
+            trend = "UP ▲ (EMA 50 crossed above 80)" if long else "DOWN ▼ (EMA 50 crossed below 80)"
+            head = f"{'🟢' if long else '🔴'} {ist(int(t[ci]), off)} IST · {sess(t[ci])}" + (" · before day start" if lg["before_day"] else "")
+            status = "still running" if lg["open"] else f"leg ended {ist(int(t[lg['end']]), off)[-5:]} IST"
+            fields.append(field(head,
+                                f"Trend **{trend}**\n"
+                                f"Cross at **{c[ci]:.2f}** → moved till **{till_px:.2f}** at {ist(int(t[pk]), off)[-5:]} IST\n"
+                                f"Move **{lg['move']:+.1f}** · against −{lg['adverse']:.1f} · {status}", inline=False))
+        if ps_today:
+            fields.append(field("P signals today", " · ".join(f"{ist(int(t[i]), off)[-5:]} {sd}" for i, sd in ps_today[-8:]), inline=False))
+        total = sum(lg["move"] for lg in legs if not lg["before_day"])
+        for lg in legs:
+            long = lg["side"] == "LONG"; pk = lg["peak_idx"]
+            lg["label"] = f"{c[lg['start']]:.1f} → {float(h_[pk] if long else l_[pk]):.1f}"
+        png2 = context_chart(df, self.symbol, self.S.display_name, self.S.fast, self.S.slow, self.S.ema_cols, off, self.chart_dir,
+                             bars=max(160, n - (legs[0]["start"] if legs else n) + 20), title_extra="legs since day start",
+                             regions=legs, day_start_ts=day_start_srv)
+        self.notify.send(self.key("STARTUP_EARLIER", bar_key(bar_t, off)), ctitle(self.symbol, "EARLIER TODAY · 50/80 LEGS"),
+                         [f"{sum(not lg['before_day'] for lg in legs)} cross(es) since 00:00 IST · available move today **{total:+.1f}** · "
+                          f"shaded on the chart: cross → peak of each leg"],
+                         png2, fields=fields, color=EVENT_COLOURS["info"], footer=cfooter(self.S.display_name, "late-start catch-up"))
 
     # ------------------------------------------------------------------ detection
     def _detect(self, closed, df, bar_t, close, ef, es):
@@ -113,9 +220,12 @@ class SymbolAgent(threading.Thread):
                                    stop=(close - s * g.pre_stop) if g else None, secure_at=(close + s * g.secure_at) if g else None,
                                    bar_ist=ist(bar_t, self.off))
             note = "place it — I manage it" if g else "signal only — no guardian profile for this mode/symbol"
-            self.notify.send(self.key(f"{kind.upper()}_{side}", bar_key(bar_t, self.off)), f"🔫 {self.symbol} {side} · {self.S.display_name}", [note],
+            png = context_chart(df, self.symbol, self.S.display_name, self.S.fast, self.S.slow, self.S.ema_cols, self.off, self.chart_dir,
+                                marker={"index": last, "side": side, "label": kind.upper(),
+                                        "stop": (close - s * g.pre_stop) if g else None, "secure": (close + s * g.secure_at) if g else None})
+            self.notify.send(self.key(f"{kind.upper()}_{side}", bar_key(bar_t, self.off)), ctitle(self.symbol, {"P": "P PRE-CROSS", "cross": "CONFIRMED CROSS", "late": "LATE ENTRY", "pullback": "PULLBACK ENTRY"}.get(kind, kind), side), [note], png,
                              fields=fields, color=EVENT_COLOURS["signal_long" if side == "LONG" else "signal_short"],
-                             footer=f"{self.S.display_name} · {self.symbol} · {kind}")
+                             footer=cfooter(self.S.display_name, f"bar {ist(bar_t, self.off)}"))
 
     # ------------------------------------------------------------------ guardian helpers
     def _locked(self, p: dict) -> float:
@@ -139,6 +249,7 @@ class SymbolAgent(threading.Thread):
         return False
 
     def _close(self, p, reason, title, key, st, journal_reason=None, bar_t=None):
+        event_name = {"p_flip": "FLIP CLOSE", "news_flat": "BANKED BEFORE NEWS"}.get(journal_reason or "", None)
         if bar_t is not None and st.get("closing_bar") == bar_t:
             return                                      # one close attempt per bar
         st["closing_bar"] = bar_t
@@ -147,10 +258,10 @@ class SymbolAgent(threading.Thread):
         self.journal.log("exit", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], points=p["points"],
                          reason=journal_reason or reason, auto=bool(r.ok))
         if r.ok:
-            self.notify.send(key, title, [reason],
+            self.notify.send(key, ctitle(self.symbol, event_name or ("CLOSED " + ("WIN" if p["points"] > 0 else "LOSS")), p["direction"]), [reason],
                              fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"],
                                                     points=p["points"], secured=st.get("secured"), peak=st["peak"]),
-                             color=EVENT_COLOURS["closed_win" if p["points"] > 0 else "closed_loss"], footer=f"{self.S.display_name} · {self.symbol}")
+                             color=EVENT_COLOURS["closed_win" if p["points"] > 0 else "closed_loss"], footer=cfooter(self.S.display_name, journal_reason or ""))
         else:
             telemetry.failure(self.notify, self.journal, title="AUREON GUARDIAN FAILURE", key=self.key("ERROR", f"close-{p['ticket']}-{r.retcode}"),
                               mode=self.S.name, symbol=self.symbol, ticket=p["ticket"], action=f"CLOSE ({reason})", bid=r.bid, ask=r.ask,
@@ -186,9 +297,9 @@ class SymbolAgent(threading.Thread):
                 sl = p["price_open"] - s * g.pre_stop
                 if self._move_sl(p, sl, "PROTECT"):
                     self.journal.log("protected", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], sl=sl)
-                    self.notify.send(self.key("PROTECTED", p["ticket"]), f"🛡 PROTECTED — {self.symbol}", [f"initial stop −{g.pre_stop:g}"],
+                    self.notify.send(self.key("PROTECTED", p["ticket"]), ctitle(self.symbol, "PROTECTED", p["direction"]), [f"initial stop −{g.pre_stop:g}"],
                                      fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"], points=p["points"], sl=sl),
-                                     color=EVENT_COLOURS["protected"], footer=f"{self.S.display_name} · {self.symbol}")
+                                     color=EVENT_COLOURS["protected"], footer=cfooter(self.S.display_name))
 
             # 1) opposite P → close (flip). The replacement trade is yours to place.
             if sig and not sig["consumed"] and sig["kind"] == "P" and sig["bar_time"] == bar_t and sig["direction"] != p["direction"].upper():
@@ -202,11 +313,11 @@ class SymbolAgent(threading.Thread):
                 sl = es - s * g.ema_slow_sl_buffer
                 ok = self._move_sl(p, sl, "CROSS SL")
                 self.journal.log("cross_confirmed", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], sl=sl, ok=ok)
-                self.notify.send(self.key("CROSS", p["ticket"]), f"✅ CROSS CONFIRMED — {self.symbol}",
+                self.notify.send(self.key("CROSS", p["ticket"]), ctitle(self.symbol, "CROSS CONFIRMED", p["direction"]),
                                  [f"EMA {self.S.fast} crossed {'above' if s > 0 else 'below'} EMA {self.S.slow}" + ("" if ok else " · SL move pending — see failure alert")],
                                  fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"], points=p["points"], sl=sl,
                                                         extra={"Next": f"secure at {p['price_open'] + s * g.secure_at:.2f} (+{g.secure_at:g})"}),
-                                 color=EVENT_COLOURS["cross"], footer=f"{self.S.display_name} · {self.symbol}")
+                                 color=EVENT_COLOURS["cross"], footer=cfooter(self.S.display_name))
             elif not st["pre"] and st["secured"] < g.secure_level and new_bar:
                 self._move_sl(p, es - s * g.ema_slow_sl_buffer, "FOLLOW EMA80", quiet=True)   # same safe path: retcode, telemetry, never-loosen
 
@@ -216,9 +327,9 @@ class SymbolAgent(threading.Thread):
                 if self._move_sl(p, sl, f"SECURE +{g.secure_level:g}"):
                     st["secured"] = g.secure_level                                             # 1. state
                     self.journal.log("secured", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], level=g.secure_level, step=g.secure_level, price=p["current"])  # 2. journal
-                    self.notify.send(self.key("SECURED", f"{p['ticket']}-{g.secure_level:g}"), f"🔒 SECURED +{g.secure_level:g} — {self.symbol}", ["riding — lock steps up every +" + f"{g.ride_step:g}"],
+                    self.notify.send(self.key("SECURED", f"{p['ticket']}-{g.secure_level:g}"), ctitle(self.symbol, f"SECURED +{g.secure_level:g}", p["direction"]), ["riding — lock steps up every +" + f"{g.ride_step:g}"],
                                      fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"], points=p["points"], sl=sl, secured=g.secure_level, peak=st["peak"]),
-                                     color=EVENT_COLOURS["secured"], footer=f"{self.S.display_name} · {self.symbol}")
+                                     color=EVENT_COLOURS["secured"], footer=cfooter(self.S.display_name))
             # 4) ride
             elif st["secured"] >= g.secure_level:
                 nxt = st["secured"] + g.ride_step
@@ -227,9 +338,9 @@ class SymbolAgent(threading.Thread):
                     if self._move_sl(p, sl, f"RIDE +{nxt:g}"):
                         st["secured"] = nxt
                         self.journal.log("secured", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], level=nxt, step=g.ride_step, price=p["current"])
-                        self.notify.send(self.key("SECURED", f"{p['ticket']}-{nxt:g}"), f"🔒 SECURED +{nxt:g} — {self.symbol}", [],
+                        self.notify.send(self.key("SECURED", f"{p['ticket']}-{nxt:g}"), ctitle(self.symbol, f"SECURED +{nxt:g}", p["direction"]), ["lock stepped up"],
                                          fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"], points=p["points"], sl=sl, secured=nxt, peak=st["peak"]),
-                                         color=EVENT_COLOURS["secured"], footer=f"{self.S.display_name} · {self.symbol}")
+                                         color=EVENT_COLOURS["secured"], footer=cfooter(self.S.display_name))
 
             # 5) exits on bar close
             if new_bar:
@@ -259,9 +370,9 @@ class SymbolAgent(threading.Thread):
                     self._close(p, "news in <15 min", f"📰 BANKED before news — {tag}", self.key("NEWS", p["ticket"]), st, "news_flat", bar_t)
                 elif st["secured"] == 0:
                     if self._move_sl(p, p["price_open"] - s * g.pre_stop, "NEWS CAP"):
-                        self.notify.send(self.key("NEWS", p["ticket"]), f"📰 NEWS in <{g.news_flat_min} min — {self.symbol}", [f"loss capped at −{g.pre_stop:g}"],
+                        self.notify.send(self.key("NEWS", p["ticket"]), ctitle(self.symbol, f"NEWS <{g.news_flat_min} MIN", p["direction"]), [f"loss capped at −{g.pre_stop:g}"],
                                          fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"], points=p["points"], sl=p["price_open"] - s * g.pre_stop),
-                                         color=EVENT_COLOURS["news"], footer=f"{self.S.display_name} · {self.symbol}")
+                                         color=EVENT_COLOURS["news"], footer=cfooter(self.S.display_name))
         if sig and not sig["consumed"] and sig["bar_time"] == bar_t:
             sig["consumed"] = True                       # nothing to flip; signal spent
         self.journal.save_state(self.symbol, self.state)

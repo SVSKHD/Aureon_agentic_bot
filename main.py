@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
 import time as _time
 from datetime import date, datetime, timedelta, timezone
-from dotenv import load_dotenv
+
 from aureon_mt5 import broker, telemetry
 from aureon_mt5.agent import SymbolAgent
 from aureon_mt5.bot import run_bot
@@ -23,14 +24,34 @@ from aureon_mt5.strategies import UnknownMode, get_strategy, mode_help, resolve_
 from aureon_mt5.common.news import load_news
 
 IST = timezone(timedelta(hours=5, minutes=30))
-load_dotenv()
 
-def git_version() -> str:
+AUTO_UPDATE_INTERVAL = 300  # check remote every 5 minutes
+
+
+def check_for_updates(notify) -> bool:
+    """Fetch remote master; if ahead of local, pull and restart the process."""
     try:
-        import subprocess
-        return subprocess.check_output(["git", "describe", "--tags", "--always", "--dirty"], stderr=subprocess.DEVNULL, timeout=3).decode().strip()
-    except Exception:
-        return ""
+        subprocess.run(["git", "fetch", "origin", "master"], capture_output=True, timeout=30)
+        local = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10).stdout.strip()
+        remote = subprocess.run(["git", "rev-parse", "origin/master"], capture_output=True, text=True, timeout=10).stdout.strip()
+        if not local or not remote or local == remote:
+            return False
+        result = subprocess.run(["git", "pull", "origin", "master"], capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            notify.card("AUREON · MT5 · UPDATE FAILED", f"git pull failed: {result.stderr[:200]}",
+                        fields=[{"name": "Action", "value": "Manual pull required", "inline": False}],
+                        footer="Aureon MT5 · Auto-Update")
+            return False
+        notify.card("AUREON · MT5 · RESTARTING", f"New commits pulled from master.\n`{local[:8]}` → `{remote[:8]}`",
+                    fields=[{"name": "Pull", "value": "Success", "inline": True},
+                            {"name": "Action", "value": "Restarting now...", "inline": True}],
+                    footer=f"Aureon MT5 · Auto-Update · {datetime.now(IST):%H:%M} IST")
+        _time.sleep(2)
+        os.environ["AUREON_AUTO_RESTARTED"] = "1"
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    except Exception as e:
+        print(f"auto-update check failed: {e}")
+    return False
 
 
 def banner() -> str:
@@ -51,13 +72,26 @@ def news_status(path: str | None) -> tuple[str, bool]:
 
 def greet(notify, cfg, S, why, news_line):
     art = banner()
-    gv = git_version()
+    gv = git_version() if "git_version" in globals() else ""
     print(art); print(f"v{VERSION}{' · ' + gv if gv else ''} · {S.display_name} · {why} · {datetime.now(IST):%a %d %b %H:%M} IST · {', '.join(cfg.symbols)}")
     srv = datetime.now(timezone.utc) + timedelta(hours=cfg.server_utc_offset)
-    notify.raw(f"```\n{art}```\n**⚡ AUREON MT5 v{VERSION}{' (' + gv + ')' if gv else ''} {why.upper()}**\n"
-               f"Mode: {S.display_name}\nSymbols: {', '.join(cfg.symbols)}\nGuardian: {'ON' if any(S.guardian_for(s) for s in cfg.symbols) else 'OFF'}\n"
-               f"MT5: {'CONNECTED' if broker.connected() else ('DRY' if cfg.dry else 'DISCONNECTED')} · server offset {cfg.server_utc_offset:+g}h\n"
-               f"Server: {srv:%a %d %b %H:%M} · IST: {datetime.now(IST):%H:%M}\nNews: {news_line}\n{S.describe()}")
+    guardian_on = any(S.guardian_for(s) for s in cfg.symbols)
+    mt5_state = "CONNECTED" if broker.connected() else ("DRY" if cfg.dry else "DISCONNECTED")
+    notify.card(
+        f"AUREON · MT5 · {why.upper()}",
+        f"```\n{art}```\n**v{VERSION}**{' · ' + gv if gv else ''} · {S.display_name} · you place, I manage",
+        fields=[
+            {"name": "Mode", "value": S.display_name, "inline": True},
+            {"name": "Symbols", "value": ", ".join(cfg.symbols), "inline": True},
+            {"name": "Guardian", "value": "🟢 ON" if guardian_on else "⚪ OFF", "inline": True},
+            {"name": "MT5", "value": ("🟢 " if mt5_state in ("CONNECTED", "DRY") else "🔴 ") + mt5_state, "inline": True},
+            {"name": "Server", "value": f"{srv:%a %d %b %H:%M} · UTC{cfg.server_utc_offset:+g}", "inline": True},
+            {"name": "IST", "value": f"{datetime.now(IST):%H:%M}", "inline": True},
+            {"name": "News", "value": news_line, "inline": False},
+            {"name": "Rules", "value": S.describe(), "inline": False},
+        ],
+        footer=f"{S.display_name} · {datetime.now(IST):%H:%M} IST",
+    )
 
 
 def supervise(agents: dict, factory, notify, mode: str) -> list[str]:
@@ -66,7 +100,7 @@ def supervise(agents: dict, factory, notify, mode: str) -> list[str]:
     for sym, ag in list(agents.items()):
         if not ag.is_alive():
             agents[sym] = factory(sym); agents[sym].start(); restarted.append(sym)
-            notify.send(f"{mode}:{sym}:RESTART:{int(_time.time()) // 60}", f"⚠️ agent {sym} restarted", ["other symbols unaffected"])
+            notify.send(f"{mode}:{sym}:RESTART:{int(_time.time()) // 60}", f"{sym} · MT5 · AGENT RESTARTED", ["other symbols unaffected"])
     return restarted
 
 
@@ -101,25 +135,49 @@ def main():
             if s not in agents or not agents[s].is_alive():
                 agents[s] = SymbolAgent(s, cfg, S, notify, journal, news); agents[s].start()
 
-    greet(notify, cfg, S, "online", news_line)
+    why = "online"
+    try:
+        last_msg = subprocess.run(["git", "log", "-1", "--pretty=%s"], capture_output=True, text=True, timeout=10).stdout.strip()
+        last_hash = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, timeout=10).stdout.strip()
+        if os.environ.get("AUREON_AUTO_RESTARTED"):
+            why = f"restarted · auto-update · {last_hash}"
+            notify.card("AUREON · MT5 · BACK ONLINE", f"Auto-update restart complete.\nRunning `{last_hash}` · {last_msg}",
+                        fields=[{"name": "Version", "value": f"v{VERSION}", "inline": True},
+                                {"name": "Commit", "value": f"`{last_hash}`", "inline": True},
+                                {"name": "Message", "value": last_msg[:200], "inline": False}],
+                        footer=f"Aureon MT5 · Auto-Update · {datetime.now(IST):%H:%M} IST")
+    except Exception:
+        pass
+    greet(notify, cfg, S, why, news_line)
     if unverified:
-        notify.raw("⚠️ **NEWS CALENDAR CONTAINS UNVERIFIED EVENTS** — news_blackout.txt has example entries; verify against the economic calendar. NFP first-Friday is automatic.")
+        notify.card("AUREON · MT5 · NEWS CALENDAR UNVERIFIED", "Unverified events are present in `news_blackout.txt`.",
+                    fields=[{"name": "Action", "value": "Verify the listed releases against the economic calendar.", "inline": False},
+                            {"name": "NFP", "value": "First-Friday protection remains automatic.", "inline": False}],
+                    footer="Aureon MT5 · News Guard")
     for s in cfg.symbols:
         g = S.guardian_for(s)
         if g is None:
-            notify.raw(f"ℹ️ {s}: {S.display_name} has no live guardian profile — signals only, positions not managed.")
+            notify.card(f"{s} · MT5 · SIGNALS ONLY", f"{S.display_name} has no live guardian profile.",
+                        fields=[{"name": "Position management", "value": "OFF", "inline": True}],
+                        footer="Aureon MT5")
         elif not g.enabled and not (cfg.enable_silver and s.startswith("XAG")):
-            notify.raw(f"ℹ️ {s}: guardian profile is EXPERIMENTAL and disabled — signals only. Start with --enable-silver to manage.")
+            notify.card(f"{s} · MT5 · GUARDIAN DISABLED", "Experimental guardian profile — signals only.",
+                        fields=[{"name": "Enable explicitly", "value": "`--enable-silver`", "inline": True}],
+                        footer="Aureon MT5")
     start_agents()
     if cfg.bot_token: run_bot(cfg, agents, journal, notify, started)
     else: print("no DISCORD_TOKEN — slash commands off, alerts via webhook only")
 
-    was_open = broker.market_open(cfg.symbols[0], cfg.server_utc_offset, cfg.dry); report_day = None
+    was_open = broker.market_open(cfg.symbols[0], cfg.server_utc_offset, cfg.dry); report_day = None; last_update_check = 0
     while True:
         try:
+            now = _time.time()
+            if now - last_update_check >= AUTO_UPDATE_INTERVAL:
+                last_update_check = now
+                check_for_updates(notify)
             is_open = broker.market_open(cfg.symbols[0], cfg.server_utc_offset, cfg.dry)
             if was_open and not is_open:
-                notify.send(f"{cfg.mode}:ALL:MARKET:closed-{date.today()}", "⏸ Market closed", [f"{datetime.now(IST):%a %d %b %H:%M} IST · agents sleeping"])
+                notify.send(f"{cfg.mode}:ALL:MARKET:closed-{date.today()}", "AUREON · MT5 · MARKET CLOSED", ["agents sleeping"], footer=f"{S.display_name} · {datetime.now(IST):%H:%M} IST")
                 if report_day != date.today():
                     notify.raw(weekly_report(cfg, agents, journal, previous=False)); report_day = date.today()
             if not was_open and is_open:

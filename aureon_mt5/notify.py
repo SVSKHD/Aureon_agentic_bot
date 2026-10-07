@@ -57,6 +57,20 @@ def field(name: str, value, inline: bool = True) -> dict:
     return {"name": str(name), "value": str(value), "inline": inline}
 
 
+# --------------------------------------------------------------------------- house style (matches the Aureon V4 cards)
+#   title : SYMBOL · MT5 · EVENT [· SIDE]        e.g.  XAUUSD · MT5 · P PRE-CROSS · SHORT
+#   desc  : one short line                        e.g.  place it — I manage it
+#   fields: bold names, values below (inline grid)
+#   footer: mode · HH:MM IST [· extra]
+def title(symbol: str, event: str, side: str | None = None) -> str:
+    parts = [symbol.upper(), "MT5", event.upper()] + ([side.upper()] if side else [])
+    return " · ".join(parts)
+
+
+def footer(mode_display: str, *extra: str) -> str:
+    return " · ".join([mode_display, f"{datetime.now(IST):%H:%M} IST"] + [e for e in extra if e])
+
+
 # --------------------------------------------------------------------------- card helpers used by the guardian
 def signal_fields(*, side: str, kind: str, price: float, ema_fast: float, ema_slow: float, fast: int, slow: int,
                   stop: float | None, secure_at: float | None, bar_ist: str, session: str = "") -> list[dict]:
