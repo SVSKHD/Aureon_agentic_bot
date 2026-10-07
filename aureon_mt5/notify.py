@@ -107,6 +107,9 @@ class Notifier:
         self.recent: list[str] = []
         self.posts = 0
         self.failures = 0
+        import queue as _q
+        self.ask_queue: "_q.Queue[dict]" = _q.Queue()   # consumed by the bot (TAKE / SKIP buttons)
+        self.bot_ready = False                          # set by bot.py when it can post interactive asks
 
     # ------------------------------------------------------------------ embed
     def make_embed(self, title: str, description: str = "", *, fields: list[dict] | None = None, color: int | None = None,
@@ -169,6 +172,21 @@ class Notifier:
         except Exception as e:
             print("  (notify failed:", e, ")")
             return False
+
+    # ------------------------------------------------------------------ ask to trade (buttons when the bot is up)
+    def ask(self, key: str, title: str, lines: list[str], *, fields=None, color=None, footer=None, png=None, meta: dict | None = None) -> bool:
+        """A trade question. With the bot running: card + [TAKE] [SKIP] buttons in the channel. Otherwise: the same card
+        via webhook, with 'reply /take or /skip' instructions. Deduped like send(). Never places orders."""
+        if key in self.sent:
+            return False
+        if self.bot_ready:
+            self.sent.add(key)
+            self.ask_queue.put({"key": key, "title": title, "description": "\n".join(lines), "fields": fields or [], "color": color,
+                                "footer": footer, "png": png, "meta": meta or {}})
+            print(f"\n[ask] {title}", flush=True)
+            return True
+        return self.send(key, title, lines + ["answer with `/take` or `/skip` (buttons need the bot token + DISCORD_CHANNEL)"],
+                         png, fields=fields, color=color, footer=footer)
 
     # ------------------------------------------------------------------ non-deduped card
     def card(self, title: str, description: str = "", *, fields: list[dict] | None = None, color: int | None = None,

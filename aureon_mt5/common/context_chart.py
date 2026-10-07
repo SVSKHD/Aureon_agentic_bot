@@ -26,7 +26,7 @@ SESS = {"asia": "#f2c14e", "london": "#5aa9ff", "ny": "#ff5a5a"}
 
 def context_chart(df, symbol: str, mode_display: str, fast: int, slow: int, ema_cols: tuple, off_h: float, out_dir: str,
                   marker: dict | None = None, bars: int = 120, title_extra: str = "", regions: list | None = None,
-                  day_start_ts: int | None = None) -> str | None:
+                  day_start_ts: int | None = None, reentries: list | None = None) -> str | None:
     """regions: [{"start": idx, "end": idx, "side": "LONG"|"SHORT", "label": "...", "move": float, "peak_idx": idx}] in df indexes."""
     try:
         os.makedirs(out_dir, exist_ok=True)
@@ -49,6 +49,21 @@ def context_chart(df, symbol: str, mode_display: str, fast: int, slow: int, ema_
                     else:
                         ax.axvspan(k0 - 0.5, k - 0.5, color=SESS[sess[k0]], alpha=0.10, lw=0)
                 k0 = k
+        # session dividers: vertical line + label at each session start
+        sess_names = {"asia": "ASIA", "london": "LONDON", "ny": "NEW YORK"}
+        for k in range(1, n):
+            if sess[k] != sess[k - 1] and sess[k] in sess_names:
+                ax.axvline(k - 0.5, color=SESS[sess[k]], lw=1.4, alpha=0.75, zorder=1)
+                ax.text(k - 0.2, 0.975, sess_names[sess[k]], transform=ax.get_xaxis_transform(), color=SESS[sess[k]],
+                        fontsize=10, weight="bold", va="top", ha="left", zorder=8)
+        # re-entry markers
+        for re_ in (reentries or []):
+            ri = re_["index"] - shift
+            if 0 <= ri < n:
+                long = re_["side"] == "LONG"; colour = UP if long else DOWN
+                ax.plot(ri, c[ri], marker="^" if long else "v", ms=12, color=colour, mec="#ffffff", mew=1.2, zorder=7)
+                ax.annotate("RE", (ri, c[ri]), xytext=(0, 14 if long else -14), textcoords="offset points", ha="center",
+                            va="bottom" if long else "top", fontsize=10, weight="bold", color=colour, zorder=7)
         # day-start line
         if day_start_ts is not None:
             ds = int(np.searchsorted(d["time"].to_numpy(), day_start_ts))
