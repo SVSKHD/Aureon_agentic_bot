@@ -42,6 +42,9 @@ class SymbolAgent(threading.Thread):
         self.latest_signal: dict | None = None
         self.last_bar: int | None = None
         self.caught_up = False            # late-start catch-up card sent once
+        self.leg: dict | None = None      # the move since the last P / cross signal (progress updates)
+        self.MOVE_STEP = 10.0 if not symbol.upper().startswith("XAG") else 0.15   # progress card every +step of move
+        self.SNAPSHOT_BARS = 6            # open-position snapshot every 6 closed bars (30 min)
         self.chart_dir = os.path.join(cfg.log_dir, "charts")
         self.last_df = None               # last closed-bar frame with EMAs (for /chart)
         self.health = {"status": "starting", "last_bar": None, "last_poll": None, "errors": 0, "managed": 0,
@@ -99,6 +102,7 @@ class SymbolAgent(threading.Thread):
                             telemetry.failure(self.notify, self.journal, title="AUREON CATCH-UP ERROR", key=self.key("ERROR", "catchup"),
                                               mode=self.S.name, symbol=self.symbol, action="catch-up", exc=e)
                     self._detect(closed, df, bar_t, close, ef, es)
+                self._track_leg(df, bar_t, new_bar, sgn)
                 if self.g is not None:
                     self._guard(new_bar, bar_t, df, close, ef, es, sgn)
             except Exception as e:
@@ -199,6 +203,104 @@ class SymbolAgent(threading.Thread):
                           f"shaded on the chart: cross → peak of each leg"],
                          png2, fields=fields, color=EVENT_COLOURS["info"], footer=cfooter(self.S.display_name, "late-start catch-up"))
 
+    # ------------------------------------------------------------------ move since the signal
+    def _track_leg(self, df, bar_t, new_bar, sgn):
+        lg = self.leg
+        if not lg:
+            return
+        long = lg["side"] == "LONG"
+        after = df[df["time"] > lg["start_t"]]
+        if len(after):
+            hi = float(after["high"].max()); lo = float(after["low"].min())
+            best = (hi - lg["start_px"]) if long else (lg["start_px"] - lo)
+            if best > lg["best"]:
+                lg["best"] = best; lg["best_px"] = hi if long else lo
+                row = after.loc[after["high"].idxmax()] if long else after.loc[after["low"].idxmin()]
+                lg["best_t"] = int(row["time"])
+            lg["against"] = max(lg["against"], (lg["start_px"] - lo) if long else (hi - lg["start_px"]))
+        # milestone cards: +10, +20, +30 ... (each once)
+        step = self.MOVE_STEP
+        reached = int(lg["best"] // step)
+        if reached > lg["steps_sent"]:
+            lg["steps_sent"] = reached
+            close = float(df["close"].iloc[-1])
+            now_move = (close - lg["start_px"]) if long else (lg["start_px"] - close)
+            self.notify.send(self.key("MOVE", f"{bar_key(lg['start_t'], self.off)}-{reached}"),
+                             ctitle(self.symbol, f"MOVED +{reached * step:g}", lg["side"]),
+                             [f"since the {lg['kind'].upper()} signal at {ist(lg['start_t'], self.off)} IST"],
+                             fields=[field("Signal", f"{lg['kind'].upper()} **{lg['side']}**"), field("From", f"{lg['start_px']:.2f}"),
+                                     field("Best", f"**{lg['best_px']:.2f}** ({lg['best']:+.1f})"), field("Now", f"{close:.2f} ({now_move:+.1f})"),
+                                     field("Against", f"−{lg['against']:.1f}"),
+                                     field("Running", f"{max(0, (bar_t - lg['start_t']) // 300)} bars · {ist(lg['best_t'], self.off)[-5:]} peak")],
+                             color=EVENT_COLOURS["signal_long" if long else "signal_short"], footer=cfooter(self.S.display_name, "leg progress"))
+        # the leg ends when the 50/80 order turns against it
+        if new_bar and ((long and sgn < 0) or ((not long) and sgn > 0)) and lg["kind"] != "P":
+            self._end_leg(df, bar_t, "EMA 50/80 crossed back")
+        elif new_bar and lg["kind"] == "P" and (bar_t - lg["start_t"]) // 300 > 48 and lg["best"] < step:
+            self._end_leg(df, bar_t, "P never developed (4h)")
+
+    def _end_leg(self, df, bar_t, why):
+        lg = self.leg; self.leg = None
+        if not lg:
+            return
+        long = lg["side"] == "LONG"; close = float(df["close"].iloc[-1])
+        png = None
+        try:
+            t = df["time"].to_numpy()
+            si = int(np.searchsorted(t, lg["start_t"])); pi = int(np.searchsorted(t, lg["best_t"])); ei = len(df) - 1
+            png = context_chart(df, self.symbol, self.S.display_name, self.S.fast, self.S.slow, self.S.ema_cols, self.off, self.chart_dir,
+                                bars=max(120, ei - si + 30), title_extra="leg summary",
+                                regions=[{"start": si, "end": ei, "side": lg["side"], "move": lg["best"], "peak_idx": pi,
+                                          "label": f"{lg['start_px']:.1f} → {lg['best_px']:.1f}"}])
+        except Exception:
+            png = None
+        self.journal.log("leg", symbol=self.symbol, mode=self.S.name, side=lg["side"], signal_kind=lg["kind"], start=lg["start_px"],
+                         best=lg["best"], best_px=lg["best_px"], against=lg["against"], why=why)
+        self.notify.send(self.key("LEG_END", bar_key(lg["start_t"], self.off)), ctitle(self.symbol, "LEG ENDED", lg["side"]),
+                         [f"{why} · the move from the {lg['kind'].upper()} signal is over"], png,
+                         fields=[field("Signal", f"{lg['kind'].upper()} at {ist(lg['start_t'], self.off)} IST"),
+                                 field("From", f"{lg['start_px']:.2f}"), field("Moved till", f"**{lg['best_px']:.2f}** at {ist(lg['best_t'], self.off)[-5:]}"),
+                                 field("Best move", f"**{lg['best']:+.1f}**"), field("Against", f"−{lg['against']:.1f}"),
+                                 field("Ended", f"{ist(bar_t, self.off)[-5:]} IST @ {close:.2f}")],
+                         color=EVENT_COLOURS["info"], footer=cfooter(self.S.display_name, "leg summary"))
+
+    # ------------------------------------------------------------------ position advisor (asks, never closes by itself)
+    def _advise(self, p, st, bar_t, df, ef, es, g):
+        """Question cards: 'should we close?' — the guardian's mechanical rules still decide automatic exits."""
+        s = 1 if p["direction"] == "long" else -1
+        close = float(df["close"].iloc[-1]); peak = st["peak"]; pts = p["points"]
+        reasons = []
+        if peak >= g.secure_at and pts <= peak * 0.6:
+            reasons.append(("giveback", f"gave back {peak - pts:.1f} of a +{peak:.1f} peak (now {pts:+.1f})"))
+        last3 = df["close"].to_numpy()[-3:]
+        if len(last3) == 3 and pts > 0 and ((s > 0 and last3[2] < last3[1] < last3[0]) or (s < 0 and last3[2] > last3[1] > last3[0])):
+            reasons.append(("momentum", "3 bars closing against the trade"))
+        dist = (close - ef) * s
+        if st.get("secured", 0) >= g.secure_level and 0 <= dist <= g.pre_stop * 0.25:
+            reasons.append(("ema", f"price {dist:.1f} from EMA {self.S.fast} — the ride's exit line"))
+        ist_h = float(datetime.fromtimestamp(bar_t - self.off * 3600, tz=IST).strftime("%H")) + float(datetime.fromtimestamp(bar_t - self.off * 3600, tz=IST).strftime("%M")) / 60
+        if pts > 0 and 22.5 <= ist_h < 23.0:
+            reasons.append(("dayend", "entry window closes 23:00 IST — overnight is thin"))
+        tutc = int(_time.time())
+        if pts > 0 and any(r - 45 * 60 <= tutc < r - g.news_flat_min * 60 for r in self.news):
+            reasons.append(("news", "high-impact release in under 45 min"))
+        for code, text in reasons:
+            self.notify.send(self.key("ASK", f"{p['ticket']}-{code}-{bar_key(bar_t, self.off) if code in ('momentum', 'ema') else ''}"),
+                             ctitle(self.symbol, "SHOULD WE CLOSE?", p["direction"]),
+                             [f"**{text}**", "your call — I will keep managing it by the rules if you hold"],
+                             fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"],
+                                                    points=pts, sl=p["sl"] or None, secured=st.get("secured"), peak=peak,
+                                                    extra={"If closed now": f"**{pts:+.2f}** banked"}),
+                             color=EVENT_COLOURS["flip"], footer=cfooter(self.S.display_name, "advisor"))
+
+    def _snapshot(self, p, st, bar_t):
+        self.notify.send(self.key("SNAPSHOT", f"{p['ticket']}-{bar_key(bar_t, self.off)}"), ctitle(self.symbol, "POSITION UPDATE", p["direction"]),
+                         [f"open {st['bars']} bars · phase {'pre-cross' if st['pre'] else 'post-cross'}"],
+                         fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"],
+                                                points=p["points"], sl=p["sl"] or None, secured=st.get("secured"), peak=st["peak"],
+                                                extra={"Made so far": f"**{p['points']:+.2f}** now · locked +{st.get('secured', 0):g}"}),
+                         color=EVENT_COLOURS["closed_win" if p["points"] > 0 else "closed_loss"], footer=cfooter(self.S.display_name, "every 30 min"))
+
     # ------------------------------------------------------------------ detection
     def _detect(self, closed, df, bar_t, close, ef, es):
         res = self.S.analyse({"M5": Bars(self.symbol, "M5", closed)}, self.symbol, self.off, self.news)["M5"]
@@ -212,6 +314,11 @@ class SymbolAgent(threading.Thread):
             elif "pb" in ev.label: kind = "pullback"
             else: kind = "cross"
             self.latest_signal = {"bar_time": bar_t, "symbol": self.symbol, "strategy": self.S.name, "kind": kind, "direction": side, "consumed": False}
+            if self.leg and self.leg["side"] != side:
+                self._end_leg(df, bar_t, f"opposite {kind} {side}")
+            if not self.leg or self.leg["side"] != side:
+                self.leg = {"side": side, "kind": kind, "start_t": bar_t, "start_i_time": bar_t, "start_px": close,
+                            "best": 0.0, "best_px": close, "best_t": bar_t, "against": 0.0, "steps_sent": 0}
             self.health["last_signal"] = f"{side} {kind} @ {ist(bar_t, self.off)}"
             self.journal.log("signal", symbol=self.symbol, mode=self.S.name, side=side, signal_kind=kind, price=close, bar=bar_t)
             g = self.g
@@ -361,6 +468,19 @@ class SymbolAgent(threading.Thread):
                 if reason:
                     self._close(p, reason, f"{'✅' if p['points'] > 0 else '🛑'} CLOSED — {tag}", self.key("CLOSED", f"{p['ticket']}-{bar_key(bar_t, self.off)}"), st, jr, bar_t)
                     continue
+
+            # 5b) advisor + periodic snapshot (notifications only — no broker action)
+            if new_bar:
+                if not st.get("tracking_sent"):
+                    st["tracking_sent"] = True
+                    self.notify.send(self.key("TRACKING", p["ticket"]), ctitle(self.symbol, "TRACKING", p["direction"]),
+                                     ["I see your position — managing it from here"],
+                                     fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"],
+                                                            points=p["points"], sl=p["sl"] or None),
+                                     color=EVENT_COLOURS["cross"], footer=cfooter(self.S.display_name))
+                self._advise(p, st, bar_t, df, ef, es, g)
+                if st["bars"] and st["bars"] % self.SNAPSHOT_BARS == 0:
+                    self._snapshot(p, st, bar_t)
 
             # 6) news safeguard
             tutc = int(_time.time())
