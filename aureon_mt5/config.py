@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from dotenv import load_dotenv
 load_dotenv()
 
-VERSION = "1.8.9"
+VERSION = "1.9.0"
 
 
 @dataclass
