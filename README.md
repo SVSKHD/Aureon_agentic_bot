@@ -1,4 +1,4 @@
-# Aureon MT5 v1.10.0
+# Aureon MT5 v1.11.0
 
 You place the trade. Aureon detects (per selected EMA mode), fires a Discord gunshot, then manages what you placed:
 protect → secure +10 → ride in +5 steps → close on the fast-EMA turn → news safeguard. Reports and slash commands.
@@ -97,3 +97,25 @@ Journal: `claude_verdict` (`claude_event, symbol, model, latency_s, decision, si
 Rules prompt: `prompts/claude_rules.md`. Daily budget: `logs/claude_budget.json`.
 
 Check on your PC: `claude -p "Reply only: OK"` from `C:\aureon_claude` prints OK → `AUREON_CLAUDE=review` → `/claude-test`.
+
+## Weekly compare (v1.11.0) — Detector vs Claude vs Me
+Measurement only: nothing here changes detection, the guardian, Claude calls or trades.
+
+Every detector signal (P / CROSS / RE, ema5080) in the window is one row. The same rows are split into groups:
+Detector · all · Claude TAKE · Claude SKIP (what Claude avoided) · Me TAKEN · Me SKIPPED · the two disagreement groups.
+- **Points** are the scorecard's if-taken result (`reports.scorecard`, read through `reports.graded_signals`). The compare never
+  grades a signal itself. OPEN and UNGRADED signals are counted, not scored.
+- **No verdict** (Claude off, timeout, bad JSON, budget, STALE) is its own count and is never treated as TAKE or SKIP.
+- **Me · TAKEN** = your TAKE button, or a trade the guardian saw in MT5 on the same side within 6 bars of the signal.
+- **Metrics:** n · win rate · expectancy (points per signal) · total · STOP count · worst losing streak · biggest loss.
+- **Verdict:** under 30 Claude-graded signals it only says "Not enough data yet". After that: Claude helps (its skips lost,
+  its takes beat the detector and kept ≥80% of the points) · Claude is skipping good trades · Mixed. Plus your own filtering line and
+  "when we disagreed, Claude right X, you right Y".
+- **Pullbacks:** Claude's HOLD / TIGHTEN / CLOSE vs what actually happened. Applied (`manage`) verdicts are counted separately.
+
+Commands: `/compare [days] [private]` · `/compare-breakdown [days]` (by P / CROSS / RE and Asia / London / New York).
+Saturday at `AUREON_WEEKLY_IST` (10:00 IST): the COMPARE card for Mon–Fri, once per week (restart-safe), with a chart of cumulative
+points and the last 4 weeks' expectancy. Footer: models used that week and the `claude_rules.md` hash.
+History: `logs/compare_weekly.jsonl`. For the Saturday Supabase batch, `compare.latest_summary(log_dir)` returns the `compare`
+field for the `aureon_weekly` row (no extra request). Optional `AUREON_COMPARE_CLAUDE_REVIEW=1`: Claude's 5-line "what I got wrong"
+card after the COMPARE card (counts toward the budget; never edits `claude_rules.md`).

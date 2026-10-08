@@ -1,4 +1,4 @@
-"""Aureon MT5 v1.10.0 — runtime configuration. Strategy thresholds and guardian profiles live inside each strategy package."""
+"""Aureon MT5 v1.11.0 — runtime configuration. Strategy thresholds and guardian profiles live inside each strategy package."""
 from __future__ import annotations
 
 import os
@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from dotenv import load_dotenv
 load_dotenv()   # load .env if present
 
-VERSION = "1.10.0"
+VERSION = "1.11.0"
 
 
 @dataclass
@@ -54,6 +54,8 @@ class Config:
     claude_max_calls: int = int(os.environ.get("AUREON_CLAUDE_MAX_CALLS", "30"))      # per IST day, all symbols
     claude_timeout: float = float(os.environ.get("AUREON_CLAUDE_TIMEOUT", "90"))      # seconds per call
     claude_workdir: str = os.environ.get("AUREON_CLAUDE_WORKDIR", "") or os.path.join(os.path.expanduser("~"), "aureon_claude")
+    # v1.11.0 weekly compare: optional Claude self-review of its wrong calls after the Saturday COMPARE card (counts toward the budget)
+    compare_claude_review: bool = os.environ.get("AUREON_COMPARE_CLAUDE_REVIEW", "0") == "1"
     news_file: str | None = "news_blackout.txt"
     log_dir: str = "logs"
     source: str = os.environ.get("AUREON_SOURCE", "mt5")

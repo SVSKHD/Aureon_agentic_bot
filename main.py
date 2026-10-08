@@ -17,6 +17,8 @@ from aureon_mt5 import broker, telemetry
 from aureon_mt5.agent import SymbolAgent
 from aureon_mt5.bot import run_bot
 from aureon_mt5.claude_advisor import ClaudeAdvisor
+from aureon_mt5 import compare
+from aureon_mt5.notify import post_compare
 from aureon_mt5.config import Config, VERSION
 from aureon_mt5.journal import Journal
 from aureon_mt5.notify import Notifier
@@ -118,6 +120,37 @@ def claude_review_tick(claude, cfg, review_day, now: datetime | None = None):
     return review_day
 
 
+_COMPARE_RETRY_AT: dict[str, float] = {}
+
+
+def compare_saturday_tick(cfg, agents, journal, notify, claude=None, now: datetime | None = None, gather=None) -> str | None:
+    """Saturday ≥ cfg.weekly_report_ist (10:00 IST), after the WEEKLY report: post the COMPARE card for Mon–Fri once.
+    Restart-safe: a week already in logs/compare_weekly.jsonl is skipped. ema5080 only. Measurement only."""
+    if cfg.mode != "ema5080":
+        return None
+    now = now or datetime.now(IST)
+    hh, mm = (int(x) for x in cfg.weekly_report_ist.split(":"))
+    if now.weekday() != 5 or (now.hour, now.minute) < (hh, mm):
+        return None
+    week, since, until = compare.week_window(now)
+    if _time.time() < _COMPARE_RETRY_AT.get(week, 0) or any(h.get("week") == week for h in compare.read_history(cfg.log_dir)):
+        return None
+    try:
+        res = (gather or compare.gather)(cfg, agents, journal, since, until)
+        c = compare.card(res, title=f"AUREON · MT5 · COMPARE · {week}")
+        post_compare(notify, f"{cfg.mode}:ALL:COMPARE:{week}", c)
+        compare.append_history(cfg.log_dir, week, res)
+    except Exception as e:                                   # back off 30 min instead of re-grading every 30 s
+        _COMPARE_RETRY_AT[week] = _time.time() + 1800
+        telemetry.failure(notify, journal, title="AUREON COMPARE FAILED", key=f"{cfg.mode}:ALL:COMPARE_ERROR:{week}",
+                          mode=cfg.mode, action="weekly compare", exc=e, retry="retry in 30 min")
+        return None
+    if cfg.compare_claude_review and claude is not None:
+        import threading
+        threading.Thread(target=compare.self_review, args=(claude, res, notify, week), daemon=True, name="compare-self-review").start()
+    return week
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode"); ap.add_argument("--symbols"); ap.add_argument("--dry", action="store_true")
@@ -208,6 +241,7 @@ def main():
                 greet(notify, cfg, S, "market open — Aureon resumed", news_line); start_agents()
             was_open = is_open
             review_day = claude_review_tick(claude, cfg, review_day)
+            compare_saturday_tick(cfg, agents, journal, notify, claude)
             supervise(agents, lambda sym: SymbolAgent(sym, cfg, S, notify, journal, news, claude=claude), notify, cfg.mode)
         except KeyboardInterrupt:
             broker.close_connection(); print("bye"); return

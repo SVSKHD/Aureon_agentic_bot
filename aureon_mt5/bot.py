@@ -546,6 +546,29 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             return Reply(content=f"CLAUDE REVIEW {day or 'today'}:\n{text}"[:1900], source="live")
         await run(inter, "claude-review", work, timeout=claude_wait)
 
+    # ------------------------------------------------------------------ v1.11.0 weekly compare (measurement only)
+    def _compare_reply(days: int, breakdown: bool) -> Reply:
+        from . import compare
+        days = max(1, min(int(days), 60))
+        since, until = compare.window_days(days)
+        res = compare.gather(cfg, agents, journal, since, until)
+        c = compare.breakdown_card(res) if breakdown else compare.card(res, title=f"AUREON · MT5 · COMPARE · last {days} days")
+        em = {"title": c["title"], "description": c["description"], "fields": c["fields"][:25], "color": BLURPLE,
+              "footer": {"text": c["footer"]}, "timestamp": datetime.now(timezone.utc).isoformat()}
+        if c.get("png"):
+            em["image"] = {"url": f"attachment://{os.path.basename(c['png'])}"}
+        return Reply(card=em, file=c.get("png"), source="cache" if (res.grading_note or "").startswith("MT5 busy") else "live")
+
+    @tree.command(name="compare", description="Detector vs Claude vs Me on the same signals (measurement only)")
+    @app_commands.describe(days="window in days (default 7)", private="only you see the answer")
+    async def compare_cmd(inter: discord.Interaction, days: int = 7, private: bool = False):
+        await run(inter, "compare", lambda: _compare_reply(days, False), ephemeral=private, timeout=30)
+
+    @tree.command(name="compare-breakdown", description="Compare by event type (P/CROSS/RE) and session")
+    @app_commands.describe(days="window in days (default 7)")
+    async def compare_breakdown_cmd(inter: discord.Interaction, days: int = 7):
+        await run(inter, "compare-breakdown", lambda: _compare_reply(days, True), timeout=30)
+
     def _runner():
         asyncio.set_event_loop(asyncio.new_event_loop())
         client.run(cfg.bot_token, log_handler=None)

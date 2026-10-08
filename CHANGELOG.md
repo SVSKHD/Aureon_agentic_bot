@@ -2,6 +2,21 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v1.11.0 — 2026-10-08  (weekly compare: Detector vs Claude vs Me)
+- NEW `compare.py`: on the same detector signals (P / CROSS / RE, ema5080) — Detector · all, Claude TAKE / SKIP, Me TAKEN / SKIPPED,
+  both disagreement groups; n, win rate, expectancy, total, STOP count, worst losing streak, biggest loss; OPEN / UNGRADED /
+  no-verdict counted, never scored. Verdict line (≥30 signals), your filtering line, disagreements line.
+- Pullbacks: Claude HOLD / TIGHTEN / CLOSE vs the guardian's actual result (TIGHTEN checked on M5 bars); applied verdicts separate.
+- Grading reused from the scorecard through `reports.graded_signals()` (a field-renaming wrapper; no second grading method).
+  If the scorecard is missing or its fields are not recognised, the card says so.
+- `/compare [days] [private]`, `/compare-breakdown [days]` (v1.9.8 wrapper). Saturday 10:00 IST COMPARE card for Mon–Fri, once per
+  week (restart-safe), with a cumulative-points chart, 4-week expectancy trend, models and `claude_rules.md` hash.
+- `logs/compare_weekly.jsonl`; `compare.latest_summary()` gives the `compare` field for the Saturday `aureon_weekly` batch row.
+- Journal additions (measurement only): `position_seen` (first sight of a trade) and `final_points` on `closed`.
+- Optional `AUREON_COMPARE_CLAUDE_REVIEW` (default 0): Claude's 5-line self-review of its wrong calls; never edits the rules.
+- 38 new tests (135 in this repository).
+- Strategy rules changed: NO.
+
 ## v1.10.0 — 2026-10-08  (Claude add-on)
 - NEW Claude add-on: a second opinion from a local `claude -p --output-format json` call using your Claude Code login
   (no API key, no Anthropic SDK, no HTTP calls from Aureon). Claude never places a trade.
