@@ -100,7 +100,7 @@ def test_wider_manual_sl_not_replaced(harness):
     assert fake.pos.sl == 4150.0
 
 def test_p_timeout_closes(harness):
-    fake, ag, df = harness(price=4201.0)
+    fake, ag, df = harness(price=4198.0)                       # losing (−2) after 12 bars without the cross -> close
     for i in range(13):                                        # lines not crossed for the long, 13 bars
         df2 = df.copy(); df2["time"] = df2["time"] + i * 300
         guard(ag, fake, df2, sgn=-1)
