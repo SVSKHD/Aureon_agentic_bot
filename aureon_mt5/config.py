@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from dotenv import load_dotenv
+load_dotenv()   # load .env if present
 
 VERSION = "1.10.0"
 
