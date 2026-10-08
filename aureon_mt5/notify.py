@@ -225,3 +225,9 @@ class Notifier:
             self.failures += 1
             print("  (discord post failed:", e, ")")
             return False
+
+
+# --------------------------------------------------------------------------- v1.11.0 COMPARE card
+def post_compare(notify: "Notifier", key: str, c: dict) -> bool:
+    """Post a card built by compare.card() / compare.breakdown_card() through the normal deduped path."""
+    return notify.send(key, c["title"], [c["description"]], c.get("png"), fields=c.get("fields"), color=BLURPLE, footer=c.get("footer"))

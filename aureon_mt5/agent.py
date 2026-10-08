@@ -649,6 +649,20 @@ class SymbolAgent(threading.Thread):
         v = (p["sl"] - p["price_open"]) if p["direction"] == "long" else (p["price_open"] - p["sl"])
         return max(0.0, v)
 
+    def _final_points(self, ticket, st) -> tuple[float | None, bool]:
+        """Closing result in price points from the MT5 closing deal; falls back to the last polled points (approx)."""
+        last = st.get("last_points")
+        try:
+            if not self.dry:
+                now = datetime.now(timezone.utc)
+                deals = [d for d in broker.closed_deals(self.symbol, now - timedelta(days=3), now + timedelta(minutes=1)) if d["ticket"] == ticket]
+                if deals and st.get("entry") is not None:
+                    px = float(deals[-1]["price"]); entry = float(st["entry"])
+                    return round((px - entry) if st.get("direction") == "long" else (entry - px), 2), False
+        except Exception:
+            pass
+        return (round(float(last), 2) if last is not None else None), True
+
     def _move_sl(self, p, sl, action, quiet=False) -> bool:
         """MT5 SL modification through the one safe path. Returns True when the protection is in place
         (changed or already better). Never sends Discord itself — callers update state, journal, then notify."""
@@ -696,8 +710,10 @@ class SymbolAgent(threading.Thread):
                 st = self.state.pop(t)
                 if self.claude is not None:
                     self.claude.forget(self.symbol, t)
+                final, approx = self._final_points(t, st)             # v1.11.0: for the weekly compare (measurement only)
                 self.journal.log("closed", symbol=self.symbol, mode=self.S.name, ticket=t, direction=st.get("direction"),
-                                 entry=st.get("entry"), secured=st.get("secured"), peak=st.get("peak"))
+                                 entry=st.get("entry"), secured=st.get("secured"), peak=st.get("peak"),
+                                 final_points=final, final_approx=approx)
                 if t not in self.closed_by_aureon:            # closed by you (or your own SL/TP): ask why, one tap
                     last = st.get("last_points", 0.0)
                     self.notify.ask(self.key("CLOSED_BY_YOU", t), ctitle(self.symbol, "CLOSED BY YOU", st.get("direction")),
@@ -711,6 +727,9 @@ class SymbolAgent(threading.Thread):
         sig = self.latest_signal
         for p in pos:
             s = 1 if p["direction"] == "long" else -1
+            if p["ticket"] not in self.state:                    # v1.11.0: first sight of a trade (compare: 'Me · TAKEN')
+                self.journal.log("position_seen", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"],
+                                 side="LONG" if s > 0 else "SHORT", entry=p["price_open"], open_time=p.get("time"))
             st = self.state.setdefault(p["ticket"], {"symbol": self.symbol, "mode": self.S.name, "direction": p["direction"],
                                                      "entry": p["price_open"], "peak": p["points"], "pre": sgn != s, "bars": 0,
                                                      "news_done": False, "secured": 0.0})

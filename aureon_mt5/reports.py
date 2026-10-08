@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from . import broker
@@ -118,3 +119,81 @@ def claude_rows_for_batch(journal, since: int, until: int | None = None) -> list
                     "latency_s": r.get("latency_s"), "acted": r.get("acted"), "stale": r.get("stale"),
                     "bar": r.get("bar"), "ticket": r.get("ticket"), "my_action": r.get("my_action"), "error": r.get("error")})
     return out
+
+
+# ----------------------------------------------------------------------------- v1.11.0 graded signals for the weekly compare
+# The compare reuses the scorecard's grading — it never grades a signal itself. This wrapper only RENAMES the scorecard's
+# per-signal fields into one shape. Every field-name assumption lives in _from_scorecard().
+GRADES = ("WIN20", "WIN10", "STOP", "FLAT", "OPEN")
+_KIND = {"p": "P", "pre": "P", "cross": "CROSS", "re": "RE", "reentry": "RE", "re-entry": "RE"}
+_SIDE = {"long": "LONG", "buy": "LONG", "bull": "LONG", "short": "SHORT", "sell": "SHORT", "bear": "SHORT"}
+
+
+@dataclass
+class GradedSignal:
+    symbol: str
+    kind: str              # P | CROSS | RE
+    side: str              # LONG | SHORT
+    bar: int               # signal bar time, same encoding as journal `signal.bar` (MT5 server epoch)
+    session: str | None
+    grade: str             # WIN20 | WIN10 | STOP | FLAT | OPEN
+    points: float | None   # if-taken result in price points (scorecard units)
+    money: float | None = None
+
+
+def norm_kind(k) -> str | None:
+    return _KIND.get(str(k or "").strip().lower())
+
+
+def norm_side(s) -> str | None:
+    return _SIDE.get(str(s or "").strip().lower())
+
+
+def _first(obj, *names):
+    for n in names:
+        v = obj.get(n) if isinstance(obj, dict) else getattr(obj, n, None)
+        if v is not None:
+            return v
+    return None
+
+
+def _from_scorecard(g, default_symbol: str | None = None) -> GradedSignal | None:
+    """Map one scorecard item. Known in use: kind, grade, session. Assumed: symbol, side|direction, bar|bar_time|time,
+    points|pts|result, money|profit. Returns None when a required field cannot be found."""
+    kind = norm_kind(_first(g, "kind")); grade = str(_first(g, "grade") or "").upper()
+    side = norm_side(_first(g, "side", "direction")); bar = _first(g, "bar", "bar_time", "time")
+    sym = _first(g, "symbol") or default_symbol
+    if not (kind and grade in GRADES and side and bar is not None and sym):
+        return None
+    pts = _first(g, "points", "pts", "result")
+    try:
+        pts = None if pts is None else float(pts)
+    except (TypeError, ValueError):
+        pts = None
+    money = _first(g, "money", "profit")
+    try:
+        money = None if money is None else float(money)
+    except (TypeError, ValueError):
+        money = None
+    return GradedSignal(str(sym).upper(), kind, side, int(bar), _first(g, "session"), grade, pts, money)
+
+
+def _fields_of(g) -> list[str]:
+    return sorted(g.keys()) if isinstance(g, dict) else sorted(k for k in vars(g) if not k.startswith("_")) if hasattr(g, "__dict__") else [type(g).__name__]
+
+
+def graded_signals(cfg, agents, journal, since: int) -> tuple[list[GradedSignal], str | None]:
+    """([graded], None) on success; ([], reason) when the scorecard is missing or its fields are not recognised."""
+    sc = globals().get("scorecard")
+    if sc is None:
+        return [], "scorecard not available in this build (reports.scorecard missing) — all signals UNGRADED"
+    out: list[GradedSignal] = []; bad = []
+    for sym, ag in (agents or {}).items():
+        res = sc(cfg, {sym: ag}, journal, since)
+        items = res[0] if isinstance(res, tuple) else res
+        for g in items or []:
+            m = _from_scorecard(g, sym)
+            (out.append(m) if m is not None else bad.append(g))
+    if bad and not out:
+        return [], f"scorecard fields not recognised: {', '.join(_fields_of(bad[0]))}"
+    return out, (f"{len(bad)} scorecard item(s) not recognised (fields: {', '.join(_fields_of(bad[0]))})" if bad else None)
