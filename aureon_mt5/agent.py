@@ -43,6 +43,9 @@ class SymbolAgent(threading.Thread):
         self.latest_signal: dict | None = None
         self.last_bar: int | None = None
         self.caught_up = False            # late-start catch-up card sent once
+        self.last_bar_wall: float | None = None   # wall clock of the last processed closed bar (heartbeat)
+        self.closed_by_aureon: set = set()        # tickets Aureon closed (anything else that disappears was closed by you)
+        self._evidence = {"at": 0.0, "graded": [], "busy": False}
         self.leg: dict | None = None      # the move since the last P / cross signal (progress updates)
         self.MOVE_STEP = 10.0 if not symbol.upper().startswith("XAG") else 0.15   # progress card every +step of move
         self.SNAPSHOT_BARS = 6            # open-position snapshot every 6 closed bars (30 min)
@@ -100,6 +103,7 @@ class SymbolAgent(threading.Thread):
                 self.health.update(last_poll=datetime.now(IST).strftime("%H:%M:%S"), close=close, ema_fast=ef, ema_slow=es)
                 if new_bar:
                     self.last_bar = bar_t; self.health["last_bar"] = ist(bar_t, self.off)
+                    self.last_bar_wall = _time.time()
                     if not self.caught_up:
                         self.caught_up = True
                         try:
@@ -212,10 +216,168 @@ class SymbolAgent(threading.Thread):
                           f"shaded on the chart: cross → peak of each leg"],
                          png2, fields=fields, color=EVENT_COLOURS["info"], footer=cfooter(self.S.display_name, "late-start catch-up"))
 
+    # ------------------------------------------------------------------ AUREON-007 / 008 / 009 context on ask cards
+    def _htf(self) -> str:
+        """M15 / H1 50/80 state — information only, never a filter."""
+        key = self.last_bar
+        cache = getattr(self, "_htf_cache", None)
+        if cache is not None and cache[0] == key:
+            return cache[1]
+        from .strategies.ema5080.trend import state_of as _st
+        parts = []
+        for tf in ("M15", "H1"):
+            try:
+                d = broker.bars_tf(self.symbol, tf, 300, self.cfg.source, self.off)
+                d = self.S.add_emas(d.iloc[:-1] if len(d) > 1 else d)      # closed bars only
+                cf, cs = self.S.ema_cols
+                parts.append(f"{tf} {_st(float(d['close'].iloc[-1]), float(d[cf].iloc[-1]), float(d[cs].iloc[-1])).lower()}")
+            except Exception:
+                parts.append(f"{tf} —")
+        txt = " · ".join(parts); self._htf_cache = (key, txt)
+        return txt
+
+    def _warnings(self, df) -> list[str]:
+        w = []
+        sp = broker.spread(self.symbol) if not self.dry else None
+        lim = next((v for k, v in self.cfg.spread_warn.items() if self.symbol.upper().startswith(k)), None)
+        if sp is not None and lim is not None and sp > lim:
+            w.append(f"⚠️ wide spread {sp:.2f} (> {lim:g})")
+        rng = (df["high"] - df["low"]).to_numpy()
+        avg = float(rng[-21:-1].mean()) if len(rng) > 21 else 0.0
+        if avg > 0 and rng[-1] >= self.cfg.vol_spike_mult * avg:
+            w.append(f"⚠️ volatile bar {rng[-1] / avg:.1f}× average range")
+        return w
+
+    def _daily_limit(self) -> str | None:
+        """AUREON-007 (advisory): today's closed losses from MT5 history across symbols."""
+        today = datetime.now(IST).date()
+        cache = getattr(self, "_limit_cache", None)
+        if cache is not None and cache[0] == (today, self.last_bar):
+            return cache[1]
+        msg = None
+        try:
+            start = datetime.now(IST).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+            deals = broker.closed_deals(None, start, datetime.now(timezone.utc) + timedelta(minutes=1))
+            net = sum(d["profit"] for d in deals); losses = sum(1 for d in deals if d["profit"] < 0)
+            acc = broker.account()
+            loss_lim = (acc["balance"] * self.cfg.daily_loss_limit_pct / 100) if acc else None
+            if losses >= self.cfg.daily_max_losses:
+                msg = f"⛔ {losses} losing trades today (limit {self.cfg.daily_max_losses}) — I'd sit out"
+            elif loss_lim and net <= -loss_lim:
+                msg = f"⛔ day P&L {net:,.0f} (limit −{loss_lim:,.0f}, {self.cfg.daily_loss_limit_pct:g}%) — I'd sit out"
+        except Exception:
+            msg = None
+        self._limit_cache = ((today, self.last_bar), msg)
+        if msg:
+            self.notify.send(self.key("LIMIT", str(today)), ctitle(self.symbol, "DAILY LIMIT REACHED"), [msg, "signals continue — nothing is blocked"],
+                             color=EVENT_COLOURS["error"], footer=cfooter(self.S.display_name, "risk"))
+        return msg
+
+    def _refresh_evidence(self):
+        """Grade the last 28 days of signals in the background, at most once an hour (it fetches ~8k bars)."""
+        ev = self._evidence
+        if ev["busy"] or _time.time() - ev["at"] < 3600:
+            return
+        ev["busy"] = True
+        def work():
+            try:
+                from .reports import scorecard
+                graded, _ = scorecard(self.cfg, {self.symbol: self}, self.journal, int(_time.time() - 28 * 86400))
+                ev["graded"] = graded; ev["at"] = _time.time()
+            except Exception:
+                ev["at"] = _time.time() - 3000          # retry in ~10 min
+            finally:
+                ev["busy"] = False
+        import threading
+        threading.Thread(target=work, daemon=True).start()
+
+    def _evidence_field(self, kind: str, side: str, bar_t: int) -> list[dict]:
+        """'RE · SHORT · London — last 4 weeks: 9 signals, 7 hit +10 (78%)'"""
+        self._refresh_evidence()
+        sess = session_of(bar_t, self.off)
+        rows = [g for g in self._evidence["graded"] if g.kind == kind and g.grade != "OPEN"]
+        same = [g for g in rows if g.session == sess]
+        def fmt(xs, label):
+            if not xs:
+                return f"{label}: no history yet"
+            w = sum(g.grade in ("WIN10", "WIN20") for g in xs); st = sum(g.grade == "STOP" for g in xs)
+            return f"{label}: {len(xs)} signals · **{w} hit +10 ({round(100 * w / len(xs))}%)** · {st} stopped"
+        names = {"asia": "Asia", "london": "London", "ny": "New York", "off": "off-hours"}
+        return [field("Track record (4 weeks)", fmt(rows, f"{kind} all sessions") + "\n" + fmt(same, f"{kind} in {names.get(sess, sess)}"), inline=False)]
+
+    def _streak(self) -> str | None:
+        """Consecutive losing closed trades (last 3 days, all symbols). Card once when it reaches 2."""
+        cache = getattr(self, "_streak_cache", None)
+        if cache is not None and cache[0] == self.last_bar:
+            return cache[1]
+        msg = None
+        try:
+            deals = sorted(broker.closed_deals(None, datetime.now(timezone.utc) - timedelta(days=3), datetime.now(timezone.utc) + timedelta(minutes=1)),
+                           key=lambda d: d["time"])
+            n = 0
+            for d in reversed(deals):
+                if d["profit"] < 0: n += 1
+                else: break
+            if n >= 2:
+                msg = f"🔻 {n} losses in a row — next one at half size?"
+                self.notify.send(self.key("STREAK", f"{n}-{deals[-1]['time']}"), ctitle(self.symbol, f"{n} LOSSES IN A ROW"),
+                                 [msg, "advisory only — signals continue"], color=EVENT_COLOURS["closed_loss"], footer=cfooter(self.S.display_name, "risk"))
+        except Exception:
+            msg = None
+        self._streak_cache = (self.last_bar, msg)
+        return msg
+
+    def _context_fields(self, df) -> list[dict]:
+        f = [field("HTF context", self._htf(), inline=False)]
+        w = self._warnings(df)
+        if w: f.append(field("Warnings", " · ".join(w), inline=False))
+        lim = self._daily_limit()
+        if lim: f.append(field("Risk", lim, inline=False))
+        stk = self._streak()
+        if stk: f.append(field("Streak", stk, inline=False))
+        return f
+
+    def _suggested(self, stop_distance: float) -> dict:
+        try:
+            r = broker.lot_for_risk(self.symbol, abs(stop_distance), self.cfg.risk_pct) if not self.dry else None
+        except Exception:
+            r = None
+        return {"lots": min(r["lots"], self.cfg.max_lots) if r else None}
+
+    def _lot_field(self, stop_distance: float):
+        """AUREON-005: 'risk 1% → 0.08 lots' — display only, never sizes an order."""
+        try:
+            r = broker.lot_for_risk(self.symbol, abs(stop_distance), self.cfg.risk_pct) if not self.dry else None
+        except Exception:
+            r = None
+        if not r:
+            return []
+        return [field("Size", f"**{r['lots']:g} lots** = {r['risk_pct']:g}% risk ({r['risk_money']:,.0f} {r['currency']}) for a {r['stop']:.1f} stop", inline=False)]
+
     # ------------------------------------------------------------------ trend states + re-entries (ema5080)
+    def _turning(self, df, bar_t, trend_side: str) -> str | None:
+        """Is the move AGAINST the trend actually a turn forming (not a pullback)? Returns a reason or None.
+        Same ingredients as the P rule: gap small vs. average range and shrinking — or an opposite P / cross on this bar or recently."""
+        cf, cs = self.S.ema_cols
+        gap = (df[cf] - df[cs]).abs().to_numpy()
+        rng = float((df["high"] - df["low"]).to_numpy()[-21:-1].mean()) if len(df) > 21 else 0.0
+        shrinking = len(gap) >= 4 and sum(gap[-k] < gap[-k - 1] for k in (1, 2, 3)) >= 2
+        if rng > 0 and gap[-1] <= 2.0 * rng and shrinking:
+            return f"EMA {self.S.fast}/{self.S.slow} gap {gap[-1]:.2f} and closing in"
+        sig = self.latest_signal
+        if sig and sig["direction"] != trend_side and sig.get("kind") in ("P", "cross") and bar_t - sig["bar_time"] <= 12 * 300:
+            return f"opposite {sig['kind']} {sig['direction']} at {ist(sig['bar_time'], self.off)[-5:]}"
+        return None
+
     def _trend_and_reentry(self, df, bar_t, close, ef, es):
         g = self.g
         st = state_of(close, ef, es)
+        if st.endswith("PULLBACK"):
+            trend_side = "SHORT" if st.startswith("BEARISH") else "LONG"
+            why = self._turning(df, bar_t, trend_side)
+            if why:
+                st = st.replace("PULLBACK", "WEAKENING")
+                self._weak_why = why
         prev = self.trend_state; self.trend_state = st
         self.health["trend"] = st
         if prev and st != prev and prev.split(" ·")[0] == st.split(" ·")[0]:        # sub-state change inside the same trend
@@ -224,8 +386,13 @@ class SymbolAgent(threading.Thread):
                 self.last_trend_note[st] = bar_t
                 bear = st.startswith("BEARISH")
                 if st.endswith("PULLBACK"):
-                    text = f"price back between EMA {self.S.fast} and EMA {self.S.slow} — **watch for a re-entry {'SHORT' if bear else 'LONG'}**"
+                    text = (f"price back between EMA {self.S.fast} and EMA {self.S.slow}, lines still apart — "
+                            f"**healthy pullback, watch for a re-entry {'SHORT' if bear else 'LONG'}**")
                     colour = EVENT_COLOURS["news"]
+                elif st.endswith("WEAKENING"):
+                    text = (f"price between EMA {self.S.fast} and EMA {self.S.slow} **but this is not a pullback** — {getattr(self, '_weak_why', '')}. "
+                            f"**{'Bullish' if bear else 'Bearish'} turn forming — don't {'sell' if bear else 'buy'} this dip**")
+                    colour = EVENT_COLOURS["signal_long" if bear else "signal_short"]
                 elif st.endswith("CHALLENGED"):
                     text = (f"price closed {'above' if bear else 'below'} EMA {self.S.slow} — {'bearish' if bear else 'bullish'} trend at risk, "
                             f"**{'bullish' if bear else 'bearish'} turn forming** (needs the 50/80 cross)")
@@ -244,6 +411,10 @@ class SymbolAgent(threading.Thread):
                              color=EVENT_COLOURS["signal_long" if st.startswith("BULLISH") else "signal_short"], footer=cfooter(self.S.display_name, "trend"))
         # re-entry on THIS closed bar
         res = find_reentries(df, *self.S.ema_cols)
+        if res and res[-1].index == len(df) - 1 and res[-1].time not in self.seen_re and self._turning(df, bar_t, res[-1].side):
+            self.seen_re.add(res[-1].time)                     # suppressed: the 'pullback' is a turn forming
+            self.journal.log("signal_suppressed", symbol=self.symbol, side=res[-1].side, signal_kind="reentry", bar=bar_t,
+                             why=self._turning(df, bar_t, res[-1].side))
         if res and res[-1].index == len(df) - 1 and res[-1].time not in self.seen_re:
             r = res[-1]; self.seen_re.add(r.time)
             s_ = 1 if r.side == "LONG" else -1
@@ -264,9 +435,11 @@ class SymbolAgent(threading.Thread):
                                     field(f"EMA {self.S.fast}", f"{r.ema50:.2f}"), field(f"EMA {self.S.slow}", f"{r.ema80:.2f}"),
                                     field("Pullback reached", f"{r.pullback_extreme:.2f}"),
                                     field("Stop", f"{stop:.2f} (beyond the pullback)", inline=False)]
-                                   + ([field("Secure", f"at {r.price + s_ * g.secure_at:.2f} (+{g.secure_at:g}) → then ride", inline=False)] if g else []),
+                                   + ([field("Secure", f"at {r.price + s_ * g.secure_at:.2f} (+{g.secure_at:g}) → then ride", inline=False)] if g else [])
+                                   + self._lot_field(r.price - stop) + self._evidence_field("reentry", r.side, bar_t) + self._context_fields(df),
                             color=EVENT_COLOURS["signal_long" if r.side == "LONG" else "signal_short"], footer=cfooter(self.S.display_name, "re-entry"),
-                            meta={"symbol": self.symbol, "side": r.side, "kind": "reentry", "price": r.price, "bar": bar_t, "mode": self.S.name})
+                            meta={"symbol": self.symbol, "side": r.side, "kind": "reentry", "price": r.price, "bar": bar_t, "mode": self.S.name,
+                                  "sl": stop, **self._suggested(r.price - stop)})
 
     # ------------------------------------------------------------------ session dividers as cards
     def _session(self, df, bar_t, close, ef, es):
@@ -423,8 +596,10 @@ class SymbolAgent(threading.Thread):
             png = context_chart(df, self.symbol, self.S.display_name, self.S.fast, self.S.slow, self.S.ema_cols, self.off, self.chart_dir,
                                 marker={"index": last, "side": side, "label": kind.upper(),
                                         "stop": (close - s * g.pre_stop) if g else None, "secure": (close + s * g.secure_at) if g else None})
+            fields = fields + (self._lot_field(g.pre_stop) if g else []) + self._evidence_field(kind, side, bar_t) + self._context_fields(df)
             self.notify.ask(self.key(f"{kind.upper()}_{side}", bar_key(bar_t, self.off)), ctitle(self.symbol, {"P": "P PRE-CROSS", "cross": "CONFIRMED CROSS", "late": "LATE ENTRY", "pullback": "PULLBACK ENTRY"}.get(kind, kind), side), [note, f"**Trade {side} now?**"], png=png,
-                             meta={"symbol": self.symbol, "side": side, "kind": kind, "price": close, "bar": bar_t, "mode": self.S.name},
+                             meta={"symbol": self.symbol, "side": side, "kind": kind, "price": close, "bar": bar_t, "mode": self.S.name,
+                                   "sl": (close - s * g.pre_stop) if g else None, **(self._suggested(g.pre_stop) if g else {})},
                              fields=fields, color=EVENT_COLOURS["signal_long" if side == "LONG" else "signal_short"],
                              footer=cfooter(self.S.display_name, f"bar {ist(bar_t, self.off)}"))
 
@@ -455,6 +630,8 @@ class SymbolAgent(threading.Thread):
             return                                      # one close attempt per bar
         st["closing_bar"] = bar_t
         r = broker.close(p["ticket"], self.symbol, "aureon") if not self.dry else broker.BrokerResult(True, "DRY", changed=True)
+        if r.ok:
+            self.closed_by_aureon.add(p["ticket"])
         self.health["last_broker_action"] = f"close {r.status} {datetime.now(IST):%H:%M:%S}"
         self.journal.log("exit", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], points=p["points"],
                          reason=journal_reason or reason, auto=bool(r.ok))
@@ -479,6 +656,15 @@ class SymbolAgent(threading.Thread):
                 st = self.state.pop(t)
                 self.journal.log("closed", symbol=self.symbol, mode=self.S.name, ticket=t, direction=st.get("direction"),
                                  entry=st.get("entry"), secured=st.get("secured"), peak=st.get("peak"))
+                if t not in self.closed_by_aureon:            # closed by you (or your own SL/TP): ask why, one tap
+                    last = st.get("last_points", 0.0)
+                    self.notify.ask(self.key("CLOSED_BY_YOU", t), ctitle(self.symbol, "CLOSED BY YOU", st.get("direction")),
+                                    [f"last seen {last:+.2f} · peak +{st.get('peak', 0):.2f} · secured +{st.get('secured', 0):g}", "**why?** one tap — it goes in the weekly review"],
+                                    fields=[field("Ticket", f"#{t}"), field("Entry", f"{st.get('entry', 0):.2f}"), field("Peak", f"+{st.get('peak', 0):.2f}")],
+                                    color=EVENT_COLOURS["info"], footer=cfooter(self.S.display_name, "reason"),
+                                    meta={"reason_for": "close", "symbol": self.symbol, "ticket": t, "side": (st.get("direction") or "").upper(),
+                                          "bar": self.last_bar, "kind": "close", "mode": self.S.name, "price": st.get("entry")})
+                self.closed_by_aureon.discard(t)
         self.health["managed"] = len(pos)
         sig = self.latest_signal
         for p in pos:
@@ -486,7 +672,7 @@ class SymbolAgent(threading.Thread):
             st = self.state.setdefault(p["ticket"], {"symbol": self.symbol, "mode": self.S.name, "direction": p["direction"],
                                                      "entry": p["price_open"], "peak": p["points"], "pre": sgn != s, "bars": 0,
                                                      "news_done": False, "secured": 0.0})
-            st["peak"] = max(st["peak"], p["points"])
+            st["peak"] = max(st["peak"], p["points"]); st["last_points"] = p["points"]
             if new_bar: st["bars"] += 1
             st["secured"] = max(st.get("secured", 0.0), self._locked(p))      # live SL is the truth; never lower
             tag = f"{self.symbol} #{p['ticket']} {p['direction'].upper()} @ {p['price_open']:.2f}"
@@ -527,6 +713,18 @@ class SymbolAgent(threading.Thread):
                 sl = p["price_open"] + s * g.secure_level
                 if self._move_sl(p, sl, f"SECURE +{g.secure_level:g}"):
                     st["secured"] = g.secure_level                                             # 1. state
+                    if self.cfg.partial_close_pct > 0 and not st.get("partial_done") and not self.dry:                # AUREON-012
+                        pr = broker.close_partial(p["ticket"], self.symbol, self.cfg.partial_close_pct / 100.0)
+                        st["partial_done"] = True
+                        if pr.ok:
+                            self.journal.log("partial", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], volume=pr.requested_sl, points=p["points"])
+                            self.notify.send(self.key("PARTIAL", p["ticket"]), ctitle(self.symbol, f"PARTIAL CLOSED {self.cfg.partial_close_pct:g}%", p["direction"]),
+                                             [f"{pr.requested_sl:g} lots banked at {p['points']:+.2f} — rest rides with SL at +{g.secure_level:g}"],
+                                             color=EVENT_COLOURS["secured"], footer=cfooter(self.S.display_name, "partial"))
+                        else:
+                            telemetry.failure(self.notify, self.journal, title="AUREON PARTIAL CLOSE FAILED", key=self.key("ERROR", f"partial-{p['ticket']}"),
+                                              mode=self.S.name, symbol=self.symbol, ticket=p["ticket"], action="PARTIAL CLOSE",
+                                              retcode=pr.retcode, comment=pr.comment, last_error=pr.last_error, retry="not retried — full position keeps riding")
                     self.journal.log("secured", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], level=g.secure_level, step=g.secure_level, price=p["current"])  # 2. journal
                     self.notify.send(self.key("SECURED", f"{p['ticket']}-{g.secure_level:g}"), ctitle(self.symbol, f"SECURED +{g.secure_level:g}", p["direction"]), ["riding — lock steps up every +" + f"{g.ride_step:g}"],
                                      fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"], points=p["points"], sl=sl, secured=g.secure_level, peak=st["peak"]),
@@ -551,12 +749,27 @@ class SymbolAgent(threading.Thread):
                 reason = jr = None
                 if st["secured"] >= g.secure_level and against_f:
                     reason, jr = f"bar closed through EMA {self.S.fast} ({ef:.2f}) — ride over", "ema_fast_turn"
-                elif st["pre"] and p["points"] <= -g.pre_stop:
+                elif st["pre"] and p["points"] <= -g.pre_stop and not (
+                        self.cfg.respect_manual_sl and p["sl"] and abs(p["price_open"] - p["sl"]) > g.pre_stop + 1e-6):
                     reason, jr = f"P failed: {p['points']:+.2f}, lines not crossed", "pre_stop"
                 elif separating and st["bars"] >= 2:
                     reason, jr = f"P aborted: EMA {self.S.fast}/{self.S.slow} separating again before the cross", "pre_abort"
-                elif st["pre"] and st["bars"] >= g.pre_timeout_bars and st["secured"] == 0:
-                    reason, jr = f"P timeout: {st['bars']} bars without the cross", "pre_timeout"
+                elif st["pre"] and st["bars"] >= g.pre_timeout_bars and st["secured"] == 0 and not st.get("timeout_hold"):
+                    if p["points"] > 0 or (self.cfg.respect_manual_sl and p.get("tp")):
+                        # in profit, or you set your own TP: hold — lock breakeven instead of closing
+                        st["timeout_hold"] = True
+                        be = p["price_open"] + s * 0.5 if p["points"] > 1.0 else None
+                        ok = self._move_sl(p, be, "TIMEOUT → BREAKEVEN") if be is not None else False
+                        self.journal.log("pre_timeout_hold", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], points=p["points"], be=be, sl_ok=ok)
+                        self.notify.send(self.key("TIMEOUT_HOLD", p["ticket"]), ctitle(self.symbol, "P TIMEOUT · HOLDING", p["direction"]),
+                                         [f"{st['bars']} bars without the cross, but the trade is {p['points']:+.2f}"
+                                          + (" and you set your own TP" if p.get("tp") else "") + " — **not closing**",
+                                          (f"SL → entry +0.5 ({be:.2f})" if ok else "SL unchanged") + " · I'll keep managing it"],
+                                         fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"],
+                                                                points=p["points"], sl=(be if ok else (p["sl"] or None)), peak=st["peak"]),
+                                         color=EVENT_COLOURS["news"], footer=cfooter(self.S.display_name, "guardian"))
+                    else:
+                        reason, jr = f"P timeout: {st['bars']} bars without the cross", "pre_timeout"
                 elif not st["pre"] and st["secured"] < g.secure_level and against_s:
                     reason, jr = f"bar closed through EMA {self.S.slow} ({es:.2f})", "ema_slow_stop"
                 if reason:
