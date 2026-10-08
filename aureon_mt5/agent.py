@@ -9,6 +9,7 @@ Invariants: live SL is the truth (state rebuilt every poll) · an SL is never lo
 """
 from __future__ import annotations
 
+import queue
 import threading
 import time as _time
 from datetime import datetime, timedelta, timezone
@@ -30,8 +31,11 @@ import numpy as np
 
 
 class SymbolAgent(threading.Thread):
-    def __init__(self, symbol: str, cfg: Config, strategy: Strategy, notify: Notifier, journal: Journal, news: tuple):
+    def __init__(self, symbol: str, cfg: Config, strategy: Strategy, notify: Notifier, journal: Journal, news: tuple, claude=None):
         super().__init__(daemon=True, name=f"agent-{symbol}")
+        # v1.10.0 Claude add-on: hooks only when the advisor advises this strategy (ema5080, advisory/manage). None = v1.9.x behaviour.
+        self.claude = claude if (claude is not None and claude.advises(strategy)) else None
+        self.claude_inbox: "queue.Queue[dict]" = queue.Queue()
         self.symbol, self.cfg, self.S, self.notify, self.journal, self.news = symbol, cfg, strategy, notify, journal, news
         self.dry = cfg.dry
         g = strategy.guardian_for(symbol)
@@ -59,6 +63,10 @@ class SymbolAgent(threading.Thread):
         self.health = {"status": "starting", "last_bar": None, "last_poll": None, "errors": 0, "managed": 0,
                        "close": None, "ema_fast": None, "ema_slow": None, "offset_h": self.off, "last_signal": None,
                        "last_broker_action": None, "guardian": "ON" if g else "OFF (no profile for this mode/symbol)"}
+        # v1.9.8: cached status for slash commands (replaced atomically each poll; the bot never calls MT5 for status)
+        self.snapshot: dict = {"at": None}
+        self._pos_seen: list | None = None
+        self._today_cache: tuple = (0.0, None)
         self._stop = threading.Event()
         for t, st in list(self.state.items()):
             if st.get("mode") and st["mode"] != strategy.name:
@@ -85,6 +93,7 @@ class SymbolAgent(threading.Thread):
                     if not announced_closed:
                         announced_closed = True
                         self.notify.send(self.key("MARKET", f"closed-{datetime.now(IST):%Y-%m-%d}"), ctitle(self.symbol, "MARKET CLOSED"), ["agent sleeping"], color=EVENT_COLOURS["market"], footer=cfooter(self.S.display_name))
+                    self._refresh_snapshot(False)
                     _time.sleep(30); continue
                 if announced_closed:
                     announced_closed = False
@@ -93,6 +102,7 @@ class SymbolAgent(threading.Thread):
                 m5 = broker.bars(self.symbol, self.cfg.bars, self.cfg.source, self.off)
                 closed = m5.df[m5.df["time"] + 300 <= broker.now_server(self.off)].reset_index(drop=True)
                 if len(closed) < 120:
+                    self._refresh_snapshot(True)
                     _time.sleep(self.cfg.poll_seconds); continue
                 bar_t = int(closed["time"].iloc[-1]); new_bar = bar_t != self.last_bar
                 df = self.S.add_emas(closed)
@@ -118,6 +128,7 @@ class SymbolAgent(threading.Thread):
                 self._track_leg(df, bar_t, new_bar, sgn)
                 if self.g is not None:
                     self._guard(new_bar, bar_t, df, close, ef, es, sgn)
+                self._refresh_snapshot(True)
             except Exception as e:
                 self.health["errors"] += 1; self.health["status"] = f"error: {e}"
                 telemetry.failure(self.notify, self.journal, title="AUREON AGENT ERROR", key=self.key("ERROR", f"loop-{type(e).__name__}"),
@@ -130,6 +141,27 @@ class SymbolAgent(threading.Thread):
             return None
         return context_chart(self.last_df, self.symbol, self.S.display_name, self.S.fast, self.S.slow, self.S.ema_cols, self.off,
                              self.chart_dir, bars=120, title_extra="on request")
+
+    # ------------------------------------------------------------------ v1.9.8 cached status snapshot (read by slash commands)
+    def _refresh_snapshot(self, market_open: bool):
+        """Runs on the agent thread after each poll. Never raises; slash commands read `self.snapshot` only."""
+        try:
+            now = _time.time()
+            pos = self._pos_seen if (self.g is not None and market_open and self._pos_seen is not None) else broker.positions(self.symbol)
+            self._pos_seen = None
+            if self._today_cache[1] is None or now - self._today_cache[0] >= 60:
+                self._today_cache = (now, self.journal.today(self.symbol))
+            self.snapshot = {
+                "at": now, "market_open": bool(market_open), "connected": broker.connected() or self.dry,
+                "mt5": "CONNECTED" if broker.connected() else ("DRY" if self.dry else "DISCONNECTED"),
+                "tick_age": broker.tick_age(self.symbol, self.off),
+                "positions": [dict(p) for p in (pos or [])],
+                "state": {t: dict(st) for t, st in self.state.items()},
+                "today": dict(self._today_cache[1]),
+                "health": dict(self.health),
+            }
+        except Exception as e:                       # a snapshot failure must never stop the agent
+            telemetry.info(f"snapshot refresh failed {self.symbol}: {e!r}")
 
     # ------------------------------------------------------------------ late-start catch-up (once)
     def _catch_up(self, closed, df, bar_t, close, ef, es):
@@ -429,7 +461,8 @@ class SymbolAgent(threading.Thread):
                                 bars=120, title_extra="re-entry", reentries=[{"index": r.index, "side": r.side}],
                                 marker={"index": r.index, "side": r.side, "label": "RE", "stop": stop,
                                         "secure": (r.price + s_ * g.secure_at) if g else None})
-            self.notify.ask(self.key(f"RE_{r.side}", bar_key(bar_t, self.off)), ctitle(self.symbol, "RE-ENTRY", r.side),
+            re_key = self.key(f"RE_{r.side}", bar_key(bar_t, self.off))
+            self.notify.ask(re_key, ctitle(self.symbol, "RE-ENTRY", r.side),
                             [f"pullback to EMA {self.S.fast} rejected — trend continues", f"**Trade {r.side} now?**"], png=png,
                             fields=[field("Side", f"**{r.side}**"), field("Price", f"**{r.price:.2f}**"), field("Bar", f"{ist(bar_t, self.off)} IST"),
                                     field(f"EMA {self.S.fast}", f"{r.ema50:.2f}"), field(f"EMA {self.S.slow}", f"{r.ema80:.2f}"),
@@ -440,6 +473,8 @@ class SymbolAgent(threading.Thread):
                             color=EVENT_COLOURS["signal_long" if r.side == "LONG" else "signal_short"], footer=cfooter(self.S.display_name, "re-entry"),
                             meta={"symbol": self.symbol, "side": r.side, "kind": "reentry", "price": r.price, "bar": bar_t, "mode": self.S.name,
                                   "sl": stop, **self._suggested(r.price - stop)})
+            if self.claude is not None:
+                self.claude.request_entry(self, "reentry", r.side, bar_t, df, card_key=re_key)
 
     # ------------------------------------------------------------------ session dividers as cards
     def _session(self, df, bar_t, close, ef, es):
@@ -520,7 +555,7 @@ class SymbolAgent(threading.Thread):
                                           "label": f"{lg['start_px']:.1f} → {lg['best_px']:.1f}"}])
         except Exception:
             png = None
-        self.journal.log("leg", symbol=self.symbol, mode=self.S.name, side=lg["side"], signal_kind=lg["kind"], start=lg["start_px"],
+        self.journal.log("leg", symbol=self.symbol, mode=self.S.name, side=lg["side"], signal_kind=lg["kind"], start=lg["start_px"], start_t=lg["start_t"],
                          best=lg["best"], best_px=lg["best_px"], against=lg["against"], why=why)
         self.notify.send(self.key("LEG_END", bar_key(lg["start_t"], self.off)), ctitle(self.symbol, "LEG ENDED", lg["side"]),
                          [f"{why} · the move from the {lg['kind'].upper()} signal is over"], png,
@@ -558,6 +593,7 @@ class SymbolAgent(threading.Thread):
                                                     points=pts, sl=p["sl"] or None, secured=st.get("secured"), peak=peak,
                                                     extra={"If closed now": f"**{pts:+.2f}** banked"}),
                              color=EVENT_COLOURS["flip"], footer=cfooter(self.S.display_name, "advisor"))
+        return [code for code, _ in reasons]
 
     def _snapshot(self, p, st, bar_t):
         self.notify.send(self.key("SNAPSHOT", f"{p['ticket']}-{bar_key(bar_t, self.off)}"), ctitle(self.symbol, "POSITION UPDATE", p["direction"]),
@@ -597,11 +633,14 @@ class SymbolAgent(threading.Thread):
                                 marker={"index": last, "side": side, "label": kind.upper(),
                                         "stop": (close - s * g.pre_stop) if g else None, "secure": (close + s * g.secure_at) if g else None})
             fields = fields + (self._lot_field(g.pre_stop) if g else []) + self._evidence_field(kind, side, bar_t) + self._context_fields(df)
-            self.notify.ask(self.key(f"{kind.upper()}_{side}", bar_key(bar_t, self.off)), ctitle(self.symbol, {"P": "P PRE-CROSS", "cross": "CONFIRMED CROSS", "late": "LATE ENTRY", "pullback": "PULLBACK ENTRY"}.get(kind, kind), side), [note, f"**Trade {side} now?**"], png=png,
+            ask_key = self.key(f"{kind.upper()}_{side}", bar_key(bar_t, self.off))
+            self.notify.ask(ask_key, ctitle(self.symbol, {"P": "P PRE-CROSS", "cross": "CONFIRMED CROSS", "late": "LATE ENTRY", "pullback": "PULLBACK ENTRY"}.get(kind, kind), side), [note, f"**Trade {side} now?**"], png=png,
                              meta={"symbol": self.symbol, "side": side, "kind": kind, "price": close, "bar": bar_t, "mode": self.S.name,
                                    "sl": (close - s * g.pre_stop) if g else None, **(self._suggested(g.pre_stop) if g else {})},
                              fields=fields, color=EVENT_COLOURS["signal_long" if side == "LONG" else "signal_short"],
                              footer=cfooter(self.S.display_name, f"bar {ist(bar_t, self.off)}"))
+            if self.claude is not None and kind in ("P", "cross"):          # v1.10.0: enqueue only — never blocks the poll
+                self.claude.request_entry(self, kind, side, bar_t, df, card_key=ask_key)
 
     # ------------------------------------------------------------------ guardian helpers
     def _locked(self, p: dict) -> float:
@@ -625,7 +664,7 @@ class SymbolAgent(threading.Thread):
         return False
 
     def _close(self, p, reason, title, key, st, journal_reason=None, bar_t=None):
-        event_name = {"p_flip": "FLIP CLOSE", "news_flat": "BANKED BEFORE NEWS"}.get(journal_reason or "", None)
+        event_name = {"p_flip": "FLIP CLOSE", "news_flat": "BANKED BEFORE NEWS", "claude_close": "CLAUDE CLOSED"}.get(journal_reason or "", None)
         if bar_t is not None and st.get("closing_bar") == bar_t:
             return                                      # one close attempt per bar
         st["closing_bar"] = bar_t
@@ -650,10 +689,13 @@ class SymbolAgent(threading.Thread):
         g = self.g; cf, cs = self.S.ema_cols
         gap = (df[cf] - df[cs]).to_numpy()
         pos = broker.positions(self.symbol)
+        self._pos_seen = pos
         live = {p["ticket"] for p in pos}
         for t in list(self.state):
             if t not in live:
                 st = self.state.pop(t)
+                if self.claude is not None:
+                    self.claude.forget(self.symbol, t)
                 self.journal.log("closed", symbol=self.symbol, mode=self.S.name, ticket=t, direction=st.get("direction"),
                                  entry=st.get("entry"), secured=st.get("secured"), peak=st.get("peak"))
                 if t not in self.closed_by_aureon:            # closed by you (or your own SL/TP): ask why, one tap
@@ -785,7 +827,9 @@ class SymbolAgent(threading.Thread):
                                      fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"],
                                                             points=p["points"], sl=p["sl"] or None),
                                      color=EVENT_COLOURS["cross"], footer=cfooter(self.S.display_name))
-                self._advise(p, st, bar_t, df, ef, es, g)
+                codes = self._advise(p, st, bar_t, df, ef, es, g)
+                if self.claude is not None:                                  # v1.10.0: enqueue only
+                    self.claude.maybe_pullback(self, p, st, bar_t, df, codes or ())
                 if st["bars"] and st["bars"] % self.SNAPSHOT_BARS == 0:
                     self._snapshot(p, st, bar_t)
 
@@ -802,4 +846,6 @@ class SymbolAgent(threading.Thread):
                                          color=EVENT_COLOURS["news"], footer=cfooter(self.S.display_name))
         if sig and not sig["consumed"] and sig["bar_time"] == bar_t:
             sig["consumed"] = True                       # nothing to flip; signal spent
+        if self.claude is not None:                      # v1.10.0: Claude verdicts AFTER the guardian — its hard exits win
+            self.claude.drain(self, pos)
         self.journal.save_state(self.symbol, self.state)

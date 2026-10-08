@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time as _time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -60,6 +61,18 @@ def close_connection():
         if _m:
             _m.shutdown()
         _m = None
+
+
+@contextmanager
+def try_lock(timeout: float = 2.0):
+    """For slash-command paths only: wait at most `timeout` s for the shared MT5 lock. Yields True when held
+    (MT5 calls inside re-enter the RLock), False when an agent is busy — the caller answers from cache instead."""
+    got = _lock.acquire(timeout=timeout)
+    try:
+        yield got
+    finally:
+        if got:
+            _lock.release()
 
 
 def _err() -> str:

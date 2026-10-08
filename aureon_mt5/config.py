@@ -1,10 +1,10 @@
-"""Aureon MT5 v1.9.7 — runtime configuration. Strategy thresholds and guardian profiles live inside each strategy package."""
+"""Aureon MT5 v1.10.0 — runtime configuration. Strategy thresholds and guardian profiles live inside each strategy package."""
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
 
-VERSION = "1.9.7"
+VERSION = "1.10.0"
 
 
 @dataclass
@@ -16,6 +16,7 @@ class Config:
     bars: int = 500
     webhook: str | None = os.environ.get("DISCORD_WEBHOOK")
     bot_token: str | None = os.environ.get("DISCORD_TOKEN")
+    health_webhook: str | None = os.environ.get("DISCORD_HEALTH_WEBHOOK") or None   # bot/Claude health cards; falls back to DISCORD_WEBHOOK
     channel_id: int | None = int(os.environ["DISCORD_CHANNEL"]) if os.environ.get("DISCORD_CHANNEL", "").isdigit() else None   # for TAKE/SKIP buttons
     ask_ttl_min: int = 20          # an ask expires after this many minutes
     risk_pct: float = float(os.environ.get("AUREON_RISK_PCT", "1.0"))   # AUREON-005: lot helper on ask cards (display only)
@@ -42,6 +43,15 @@ class Config:
     watchdog_ping: bool = os.environ.get("AUREON_WATCHDOG", "0") == "1"     # minute heartbeat to Supabase — off on the free plan
     # your manual SL rules: if you placed an SL wider than the guardian's P-phase stop, the guardian does not close at −pre_stop
     respect_manual_sl: bool = os.environ.get("AUREON_RESPECT_MANUAL_SL", "1") == "1"
+    # v1.10.0 Claude add-on (local `claude -p`, your Claude Code login — no API key, no SDK). off | review | advisory | manage
+    claude_mode: str = os.environ.get("AUREON_CLAUDE", "off").strip().lower()
+    claude_bin: str = os.environ.get("AUREON_CLAUDE_BIN", "claude")
+    claude_entry_model: str = os.environ.get("AUREON_CLAUDE_ENTRY_MODEL", "opus")
+    claude_pullback_model: str = os.environ.get("AUREON_CLAUDE_PULLBACK_MODEL", "sonnet")
+    claude_review_model: str = os.environ.get("AUREON_CLAUDE_REVIEW_MODEL", "haiku")
+    claude_max_calls: int = int(os.environ.get("AUREON_CLAUDE_MAX_CALLS", "30"))      # per IST day, all symbols
+    claude_timeout: float = float(os.environ.get("AUREON_CLAUDE_TIMEOUT", "90"))      # seconds per call
+    claude_workdir: str = os.environ.get("AUREON_CLAUDE_WORKDIR", "") or os.path.join(os.path.expanduser("~"), "aureon_claude")
     news_file: str | None = "news_blackout.txt"
     log_dir: str = "logs"
     source: str = os.environ.get("AUREON_SOURCE", "mt5")
