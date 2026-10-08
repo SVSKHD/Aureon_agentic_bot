@@ -18,12 +18,15 @@ def week_bounds(previous: bool = False) -> tuple[datetime, datetime]:
     return monday, monday + timedelta(days=7)
 
 
-def weekly_report(cfg, agents, journal, previous: bool = False) -> str:
+def weekly_report(cfg, agents, journal, previous: bool = False, mt5: bool = True) -> str:
+    """mt5=False: journal part only (used by /report when the MT5 lock is busy)."""
     start, end = week_bounds(previous)
     mode = next(iter(agents.values())).S.display_name if agents else cfg.mode
     L = [f"**AUREON WEEKLY REPORT** · v{VERSION}", f"Mode: {mode}", f"Week: {start:%d %b} → {(end - timedelta(days=1)):%d %b %Y}"]
     total = n = wins = 0
-    for sym in cfg.symbols:
+    if not mt5:
+        L.append("\n⏳ MT5 busy — closed trades skipped, journal data only")
+    for sym in (cfg.symbols if mt5 else []):
         deals = broker.closed_deals(sym, start, end)
         if deals:
             net = sum(d["profit"] for d in deals); w = sum(1 for d in deals if d["profit"] > 0)

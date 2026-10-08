@@ -1,10 +1,10 @@
-"""Aureon MT5 v1.9.7 — runtime configuration. Strategy thresholds and guardian profiles live inside each strategy package."""
+"""Aureon MT5 v1.9.8 — runtime configuration. Strategy thresholds and guardian profiles live inside each strategy package."""
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
 
-VERSION = "1.9.7"
+VERSION = "1.9.8"
 
 
 @dataclass
@@ -16,6 +16,7 @@ class Config:
     bars: int = 500
     webhook: str | None = os.environ.get("DISCORD_WEBHOOK")
     bot_token: str | None = os.environ.get("DISCORD_TOKEN")
+    health_webhook: str | None = os.environ.get("DISCORD_HEALTH_WEBHOOK") or None   # bot/Claude health cards; falls back to DISCORD_WEBHOOK
     channel_id: int | None = int(os.environ["DISCORD_CHANNEL"]) if os.environ.get("DISCORD_CHANNEL", "").isdigit() else None   # for TAKE/SKIP buttons
     ask_ttl_min: int = 20          # an ask expires after this many minutes
     risk_pct: float = float(os.environ.get("AUREON_RISK_PCT", "1.0"))   # AUREON-005: lot helper on ask cards (display only)

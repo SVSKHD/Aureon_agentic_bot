@@ -1,4 +1,4 @@
-# Aureon MT5 v1.8.3
+# Aureon MT5 v1.9.8
 
 You place the trade. Aureon detects (per selected EMA mode), fires a Discord gunshot, then manages what you placed:
 protect → secure +10 → ride in +5 steps → close on the fast-EMA turn → news safeguard. Reports and slash commands.
@@ -42,6 +42,8 @@ rejected modifications → `❌ AUREON GUARDIAN FAILURE` with retcode, retried, 
 ## Commands
 `/status` (version, mode, market, tick age, MT5, agent, guardian, position phase/SL/secured/peak, IST-day counters, last broker action) ·
 `/parallel-status` · `/agents` (components ✅/❌) · `/symbols` (mode, profile) · `/symbol-present` · `/market` · `/report [current]` (mode, signals by kind, secure steps, exits).
+Every command is acknowledged at once and answered by a followup. Status commands read a per-symbol snapshot the agent refreshes
+each poll ("as of N s ago"), so a busy MT5 never delays them. `/status` and `/agents` also show event-loop lag and gateway latency.
 
 ## Files
 `logs/journal.jsonl` (events: signal/secured/exit/closed/error, with `signal_kind`), `logs/guardian_state.json` (per symbol, with mode),

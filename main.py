@@ -1,4 +1,4 @@
-"""Aureon MT5 v1.8.3 — start here.
+"""Aureon MT5 — start here (version: aureon_mt5/config.py VERSION).
 
   python main.py --mode ema5080 --symbols XAUUSD
   python main.py --dry --mode ema5080 --symbols XAUUSD      # synthetic bars, no MT5 modifications
@@ -121,6 +121,7 @@ def main():
     if a.token: cfg.bot_token = a.token
 
     notify = Notifier(cfg.webhook); journal = Journal(cfg.log_dir); telemetry.setup(cfg.log_dir)
+    health_notify = Notifier(cfg.health_webhook) if cfg.health_webhook else notify
     if not cfg.dry:
         if not broker.connect():
             print("MT5 not available — is the terminal open and logged in? (use --dry for a pipe test)"); sys.exit(1)
@@ -165,7 +166,7 @@ def main():
                         fields=[{"name": "Enable explicitly", "value": "`--enable-silver`", "inline": True}],
                         footer="Aureon MT5")
     start_agents()
-    if cfg.bot_token: run_bot(cfg, agents, journal, notify, started)
+    if cfg.bot_token: run_bot(cfg, agents, journal, notify, started, health_notify=health_notify)
     else: print("no DISCORD_TOKEN — slash commands off, alerts via webhook only")
 
     was_open = broker.market_open(cfg.symbols[0], cfg.server_utc_offset, cfg.dry); report_day = None; last_update_check = 0

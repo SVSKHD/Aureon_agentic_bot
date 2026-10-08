@@ -59,6 +59,10 @@ class SymbolAgent(threading.Thread):
         self.health = {"status": "starting", "last_bar": None, "last_poll": None, "errors": 0, "managed": 0,
                        "close": None, "ema_fast": None, "ema_slow": None, "offset_h": self.off, "last_signal": None,
                        "last_broker_action": None, "guardian": "ON" if g else "OFF (no profile for this mode/symbol)"}
+        # v1.9.8: cached status for slash commands (replaced atomically each poll; the bot never calls MT5 for status)
+        self.snapshot: dict = {"at": None}
+        self._pos_seen: list | None = None
+        self._today_cache: tuple = (0.0, None)
         self._stop = threading.Event()
         for t, st in list(self.state.items()):
             if st.get("mode") and st["mode"] != strategy.name:
@@ -85,6 +89,7 @@ class SymbolAgent(threading.Thread):
                     if not announced_closed:
                         announced_closed = True
                         self.notify.send(self.key("MARKET", f"closed-{datetime.now(IST):%Y-%m-%d}"), ctitle(self.symbol, "MARKET CLOSED"), ["agent sleeping"], color=EVENT_COLOURS["market"], footer=cfooter(self.S.display_name))
+                    self._refresh_snapshot(False)
                     _time.sleep(30); continue
                 if announced_closed:
                     announced_closed = False
@@ -93,6 +98,7 @@ class SymbolAgent(threading.Thread):
                 m5 = broker.bars(self.symbol, self.cfg.bars, self.cfg.source, self.off)
                 closed = m5.df[m5.df["time"] + 300 <= broker.now_server(self.off)].reset_index(drop=True)
                 if len(closed) < 120:
+                    self._refresh_snapshot(True)
                     _time.sleep(self.cfg.poll_seconds); continue
                 bar_t = int(closed["time"].iloc[-1]); new_bar = bar_t != self.last_bar
                 df = self.S.add_emas(closed)
@@ -118,6 +124,7 @@ class SymbolAgent(threading.Thread):
                 self._track_leg(df, bar_t, new_bar, sgn)
                 if self.g is not None:
                     self._guard(new_bar, bar_t, df, close, ef, es, sgn)
+                self._refresh_snapshot(True)
             except Exception as e:
                 self.health["errors"] += 1; self.health["status"] = f"error: {e}"
                 telemetry.failure(self.notify, self.journal, title="AUREON AGENT ERROR", key=self.key("ERROR", f"loop-{type(e).__name__}"),
@@ -130,6 +137,27 @@ class SymbolAgent(threading.Thread):
             return None
         return context_chart(self.last_df, self.symbol, self.S.display_name, self.S.fast, self.S.slow, self.S.ema_cols, self.off,
                              self.chart_dir, bars=120, title_extra="on request")
+
+    # ------------------------------------------------------------------ v1.9.8 cached status snapshot (read by slash commands)
+    def _refresh_snapshot(self, market_open: bool):
+        """Runs on the agent thread after each poll. Never raises; slash commands read `self.snapshot` only."""
+        try:
+            now = _time.time()
+            pos = self._pos_seen if (self.g is not None and market_open and self._pos_seen is not None) else broker.positions(self.symbol)
+            self._pos_seen = None
+            if self._today_cache[1] is None or now - self._today_cache[0] >= 60:
+                self._today_cache = (now, self.journal.today(self.symbol))
+            self.snapshot = {
+                "at": now, "market_open": bool(market_open), "connected": broker.connected() or self.dry,
+                "mt5": "CONNECTED" if broker.connected() else ("DRY" if self.dry else "DISCONNECTED"),
+                "tick_age": broker.tick_age(self.symbol, self.off),
+                "positions": [dict(p) for p in (pos or [])],
+                "state": {t: dict(st) for t, st in self.state.items()},
+                "today": dict(self._today_cache[1]),
+                "health": dict(self.health),
+            }
+        except Exception as e:                       # a snapshot failure must never stop the agent
+            telemetry.info(f"snapshot refresh failed {self.symbol}: {e!r}")
 
     # ------------------------------------------------------------------ late-start catch-up (once)
     def _catch_up(self, closed, df, bar_t, close, ef, es):
@@ -650,6 +678,7 @@ class SymbolAgent(threading.Thread):
         g = self.g; cf, cs = self.S.ema_cols
         gap = (df[cf] - df[cs]).to_numpy()
         pos = broker.positions(self.symbol)
+        self._pos_seen = pos
         live = {p["ticket"] for p in pos}
         for t in list(self.state):
             if t not in live:
