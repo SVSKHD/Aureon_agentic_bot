@@ -233,6 +233,19 @@ def symbols_text(agents, cfg) -> str:
     return c["title"] + "\n" + "\n".join(f"{f['name']}: {f['value']}" for f in c.get("fields", []))
 
 
+def claude_card(claude, cfg) -> dict:
+    if claude is None:
+        return _embed("AUREON · MT5 · CLAUDE", "Claude add-on is **off** (`AUREON_CLAUDE=off`) — zero Claude calls.", color=GREY)
+    st = claude.status()
+    lat = f"{st['avg_latency']:.0f} s" if st["avg_latency"] is not None else "—"
+    login = st["login"]
+    fields = [_field("Mode", st["mode"].upper()), _field("Login", ("🟢 " if login == "OK" else "🔴 " if login == "FAILED" else "⚪ ") + login),
+              _field("Calls today", f"{st['calls']} / {st['limit']}"), _field("Avg latency", lat), _field("Queue", st["queue"]),
+              _field("Last verdict", st["last_verdict"], False), _field("Last error", st["last_error"][:300], False),
+              _field("Models", st["models"], False)]
+    return _embed("AUREON · MT5 · CLAUDE", "second opinion only — Claude never places a trade", color=BLURPLE, fields=fields)
+
+
 # ----------------------------------------------------------------------------- v1.9.8 command wrapper
 CMD_TIMEOUT = 15.0          # seconds a command's off-loop work may take before we answer "timed out"
 
@@ -326,6 +339,18 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             em.add_field(name=str(f["name"])[:256], value=str(f["value"])[:1024], inline=bool(f.get("inline", True)))
         em.set_footer(text=(item.get("footer") or "Aureon MT5")[:2048])
         return em
+
+    def _claude_edit(key, fld) -> bool:
+        """v1.10.0 (called from the Claude worker thread): add the Claude field to the posted ask card if it is still open."""
+        item = pending.get(key)
+        if not item or item.get("decided") or not item.get("message"):
+            return False
+        item["fields"] = list(item.get("fields") or []) + [fld]
+        fut = asyncio.run_coroutine_threadsafe(item["message"].edit(embed=_ask_embed(item)), client.loop)
+        fut.result(timeout=10)
+        return True
+
+    notify.claude_edit_hook = _claude_edit
 
     def _decide(item, decision, user):
         m = item.get("meta", {})
@@ -488,6 +513,38 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
                 return Reply(content=f"{sym}: no bars yet — try again after the first closed M5 bar")
             return Reply(card=card, file=path, source="live")
         await run(inter, "chart", work, timeout=20)
+
+    # ------------------------------------------------------------------ v1.10.0 Claude add-on (all off the loop via run())
+    claude_wait = float(getattr(cfg, "claude_timeout", 90)) * 2 + 15      # a call may queue behind one in flight
+
+    @tree.command(name="claude", description="Claude add-on: mode, login, calls today, last verdict")
+    async def claude_cmd(inter: discord.Interaction):
+        await run(inter, "claude", lambda: Reply(card=claude_card(claude, cfg)))
+
+    @tree.command(name="claude-test", description="One tiny Claude call to check the login")
+    async def claude_test(inter: discord.Interaction):
+        def work():
+            if claude is None:
+                return Reply(content="Claude add-on is off (`AUREON_CLAUDE=off`)")
+            r = claude.test_call()
+            if r is None:
+                return Reply(content="⛔ daily Claude budget used — no call made")
+            ok = r.ok and "OK" in (r.text or "").upper()
+            return Reply(content=(f"🟢 Claude login OK · {r.latency_s:.0f} s" if ok else f"🔴 Claude test failed: {r.error or r.text[:200]}"), source="live")
+        await run(inter, "claude-test", work, timeout=claude_wait)
+
+    @tree.command(name="claude-review", description="Claude review of a day's journal (default today, IST)")
+    @app_commands.describe(date="YYYY-MM-DD (IST), default today")
+    async def claude_review(inter: discord.Interaction, date: str = ""):
+        def work():
+            if claude is None:
+                return Reply(content="Claude add-on is off (`AUREON_CLAUDE=off`)")
+            day = date.strip() or None
+            if day:
+                datetime.strptime(day, "%Y-%m-%d")       # ValueError → '⚠️ command failed'
+            text = claude.daily_review(day)
+            return Reply(content=f"CLAUDE REVIEW {day or 'today'}:\n{text}"[:1900], source="live")
+        await run(inter, "claude-review", work, timeout=claude_wait)
 
     def _runner():
         asyncio.set_event_loop(asyncio.new_event_loop())

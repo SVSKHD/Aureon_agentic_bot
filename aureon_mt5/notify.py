@@ -110,6 +110,7 @@ class Notifier:
         import queue as _q
         self.ask_queue: "_q.Queue[dict]" = _q.Queue()   # consumed by the bot (TAKE / SKIP buttons)
         self.bot_ready = False                          # set by bot.py when it can post interactive asks
+        self.claude_edit_hook = None                    # v1.10.0: set by bot.py — adds the Claude field to a posted ask card
 
     # ------------------------------------------------------------------ embed
     def make_embed(self, title: str, description: str = "", *, fields: list[dict] | None = None, color: int | None = None,

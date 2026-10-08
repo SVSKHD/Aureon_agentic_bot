@@ -1,4 +1,4 @@
-# Aureon MT5 v1.9.8
+# Aureon MT5 v1.10.0
 
 You place the trade. Aureon detects (per selected EMA mode), fires a Discord gunshot, then manages what you placed:
 protect → secure +10 → ride in +5 steps → close on the fast-EMA turn → news safeguard. Reports and slash commands.
@@ -67,3 +67,33 @@ Validation order: `detect.py --live` → `main.py --mode ema5080 --symbols XAUUS
 Dedupe keys are committed only after a successful webhook post (HTTP 2xx). A failed post is retried on the next poll;
 after 20 failed attempts the key is committed with a log line so a dead webhook cannot loop forever. Console mode
 (no webhook) counts as delivered. Guardian ordering (MT5 → state → journal → Discord) is unchanged. Version strings aligned.
+
+## Claude add-on (v1.10.0)
+Aureon stays the data layer, the rules, and the only thing that talks to MT5 and Discord. Claude is a second opinion,
+called as a local program (`claude -p … --output-format json`) with your Claude Code login — no API key, no SDK,
+no HTTP calls from Aureon. **You place every trade. Claude never places a trade.**
+
+| `AUREON_CLAUDE` | what happens |
+|---|---|
+| `off` (default) | no Claude calls at all — v1.9.x behaviour |
+| `review` | 23:00 IST `CLAUDE REVIEW` card of the day's journal |
+| `advisory` | review + Claude's TAKE/SKIP on P / CROSS / RE cards + `CLAUDE PULLBACK VERDICT` cards; nothing applied |
+| `manage` | advisory + pullback TIGHTEN and CLOSE-in-profit applied to your open trades |
+
+When it is asked: a P PRE-CROSS, CONFIRMED CROSS or RE-ENTRY at bar close (entry model) · a pullback in an open trade —
+trend state PULLBACK / WEAKENING / CHALLENGED, profit ≤ 60% of a peak ≥ +5, or a SHOULD WE CLOSE? card — once per
+pullback, re-armed after a new peak (pullback model) · 23:00 IST (review model). ema5080 only.
+
+Safety: the poll never waits (one background worker, one call at a time, timeout) · fail closed — timeout, bad JSON,
+wrong decision, auth error, budget used or a verdict after the next bar closed (STALE) are never acted on · TIGHTEN goes
+through the guardian's `_move_sl` (never loosens, announced after MT5 confirms) · CLOSE only in `manage` and only in profit,
+after the guardian's own exits · snapshots carry market data only (no account, balance, login, webhook, token) ·
+`ANTHROPIC_API_KEY` is removed from the subprocess environment and a warning card is posted if it is set.
+
+Commands: `/claude` (mode, login, calls today/limit, last verdict, avg latency) · `/claude-test` · `/claude-review [YYYY-MM-DD]`.
+Journal: `claude_verdict` (`claude_event, symbol, model, latency_s, decision, side, confidence, reason, my_action, acted, stale`,
+`source=claude`). `/report` has a Claude section (TAKE vs SKIP outcomes, you vs Claude, pullback verdicts vs the guardian).
+`reports.claude_rows_for_batch()` returns the rows for the Saturday `aureon_decisions` batch (`source='claude'`).
+Rules prompt: `prompts/claude_rules.md`. Daily budget: `logs/claude_budget.json`.
+
+Check on your PC: `claude -p "Reply only: OK"` from `C:\aureon_claude` prints OK → `AUREON_CLAUDE=review` → `/claude-test`.

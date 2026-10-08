@@ -16,6 +16,7 @@ from datetime import date, datetime, timedelta, timezone
 from aureon_mt5 import broker, telemetry
 from aureon_mt5.agent import SymbolAgent
 from aureon_mt5.bot import run_bot
+from aureon_mt5.claude_advisor import ClaudeAdvisor
 from aureon_mt5.config import Config, VERSION
 from aureon_mt5.journal import Journal
 from aureon_mt5.notify import Notifier
@@ -104,6 +105,19 @@ def supervise(agents: dict, factory, notify, mode: str) -> list[str]:
     return restarted
 
 
+def claude_review_tick(claude, cfg, review_day, now: datetime | None = None):
+    """23:00 IST (cfg.daily_report_ist): queue the day's CLAUDE REVIEW once per IST day. Runs on the Claude worker, never here."""
+    if claude is None:
+        return review_day
+    now = now or datetime.now(IST)
+    hh, mm = (int(x) for x in cfg.daily_report_ist.split(":"))
+    today = now.strftime("%Y-%m-%d")
+    if review_day != today and (now.hour, now.minute) >= (hh, mm):
+        claude.request_review(today)
+        return today
+    return review_day
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode"); ap.add_argument("--symbols"); ap.add_argument("--dry", action="store_true")
@@ -130,11 +144,19 @@ def main():
     news_line, unverified = news_status(cfg.news_file)
 
     agents: dict[str, SymbolAgent] = {}; started = _time.time()
+    claude = ClaudeAdvisor.create(cfg, notify, journal, health_notify=health_notify)     # None when AUREON_CLAUDE=off
+    if claude is not None:
+        print(f"Claude add-on: {claude.mode} · bin {cfg.claude_bin} · workdir {cfg.claude_workdir} · {cfg.claude_max_calls} calls/day")
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            health_notify.card("AUREON · MT5 · CLAUDE · API KEY SET",
+                               "`ANTHROPIC_API_KEY` is set in this environment. Aureon removes it from the `claude -p` call so your "
+                               "subscription login is used — remove it from the environment to be sure nothing bills the API.",
+                               footer="Aureon MT5 · Claude")
 
     def start_agents():
         for s in cfg.symbols:
             if s not in agents or not agents[s].is_alive():
-                agents[s] = SymbolAgent(s, cfg, S, notify, journal, news); agents[s].start()
+                agents[s] = SymbolAgent(s, cfg, S, notify, journal, news, claude=claude); agents[s].start()
 
     why = "online"
     try:
@@ -166,10 +188,11 @@ def main():
                         fields=[{"name": "Enable explicitly", "value": "`--enable-silver`", "inline": True}],
                         footer="Aureon MT5")
     start_agents()
-    if cfg.bot_token: run_bot(cfg, agents, journal, notify, started, health_notify=health_notify)
+    if cfg.bot_token: run_bot(cfg, agents, journal, notify, started, health_notify=health_notify, claude=claude)
     else: print("no DISCORD_TOKEN — slash commands off, alerts via webhook only")
 
     was_open = broker.market_open(cfg.symbols[0], cfg.server_utc_offset, cfg.dry); report_day = None; last_update_check = 0
+    review_day = None
     while True:
         try:
             now = _time.time()
@@ -184,7 +207,8 @@ def main():
             if not was_open and is_open:
                 greet(notify, cfg, S, "market open — Aureon resumed", news_line); start_agents()
             was_open = is_open
-            supervise(agents, lambda sym: SymbolAgent(sym, cfg, S, notify, journal, news), notify, cfg.mode)
+            review_day = claude_review_tick(claude, cfg, review_day)
+            supervise(agents, lambda sym: SymbolAgent(sym, cfg, S, notify, journal, news, claude=claude), notify, cfg.mode)
         except KeyboardInterrupt:
             broker.close_connection(); print("bye"); return
         except Exception as e:
