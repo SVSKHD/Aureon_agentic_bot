@@ -25,7 +25,9 @@ def test_invalid_mode_rejected():
 
 def test_strategies_isolated():
     a, b = get_strategy("ema5080"), get_strategy("ema2050")
-    assert a.guardian_for("XAUUSD") is not None and b.guardian_for("XAUUSD") is None     # 20/50 gets no 50/80 guardian rules
+    ga, gb = a.guardian_for("XAUUSD"), b.guardian_for("XAUUSD")
+    assert ga is not None and gb is not None and ga is not gb                            # v2.0.0: 20/50 has its OWN profile, never the 50/80 one
+    assert (ga.pre_stop, ga.early_at, ga.p_phase) == (6.0, None, True) and (gb.pre_stop, gb.early_at, gb.p_phase) == (12.0, 3.0, False)
     assert a.ema_cols != b.ema_cols and (a.fast, a.slow) == (50, 80) and (b.fast, b.slow) == (20, 50)
 
 
