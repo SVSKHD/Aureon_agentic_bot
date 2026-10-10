@@ -2,6 +2,51 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.0.0 — 2026-10-10  (ema2050 un-frozen: a NEW ACTIVE strategy · /alert price alerts · Claude add-on for both modes)
+- **ema2050 is ACTIVE** with its own rules and live guardian profile; `ema5080` stays the default and is untouched (thresholds, guardian
+  values and all its tests unchanged; a test pins its Guardian dataclass byte-identical).
+- Detection (`strategies/ema2050/journeys.py`, GOLD): EMA 20/50 on M5 · cross = sign change on a closed bar · **confirm** = order holds ≥ 3 bars
+  AND |gap| ≥ 1.5 pts within 18 bars (first bar with both); a flip before → **multi cross**, no trade · **pullback entry**: touch of EMA20 within
+  1.5 (touch between cross and confirm → enter at the confirm bar; else first touch after confirm up to confirm+12; fallback at confirm+12 only if
+  |close − EMA20| ≤ 5 and the order holds; never chase beyond 5) · no entries server 21:00–23:59 / outside 05:30–23:00 IST (stricter wins) ·
+  news 60/30 via `common/news.py` as ema5080 · pre-cross shoot (40 bars) reported only · reentry_max=0, skip_sessions=(), m15_align=False,
+  min_slope50=0, max_extension=0, min_shoot=0. Removed: late_entry, target/protect/trail_arm/let_run, leg_mode, pyramid, pre_entry/PB/PS.
+- Guardian profile (`GUARDIANS["XAU"]`, XAG disabled): pre_stop **12** · **early lock** +3 seen → SL entry +1 (new `Guardian.early_at/early_level`,
+  defaults None/0 keep ema5080 unchanged) · secure +10 → SL +10 (announced after MT5 confirms) · ride +5 (2 pts air) · ema_slow_sl_buffer 0 and
+  `slow_ema_sl=False` (**no EMA50 follow-SL, no close through EMA50**) · close on the EMA20 turn once secured · exit on the next **confirmed**
+  opposite cross (`exit_on_confirmed_cross`) · `p_phase=False`: P timeout / pre-stop / separation-abort paths skipped · SL never loosened ·
+  live SL is the truth · `respect_manual_sl` as configured.
+- Cards: CROSS (unconfirmed) · CROSS CONFIRMED · MULTI CROSS (ignored) · ENTER LONG/SHORT (pullback | no-pullback, TAKE/SKIP) · NO ENTRY (too far
+  from EMA20 | no-entry hour | news) · EARLY LOCK · OPPOSITE CROSS · CLOSED; each with cross time, confirm time, shoot, session, EMA20/50, bars since cross.
+- `run.py`: `--from/--to` day-by-day replay (entries inside the server day, open trades closed at the day end), `--lot`, `--point-value`, `--trades`,
+  and the research summary block (profit pts and $, moves offered, available at entry, captured %, trades/winners/losers/stops, goal days ≥ 10,
+  losing days, best/worst day, max drawdown, month table). `detect.py --mode ema2050`: per bar EMAs, cross, confirm state, pullback touch,
+  entry allowed, reason (`common/verdict.py`, shared with the alert card).
+- Data it was decided on: XAUUSD M5 2026-07-01..2026-10-09 (guardian rules: +475.7 pts, 211 trades, 39 losers, 34 stops, max DD −35.0;
+  Jul +222.5 / Aug +33.5 / Sep +134.8 / Oct +85.0; 2026-10-07: 03:30 short +10 secured, 19:20 long +13, 22:50 short −6.2 day end) and the
+  2025 out-of-sample set 2025-06..2025-12 (guardian rules **+297.8 pts / 143 days**; the trend-engine variant **−33 pts, rejected**; trend / hold /
+  filter variants failed 2025 and were not added). Research scripts (`research/ema2050_scan.py`, `research/harness.py`) are not in this
+  repository, so the replay could not be diffed against the scan in this change; run `python run.py --mode ema2050 --from 2026-07-01 --to 2026-10-09`
+  on the MT5 machine to confirm (±2 pts, same trade count). Known convention choices to check first if it differs: SL levels armed by bar k apply
+  from bar k+1 (as the 50/80 replay); news_flat (15 min, ≥ +1) is replayed because the live guardian does it; crosses before the server day are
+  context only.
+- **/alert price alerts** (both modes): `/alert <price> [symbol] [note]`, `/alerts`, `/alert-cancel <id>`, `/alert-clear`; `logs/alerts.json`;
+  fires once on the guardian's tick (ask from below, bid from above), never on a stale tick; ALERT REACHED card with EMA behaviour, trend
+  behaviour (ema5080/trend.py state machine on the mode's lines), guardian context and the SUGGEST line = the mode's own entry verdict for the
+  bar (never a new rule); [LONG] [SHORT] [SKIP] buttons → `alert_decision` journal; order placed only with `AUREON_EXECUTION=1` on demo (or
+  `AUREON_ALLOW_LIVE=1`) through the new `broker.place_market`, otherwise the guardian is armed for the trade you place (alert id attached);
+  Alerts section in `/report` and the Saturday card.
+- Claude add-on: advises both modes (ema2050: ENTER bar + pullbacks only); snapshot fields `crosses_today, bars_since_cross, confirm_state,
+  dist_to_fast_ema_pts, swing_against_last6_pts, atr20, day_pnl_pts, trades_today` + position `mae_so_far, retrace_from_peak_pts, retrace_pct,
+  bars_since_peak, closed_through_slow_ema, dist_to_sl` (no account data); `"evidence": [...]` in the reply contract, journaled with the compact
+  snapshot fields; mode-aware prompt (`prompts/claude_rules.md` rewritten with one section per mode — placeholder until
+  `research/claude_rules_v2.md` is supplied); Saturday CLAUDE RULE PROPOSALS card (up to 3 lines with support) + `/claude-rules`,
+  `/claude-rules-approve <n>` (appends a dated line; nothing changes without approval). Alert add-on line in review/advisory/manage.
+- Broker: `tick`, `account`/`is_demo`, `place_market`, plus the helpers the agent already referenced (`spread`, `lot_for_risk`, `bars_tf`, `close_partial`).
+- 53 new tests (188 in this repository).
+- Strategy rules changed: YES (ema2050 un-frozen: confirm 3 bars/1.5 gap, pullback entry, guardian pre_stop 12, early lock +3->+1, no EMA50 follow-SL).
+  /alert and the Claude add-on changes: strategy rules changed: NO (they read rules, never add one).
+
 ## v1.11.0 — 2026-10-08  (weekly compare: Detector vs Claude vs Me)
 - NEW `compare.py`: on the same detector signals (P / CROSS / RE, ema5080) — Detector · all, Claude TAKE / SKIP, Me TAKEN / SKIPPED,
   both disagreement groups; n, win rate, expectancy, total, STOP count, worst losing streak, biggest loss; OPEN / UNGRADED /
