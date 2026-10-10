@@ -30,6 +30,12 @@ class Guardian:
     ema_slow_sl_buffer: float = 0.0
     enabled: bool = True
     note: str = ""
+    # ---- v2.0.0 additions. Defaults keep every ema5080 profile byte-identical (a test enforces it).
+    early_at: float | None = None       # MFE at which the early lock arms (None = no early lock)
+    early_level: float = 0.0            # SL = entry + early_level once early_at is seen (never loosened)
+    p_phase: bool = True                # False = no P phase at all: pre-stop / timeout / separation-abort paths are skipped
+    slow_ema_sl: bool = True            # post-cross follow-SL on the slow EMA and the close on a bar through it (False = off)
+    exit_on_confirmed_cross: bool = False   # close the position on the next CONFIRMED opposite cross (same confirm rule)
 
 
 class Strategy:
@@ -42,6 +48,7 @@ class Strategy:
     def analyse(self, bars, symbol: str, server_offset_h: float, news, display_from=None, trade_from=None) -> dict: ...
     def add_emas(self, df): ...
     ema_cols: tuple = ("ema_fast", "ema_slow")   # column names of the fast/slow EMA in this strategy's dataframe
+    day_end_exit: bool = False                    # analyse() accepts day_end= and closes open journeys there (replay)
     def render_png(self, *a, **k): ...
     def render_html(self, *a, **k): ...
     def describe(self) -> str: return self.display_name
