@@ -761,7 +761,8 @@ class SymbolAgent(threading.Thread):
         return False
 
     def _close(self, p, reason, title, key, st, journal_reason=None, bar_t=None):
-        event_name = {"p_flip": "FLIP CLOSE", "news_flat": "BANKED BEFORE NEWS", "claude_close": "CLAUDE CLOSED"}.get(journal_reason or "", None)
+        event_name = {"p_flip": "FLIP CLOSE", "news_flat": "BANKED BEFORE NEWS", "claude_close": "CLAUDE CLOSED",
+                      "opposite_cross": "OPPOSITE CROSS · CLOSED"}.get(journal_reason or "", None)
         if bar_t is not None and st.get("closing_bar") == bar_t:
             return                                      # one close attempt per bar
         st["closing_bar"] = bar_t

@@ -18,6 +18,8 @@ Entry (pullback to EMA20):
 Exits are the GUARDIAN's (replayed here from the Guardian profile): −pre_stop stop · early lock (+early_at seen ->
 SL entry+early_level) · secure +10 -> SL +10 · ride +5 steps (2 pts air) · close on an EMA20 turn once secured ·
 exit at the next CONFIRMED opposite cross · news flat · day end. No EMA50 follow-SL. One trade per cross.
+Replay convention (same as the 50/80 replay): an SL level armed by bar k's extreme is tested from bar k+1; the stop check
+on bar k uses the level in force at its open. Bar-close exits (EMA20 turn, opposite cross, day end) use the updated level.
 Pre-cross shoot (report only): the move already made in the new direction over the shoot_bars bars before the cross.
 Everything is in price points; on gold $1 of price = $1 per ounce.
 """
@@ -301,28 +303,31 @@ def build(df: pd.DataFrame, rules: Rules, server_offset_h: float = 3.0, trade_fr
             fav = (high[k] - jn.entry_price) if s > 0 else (jn.entry_price - low[k])
             adv = (low[k] - jn.entry_price) if s > 0 else (jn.entry_price - high[k])
             mfe = max(mfe, fav); mae = min(mae, adv)
-            # locks move on this bar's favourable extreme first (same convention as the 50/80 replay), then the stop check
-            if g.early_at is not None and mfe >= g.early_at and sl < g.early_level:
-                sl = g.early_level; jn.lock_index = k
-            if mfe >= g.secure_at and sl < g.secure_level:
-                sl = g.secure_level; jn.target_index = jn.target_index if jn.target_index is not None else k
-            while sl >= g.secure_level and mfe >= sl + g.ride_step + g.ride_step * 0.4:
-                sl += g.ride_step
             unreal = s * (close[k] - jn.entry_price)
             tk_utc = int(time[k]) - server_offset_h * 3600
             reason = None; px = float(close[k])
+            # 1) the SL in force at this bar's open (a lock armed on bar k is tested from bar k+1 — the 50/80 replay convention)
             if rules.news_filter and any(r - rules.news_flat_min * 60 <= tk_utc < r for r in rules.news_times) and \
                     (unreal >= rules.news_flat_min_profit or rules.news_flat_losers):
                 reason = "news_flat"
             elif adv <= sl:
                 reason = "stop" if sl <= -g.pre_stop else ("early" if sl < g.secure_level else "secured")
                 px = jn.entry_price + s * sl
-            elif sl >= g.secure_level and ((close[k] < e20[k]) if s > 0 else (close[k] > e20[k])):
-                reason = "ema20_turn"
-            elif k in opp_confirm_of and opp_confirm_of[k].direction != x.direction:
-                reason = "opposite_cross"
-            elif k == end_k and day_end is not None and at_day_end and rules.day_end_close:
-                reason = "day_end"
+            if reason is None:
+                # 2) locks from this bar's favourable extreme: early lock, secure, ride steps (2 pts air)
+                if g.early_at is not None and mfe >= g.early_at and sl < g.early_level:
+                    sl = g.early_level; jn.lock_index = k
+                if mfe >= g.secure_at and sl < g.secure_level:
+                    sl = g.secure_level; jn.target_index = jn.target_index if jn.target_index is not None else k
+                while sl >= g.secure_level and mfe >= sl + g.ride_step + g.ride_step * 0.4:
+                    sl += g.ride_step
+                # 3) bar-close exits
+                if sl >= g.secure_level and ((close[k] < e20[k]) if s > 0 else (close[k] > e20[k])):
+                    reason = "ema20_turn"
+                elif k in opp_confirm_of and opp_confirm_of[k].direction != x.direction:
+                    reason = "opposite_cross"
+                elif k == end_k and day_end is not None and at_day_end and rules.day_end_close:
+                    reason = "day_end"
             if reason:
                 jn.exit_index, jn.exit_time, jn.exit_price, jn.exit_reason = k, int(time[k]), float(px), reason
                 break
