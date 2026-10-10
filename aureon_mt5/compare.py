@@ -325,6 +325,7 @@ class CompareResult:
     rules_hash: str
     png: str | None = None
     history: list = field(default_factory=list)
+    alerts: dict | None = None           # v2.0.0: alerts.stats() of the window (fired, taken, agreed, win/loss)
 
 
 def rules_hash(path: str = RULES_PATH) -> str:
@@ -344,8 +345,10 @@ def compute(records: list[dict], graded: list, since: int, until: int, off: floa
         grading_note = f"scorecard graded {len(graded)} signal(s) but none matched a journal signal bar — check the bar-time field"
     models = sorted({str(v.get("model")) for v in records if v.get("event") == "claude_verdict" and v.get("model")
                      and since <= v["t"] < until})
+    from . import alerts as _alerts
     res = CompareResult(since, until, rows, g, m, verdict(m), disagreements(g), pullbacks(records, since, until, off, bars),
-                        grading_note, models, rules_hash(), history=history or [])
+                        grading_note, models, rules_hash(), history=history or [],
+                        alerts=_alerts.stats([r for r in records if since <= r.get("t", 0) < until]))
     if png_path:
         last_bar = max([r.bar for r in rows], default=None)
         res.png = chart(rows, png_path, off, f"Detector vs Claude vs Me · {_fmt_day(since)} → {_fmt_day(until - 1)}",
@@ -500,6 +503,11 @@ def card(res: CompareResult, *, title: str = "AUREON · MT5 · COMPARE", mode_di
         pbt += "\n" + " · ".join(extra)
     fields.append({"name": "Pullbacks (Claude vs guardian)", "value": pbt, "inline": False})
     fields.append({"name": "Excluded", "value": f"OPEN {det.open} · UNGRADED {det.ungraded} · no verdict {len(res.groups['no_verdict'])}", "inline": False})
+    al = res.alerts or {}
+    if al.get("fired") or al.get("taken"):                               # v2.0.0 alerts section
+        agree = f"{al['agreed']}/{al['taken']}" if al["taken"] else "—"
+        fields.append({"name": "Alerts", "value": (f"fired {al['fired']} · taken {al['taken']} (skipped {al['skipped']}) · agreed with the bot {agree}\n"
+                                                   f"taken & closed {al['graded']}: win {al['wins']} / loss {al['losses']} · {al['points']:+.1f} pts"), "inline": False})
     tl = trend_line(res.history, res)
     if tl:
         fields.append({"name": "Expectancy · last 4 weeks", "value": tl[:1024], "inline": False})

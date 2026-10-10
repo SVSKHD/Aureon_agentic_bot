@@ -44,6 +44,8 @@ def weekly_report(cfg, agents, journal, previous: bool = False, mt5: bool = True
     L.append(f"Secure steps: {len(sec)} · locked total +{sum(float(r.get('step', 0)) for r in sec):g}")
     L.append("Auto exits: " + (", ".join(f"{k} {v}" for k, v in ex.items()) or "none"))
     L += claude_summary(recs)
+    from . import alerts as _alerts                                     # v2.0.0 alerts section
+    L += _alerts.stats_lines(_alerts.stats(recs))
     if not n and not recs:
         L.append("nothing recorded this week")
     return "\n".join(L)

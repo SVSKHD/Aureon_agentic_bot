@@ -196,6 +196,65 @@ def close(ticket: int, symbol: str, comment: str = "aureon") -> BrokerResult:
                         last_error="" if ok else _err(), bid=tick.bid if tick else None, ask=tick.ask if tick else None)
 
 
+def tick(symbol: str) -> dict | None:
+    """The same tick the guardian prices positions with: {bid, ask, time} (server epoch). None without MT5 / no tick."""
+    m = mt5()
+    if not m:
+        return None
+    with _lock:
+        t = m.symbol_info_tick(symbol)
+    if not t or not t.time:
+        return None
+    return {"bid": float(t.bid), "ask": float(t.ask), "time": int(t.time)}
+
+
+def account() -> dict | None:
+    """{balance, equity, currency, trade_mode: demo|contest|real, login_masked}. None without MT5. Never logged in full."""
+    m = mt5()
+    if not m:
+        return None
+    with _lock:
+        a = m.account_info()
+    if a is None:
+        return None
+    mode = {0: "demo", 1: "contest", 2: "real"}.get(int(getattr(a, "trade_mode", 2)), "real")
+    return {"balance": float(a.balance), "equity": float(getattr(a, "equity", a.balance)), "currency": str(getattr(a, "currency", "")),
+            "trade_mode": mode, "login_masked": f"***{str(getattr(a, 'login', ''))[-3:]}"}
+
+
+def is_demo() -> bool | None:
+    """True on a demo/contest account, False on real, None when unknown (no MT5)."""
+    a = account()
+    return None if a is None else (a["trade_mode"] in ("demo", "contest"))
+
+
+def place_market(symbol: str, side: str, lots: float, sl: float | None = None, comment: str = "aureon-alert") -> BrokerResult:
+    """v2.0.0 — the ONE order-placement path (used by the alert LONG/SHORT buttons when AUREON_EXECUTION=1).
+    Callers decide the policy (execution_enabled, demo/allow_live, max_lots); this only sends the request and reports the retcode."""
+    m = mt5()
+    if not m:
+        return BrokerResult(False, "NO_CONNECTION", comment="no MT5")
+    with _lock:
+        m.symbol_select(symbol, True)
+        t = m.symbol_info_tick(symbol)
+        if not t:
+            return BrokerResult(False, "BROKER_REJECTED", comment="no tick", last_error=_err())
+        is_buy = side.upper() in ("LONG", "BUY")
+        req = {"action": m.TRADE_ACTION_DEAL, "symbol": symbol, "volume": float(lots),
+               "type": m.ORDER_TYPE_BUY if is_buy else m.ORDER_TYPE_SELL, "price": t.ask if is_buy else t.bid,
+               "deviation": 30, "comment": comment[:31], "type_filling": m.ORDER_FILLING_IOC}
+        if sl is not None:
+            req["sl"] = round(float(sl), digits(symbol))
+        r = m.order_send(req)
+        if r is not None and r.retcode != m.TRADE_RETCODE_DONE:
+            req["type_filling"] = m.ORDER_FILLING_FOK; r = m.order_send(req)
+    if r is None:
+        return BrokerResult(False, "BROKER_REJECTED", comment="order_send returned None", last_error=_err(), bid=t.bid, ask=t.ask)
+    ok = r.retcode == m.TRADE_RETCODE_DONE
+    return BrokerResult(ok, "PLACED" if ok else "BROKER_REJECTED", changed=ok, retcode=r.retcode, comment=getattr(r, "comment", ""),
+                        last_error="" if ok else _err(), requested_sl=sl, bid=t.bid, ask=t.ask)
+
+
 def tick_age(symbol: str, off: float) -> int | None:
     m = mt5()
     if not m:

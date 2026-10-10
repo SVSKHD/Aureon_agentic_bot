@@ -26,15 +26,19 @@ from .common.timeutil import IST, bar_key, ist_str as ist
 from .common.news import session_of
 from .common.context_chart import context_chart
 from .strategies.ema5080.trend import find_reentries, state_of
+from . import alerts as alerts_mod
 import os
 import numpy as np
 
 
 class SymbolAgent(threading.Thread):
-    def __init__(self, symbol: str, cfg: Config, strategy: Strategy, notify: Notifier, journal: Journal, news: tuple, claude=None):
+    def __init__(self, symbol: str, cfg: Config, strategy: Strategy, notify: Notifier, journal: Journal, news: tuple, claude=None, alerts=None):
         super().__init__(daemon=True, name=f"agent-{symbol}")
-        # v1.10.0 Claude add-on: hooks only when the advisor advises this strategy (ema5080, advisory/manage). None = v1.9.x behaviour.
+        # v1.10.0 Claude add-on: hooks only when the advisor advises this strategy (advisory/manage). None = v1.9.x behaviour.
         self.claude = claude if (claude is not None and claude.advises(strategy)) else None
+        self.claude_any = claude              # v2.0.0: the advisor in ANY mode (review included) — the alert card's add-on line
+        self.alerts = alerts if alerts is not None else alerts_mod.AlertStore(cfg.log_dir)   # v2.0.0 /alert store (shared by main)
+        self.pending_alert: dict | None = None   # {"alert_id", "side"}: attach to the next position seen on this symbol
         self.claude_inbox: "queue.Queue[dict]" = queue.Queue()
         self.symbol, self.cfg, self.S, self.notify, self.journal, self.news = symbol, cfg, strategy, notify, journal, news
         self.dry = cfg.dry
@@ -131,6 +135,7 @@ class SymbolAgent(threading.Thread):
                 if self.g is not None:
                     self._guard(new_bar, bar_t, df, close, ef, es, sgn)
                 self._refresh_snapshot(True)
+                self._check_alerts(closed, df, bar_t)
             except Exception as e:
                 self.health["errors"] += 1; self.health["status"] = f"error: {e}"
                 telemetry.failure(self.notify, self.journal, title="AUREON AGENT ERROR", key=self.key("ERROR", f"loop-{type(e).__name__}"),
@@ -647,6 +652,47 @@ class SymbolAgent(threading.Thread):
             if self.claude is not None and kind in ("P", "cross"):          # v1.10.0: enqueue only — never blocks the poll
                 self.claude.request_entry(self, kind, side, bar_t, df, card_key=ask_key)
 
+    # ------------------------------------------------------------------ v2.0.0 price alerts (every poll, on the guardian's tick)
+    def _tick(self, df) -> dict | None:
+        if self.dry:
+            px = float(df["close"].iloc[-1]); return {"bid": px, "ask": px, "time": broker.now_server(self.off)}
+        return broker.tick(self.symbol)
+
+    def _check_alerts(self, closed, df, bar_t):
+        """Fires once per alert when the tick crosses the level from the side_hint side. Stale tick (> heartbeat_stale_min) or no tick:
+        nothing fires — re-checked when fresh. Card = alerts.reached_card (EMA + trend + guardian + the mode's own SUGGEST line)."""
+        store = self.alerts
+        try:
+            if store is None or not store.armed(self.symbol):
+                return
+            tk = self._tick(df)
+            if not tk:
+                return
+            if broker.now_server(self.off) - tk["time"] > self.cfg.heartbeat_stale_min * 60:
+                return
+            for a in store.check(self.symbol, tk["bid"], tk["ask"], bar_t):
+                self.journal.log("alert_fired", symbol=self.symbol, mode=self.S.name, alert_id=a["id"], price=a["price"], hit=a["hit_price"],
+                                 side_hint=a["side_hint"], note=a.get("note"), bar=bar_t, created_t=a.get("created_t"))
+                res = self.last_res
+                if res is None:
+                    res = self.S.analyse({"M5": Bars(self.symbol, "M5", closed)}, self.symbol, self.off, self.news)["M5"]; self.last_res = res
+                card = alerts_mod.reached_card(self, a, a["hit_price"], tk["time"], bar_t, df, res)
+                png = context_chart(df, self.symbol, self.S.display_name, self.S.fast, self.S.slow, self.S.ema_cols, self.off, self.chart_dir,
+                                    bars=120, title_extra=f"alert {a['price']:.2f}")
+                self.notify.ask(card["key"], card["title"], card["lines"], png=png, fields=card["fields"], color=card["color"],
+                                footer=card["footer"], meta=card["meta"])
+                self.health["last_signal"] = f"ALERT {a['price']:.2f} @ {ist(bar_t, self.off)}"
+                cl = self.claude_any
+                if cl is not None and getattr(cl, "mode", "off") != "off" and hasattr(cl, "request_alert"):
+                    cl.request_alert(self, a, card, df, bar_t)
+        except Exception as e:
+            telemetry.failure(self.notify, self.journal, title="AUREON ALERT ERROR", key=self.key("ERROR", "alerts"), mode=self.S.name,
+                              symbol=self.symbol, action="alert check", exc=e)
+
+    def attach_alert(self, alert_id: str, side: str):
+        """A LONG/SHORT button without execution: 'place it in MT5, I will manage it' — the next position seen carries the alert id."""
+        self.pending_alert = {"alert_id": alert_id, "side": side.upper(), "t": _time.time()}
+
     # ------------------------------------------------------------------ detection, EMA 20/50 (v2.0.0)
     def _detect_2050(self, res, df, bar_t, close, ef, es):
         """CROSS (unconfirmed) · CROSS CONFIRMED · MULTI CROSS (ignored) · ENTER (pullback | no-pullback) · NO ENTRY (reason).
@@ -771,7 +817,7 @@ class SymbolAgent(threading.Thread):
             self.closed_by_aureon.add(p["ticket"])
         self.health["last_broker_action"] = f"close {r.status} {datetime.now(IST):%H:%M:%S}"
         self.journal.log("exit", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], points=p["points"],
-                         reason=journal_reason or reason, auto=bool(r.ok))
+                         reason=journal_reason or reason, auto=bool(r.ok), alert_id=st.get("alert_id"))
         if r.ok:
             self.notify.send(key, ctitle(self.symbol, event_name or ("CLOSED " + ("WIN" if p["points"] > 0 else "LOSS")), p["direction"]), [reason],
                              fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"],
@@ -797,7 +843,7 @@ class SymbolAgent(threading.Thread):
                 final, approx = self._final_points(t, st)             # v1.11.0: for the weekly compare (measurement only)
                 self.journal.log("closed", symbol=self.symbol, mode=self.S.name, ticket=t, direction=st.get("direction"),
                                  entry=st.get("entry"), secured=st.get("secured"), peak=st.get("peak"),
-                                 final_points=final, final_approx=approx)
+                                 final_points=final, final_approx=approx, alert_id=st.get("alert_id"))
                 if t not in self.closed_by_aureon:            # closed by you (or your own SL/TP): ask why, one tap
                     last = st.get("last_points", 0.0)
                     self.notify.ask(self.key("CLOSED_BY_YOU", t), ctitle(self.symbol, "CLOSED BY YOU", st.get("direction")),
@@ -811,12 +857,16 @@ class SymbolAgent(threading.Thread):
         sig = self.latest_signal
         for p in pos:
             s = 1 if p["direction"] == "long" else -1
+            alert_id = None
             if p["ticket"] not in self.state:                    # v1.11.0: first sight of a trade (compare: 'Me · TAKEN')
+                pa = self.pending_alert
+                if pa and pa["side"] == ("LONG" if s > 0 else "SHORT") and _time.time() - pa["t"] <= self.cfg.ask_ttl_min * 60:
+                    alert_id = pa["alert_id"]; self.pending_alert = None          # v2.0.0: the trade you placed for an alert
                 self.journal.log("position_seen", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"],
-                                 side="LONG" if s > 0 else "SHORT", entry=p["price_open"], open_time=p.get("time"))
+                                 side="LONG" if s > 0 else "SHORT", entry=p["price_open"], open_time=p.get("time"), alert_id=alert_id)
             st = self.state.setdefault(p["ticket"], {"symbol": self.symbol, "mode": self.S.name, "direction": p["direction"],
                                                      "entry": p["price_open"], "peak": p["points"], "pre": (sgn != s) if g.p_phase else False, "bars": 0,
-                                                     "news_done": False, "secured": 0.0})
+                                                     "news_done": False, "secured": 0.0, "alert_id": alert_id})
             st["peak"] = max(st["peak"], p["points"]); st["last_points"] = p["points"]
             if new_bar: st["bars"] += 1
             st["secured"] = max(st.get("secured", 0.0), self._locked(p))      # live SL is the truth; never lower
