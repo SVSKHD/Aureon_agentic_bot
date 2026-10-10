@@ -867,7 +867,10 @@ class SymbolAgent(threading.Thread):
             st = self.state.setdefault(p["ticket"], {"symbol": self.symbol, "mode": self.S.name, "direction": p["direction"],
                                                      "entry": p["price_open"], "peak": p["points"], "pre": (sgn != s) if g.p_phase else False, "bars": 0,
                                                      "news_done": False, "secured": 0.0, "alert_id": alert_id})
+            if p["points"] > st["peak"] or "peak_t" not in st:
+                st["peak_t"] = bar_t                                                   # v2.0.0: bars_since_peak for the Claude snapshot
             st["peak"] = max(st["peak"], p["points"]); st["last_points"] = p["points"]
+            st["mae"] = min(st.get("mae", 0.0), p["points"])
             if new_bar: st["bars"] += 1
             st["secured"] = max(st.get("secured", 0.0), self._locked(p))      # live SL is the truth; never lower
             tag = f"{self.symbol} #{p['ticket']} {p['direction'].upper()} @ {p['price_open']:.2f}"

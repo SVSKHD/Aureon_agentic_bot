@@ -18,8 +18,10 @@ IST = timezone(timedelta(hours=5, minutes=30))
 BAR_S = 300
 MATCH_BARS = 6                    # a trade opened within 6 bars (30 min) after the signal bar closed = taken
 MIN_N = 30                        # below this, the only verdict is "not enough data"
-STRATEGY = "ema5080"
-KIND_OF_SIGNAL = {"P": "P", "cross": "CROSS", "reentry": "RE"}
+STRATEGY = "ema5080"                                   # dedupe-key prefix (kept)
+KIND_OF_SIGNAL = {"P": "P", "cross": "CROSS", "reentry": "RE"}                     # ema5080 entry signals
+KINDS_BY_MODE = {"ema5080": KIND_OF_SIGNAL, "ema2050": {"pullback": "ENTER", "no-pullback": "ENTER"}}   # v2.0.0: ema2050 ENTER bars
+ENTRY_EVENTS = ("P", "CROSS", "RE", "ENTER")
 WINS = ("WIN20", "WIN10")
 SESSIONS = {"asia": "Asia", "london": "London", "ny": "New York", "off": "Off-hours"}
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -48,18 +50,18 @@ class Row:
 
 
 def _valid_entry_verdict(v: dict) -> bool:
-    return v.get("decision") in ("TAKE", "SKIP") and not v.get("stale") and v.get("claude_event") in ("P", "CROSS", "RE")
+    return v.get("decision") in ("TAKE", "SKIP") and not v.get("stale") and v.get("claude_event") in ENTRY_EVENTS
 
 
 def build_rows(records: list[dict], graded: list, since: int, until: int, off: float) -> list[Row]:
     """records: journal rows (may extend past `until` so late verdicts/decisions/trades still join).
     graded: reports.GradedSignal list. Signals are those journaled in [since, until)."""
-    sigs = [r for r in records if r.get("event") == "signal" and r.get("mode", STRATEGY) == STRATEGY
-            and r.get("signal_kind") in KIND_OF_SIGNAL and since <= r["t"] < until and r.get("bar") is not None]
+    sigs = [r for r in records if r.get("event") == "signal" and r.get("mode", STRATEGY) in KINDS_BY_MODE
+            and r.get("signal_kind") in KINDS_BY_MODE[r.get("mode", STRATEGY)] and since <= r["t"] < until and r.get("bar") is not None]
     grades = {(g.symbol, g.kind, g.side, int(g.bar)): g for g in graded}
     verdicts = {}
     for v in records:
-        if v.get("event") == "claude_verdict" and v.get("claude_event") in ("P", "CROSS", "RE"):
+        if v.get("event") == "claude_verdict" and v.get("claude_event") in ENTRY_EVENTS:
             verdicts[(v.get("symbol"), v.get("claude_event"), v.get("bar"))] = v          # latest wins
     decisions = {}
     for d in records:
@@ -67,7 +69,7 @@ def build_rows(records: list[dict], graded: list, since: int, until: int, off: f
             decisions[(d.get("symbol"), d.get("bar"))] = d["decision"]
     rows, seen = [], set()
     for s in sorted(sigs, key=lambda r: r["bar"]):
-        kind = KIND_OF_SIGNAL[s["signal_kind"]]; side = str(s.get("side", "")).upper()
+        kind = KINDS_BY_MODE[s.get("mode", STRATEGY)][s["signal_kind"]]; side = str(s.get("side", "")).upper()
         key = (s.get("symbol"), kind, side, int(s["bar"]))
         if key in seen:
             continue
@@ -568,3 +570,126 @@ def self_review(claude, res: CompareResult, notify, week: str) -> str | None:
                         {"name": "Rules", "value": f"unchanged ({res.rules_hash}) — you edit claude_rules.md", "inline": True}],
                 footer="Aureon MT5 · Claude · advisory only")
     return text
+
+
+# ============================================================================= v2.0.0 CLAUDE RULE PROPOSALS (Saturday) — nothing changes without /claude-rules-approve
+PROPOSAL_FIELDS = ("gap", "dist_to_fast_ema_pts", "swing_against_last6_pts", "atr20", "crosses_today", "bars_since_cross", "minutes_to_news",
+                   "day_pnl_pts", "trades_today", "whipsaw_flips")
+MIN_SUPPORT = 2
+
+
+def _verdict_rows(records: list[dict], res: "CompareResult") -> list[dict]:
+    """Entry verdicts of the window joined with their graded outcome: [{claude, points, fields, event, symbol, bar}]."""
+    graded = {(r.symbol, r.bar): r for r in res.rows if r.status == "GRADED" and r.points is not None}
+    out = []
+    for v in records:
+        if v.get("event") != "claude_verdict" or v.get("claude_event") not in ENTRY_EVENTS or v.get("decision") not in ("TAKE", "SKIP") or v.get("stale"):
+            continue
+        row = graded.get((v.get("symbol"), v.get("bar")))
+        if row is None or not isinstance(v.get("snapshot_fields"), dict):
+            continue
+        out.append({"claude": v["decision"], "points": float(row.points), "fields": v["snapshot_fields"], "event": v["claude_event"],
+                    "symbol": v.get("symbol"), "bar": v.get("bar"), "evidence": v.get("evidence") or []})
+    return out
+
+
+def rule_proposals(records: list[dict], res: "CompareResult", mode_display: str = "EMA 50/80", limit: int = 3) -> list[dict]:
+    """Wrong calls (TAKE that lost, SKIP that won) + their snapshot fields → up to `limit` proposed rule lines with the supporting count.
+    Deterministic: for each numeric field, every wrong value is tried as a >= / <= threshold; the best side (most wrong minus right)
+    is proposed when it holds >= MIN_SUPPORT wrong calls and strictly more wrong than right calls. Nothing is written by this function."""
+    rows = _verdict_rows(records, res)
+    wrong = [r for r in rows if (r["claude"] == "TAKE" and r["points"] < 0) or (r["claude"] == "SKIP" and r["points"] > 0)]
+    right = [r for r in rows if r not in wrong]
+    props = []
+    for dec in ("TAKE", "SKIP"):
+        w = [r for r in wrong if r["claude"] == dec]; ok = [r for r in right if r["claude"] == dec]
+        if len(w) < MIN_SUPPORT:
+            continue
+        for f in PROPOSAL_FIELDS:
+            vals = [float(r["fields"][f]) for r in w if isinstance(r["fields"].get(f), (int, float)) and not isinstance(r["fields"].get(f), bool)]
+            if len(vals) < MIN_SUPPORT:
+                continue
+            def num(r):
+                x = r["fields"].get(f)
+                return float(x) if isinstance(x, (int, float)) and not isinstance(x, bool) else None
+            best = None
+            for thr in sorted(set(vals)):                                   # every wrong value is a candidate threshold
+                for op in (">=", "<="):
+                    test = (lambda x, t=thr: x >= t) if op == ">=" else (lambda x, t=thr: x <= t)
+                    nw = sum(1 for r in w if num(r) is not None and test(num(r)))
+                    nr = sum(1 for r in ok if num(r) is not None and test(num(r)))
+                    if nw >= MIN_SUPPORT and nw > nr and (best is None or (nw - nr, nw) > (best["score"], best["n_wrong"])):
+                        action = "prefer SKIP" if dec == "TAKE" else "allow TAKE"
+                        best = {"line": f"{action} when {f} {op} {thr:g} ({mode_display})", "field": f, "op": op, "value": thr, "decision": dec,
+                                "n_wrong": nw, "n_right": nr, "support": f"{nw} wrong {dec} calls vs {nr} right", "score": nw - nr}
+            if best is not None:
+                props.append(best)
+    props.sort(key=lambda p: (-p["score"], -p["n_wrong"], p["field"]))
+    seen = set(); out = []
+    for p in props:
+        if (p["field"], p["decision"]) in seen:
+            continue
+        seen.add((p["field"], p["decision"])); out.append(p)
+        if len(out) >= limit:
+            break
+    for i, p in enumerate(out, 1):
+        p["n"] = i
+    return out
+
+
+def proposals_path(log_dir: str) -> str:
+    return os.path.join(log_dir, "claude_rule_proposals.json")
+
+
+def save_proposals(log_dir: str, week: str, props: list[dict]):
+    os.makedirs(log_dir, exist_ok=True)
+    tmp = proposals_path(log_dir) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"week": week, "made": datetime.now(IST).strftime("%Y-%m-%d %H:%M"), "proposals": props}, f, indent=1)
+    os.replace(tmp, proposals_path(log_dir))
+
+
+def load_proposals(log_dir: str) -> dict:
+    try:
+        with open(proposals_path(log_dir), encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def proposals_card(week: str, props: list[dict], n_wrong: int, rules_hash_: str) -> dict:
+    if props:
+        desc = "\n".join(f"**{p['n']}.** {p['line']} — {p['support']}" for p in props) + "\n\napprove one with `/claude-rules-approve <n>` — nothing changes until you do"
+    else:
+        desc = f"{n_wrong} wrong call(s) this week — no field separates them yet (need ≥ {MIN_SUPPORT} wrong calls on one side of a threshold)"
+    return {"title": f"AUREON · MT5 · CLAUDE RULE PROPOSALS · {week}", "description": desc[:4096],
+            "fields": [{"name": "Wrong calls", "value": str(n_wrong), "inline": True}, {"name": "Rules file", "value": f"unchanged ({rules_hash_})", "inline": True}],
+            "footer": "Aureon MT5 · Claude · proposals only — approval appends a dated line to claude_rules.md", "png": None}
+
+
+def approve_proposal(n: int, log_dir: str, rules_path: str = RULES_PATH) -> str:
+    """/claude-rules-approve <n>: append the proposed line, dated, to claude_rules.md. Returns the appended line."""
+    d = load_proposals(log_dir); props = d.get("proposals") or []
+    p = next((x for x in props if int(x.get("n", 0)) == int(n)), None)
+    if p is None:
+        raise ValueError(f"no proposal {n} (latest card: {d.get('week') or 'none'})")
+    if p.get("approved"):
+        raise ValueError(f"proposal {n} already approved on {p['approved']}")
+    line = f"- [approved {datetime.now(IST):%Y-%m-%d} · {d.get('week', '')}] {p['line']} — {p['support']}"
+    with open(rules_path, "a", encoding="utf-8") as f:
+        f.write(("\n" if not open(rules_path, encoding="utf-8").read().endswith("\n") else "") + line + "\n")
+    p["approved"] = datetime.now(IST).strftime("%Y-%m-%d"); save_proposals(log_dir, d.get("week", ""), props)
+    return line
+
+
+def rule_proposals_tick(cfg, journal, notify, res: "CompareResult", week: str, mode_display: str = "EMA 50/80") -> list[dict]:
+    """After the Saturday COMPARE card: build, save and post the proposals. No Claude call, no file edit."""
+    records = journal.read(res.since - 86400, res.until + 3 * 86400)
+    props = rule_proposals(records, res, mode_display)
+    rows = _verdict_rows(records, res)
+    n_wrong = sum(1 for r in rows if (r["claude"] == "TAKE" and r["points"] < 0) or (r["claude"] == "SKIP" and r["points"] > 0))
+    save_proposals(cfg.log_dir, week, props)
+    c = proposals_card(week, props, n_wrong, res.rules_hash)
+    notify.send(f"{cfg.mode}:ALL:CLAUDE_RULE_PROPOSALS:{week}", c["title"], [c["description"]], fields=c["fields"], footer=c["footer"])
+    return props

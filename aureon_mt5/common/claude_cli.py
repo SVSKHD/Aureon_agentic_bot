@@ -17,7 +17,8 @@ from datetime import datetime, timedelta, timezone
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-ENTRY_EVENTS = ("P", "CROSS", "RE")
+ENTRY_EVENTS = ("P", "CROSS", "RE", "ENTER", "ALERT")   # ENTER = ema2050 pullback-entry bar · ALERT = /alert card add-on (v2.0.0)
+MAX_EVIDENCE = 12
 DECISIONS = {**{e: ("TAKE", "SKIP") for e in ENTRY_EVENTS}, "pullback": ("HOLD", "TIGHTEN", "CLOSE")}
 CONFIDENCE = ("low", "medium", "high")
 MAX_REASON_WORDS = 20
@@ -95,8 +96,12 @@ def validate(v: dict, event: str) -> dict:
     if dec == "TIGHTEN" and tt is None:
         raise ValueError("TIGHTEN without tighten_to")
     words = str(v.get("reason", "")).split()
+    ev = v.get("evidence")                                    # v2.0.0: the snapshot field names the verdict used (journaled)
+    if isinstance(ev, str):
+        ev = [x.strip() for x in ev.split(",")]
+    evidence = [str(x)[:40] for x in ev if str(x).strip()][:MAX_EVIDENCE] if isinstance(ev, (list, tuple)) else []
     return {"decision": dec, "side": side, "tighten_to": tt if dec == "TIGHTEN" else None, "confidence": conf,
-            "reason": " ".join(words[:MAX_REASON_WORDS])}
+            "reason": " ".join(words[:MAX_REASON_WORDS]), "evidence": evidence}
 
 
 def _is_auth(text: str) -> bool:

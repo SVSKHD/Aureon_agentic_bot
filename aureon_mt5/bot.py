@@ -695,6 +695,30 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             return Reply(content=f"CLAUDE REVIEW {day or 'today'}:\n{text}"[:1900], source="live")
         await run(inter, "claude-review", work, timeout=claude_wait)
 
+    @tree.command(name="claude-rules", description="Latest CLAUDE RULE PROPOSALS (Saturday card) and their status")
+    async def claude_rules_cmd(inter: discord.Interaction):
+        def work():
+            from . import compare
+            d = compare.load_proposals(cfg.log_dir); props = d.get("proposals") or []
+            if not props:
+                return Reply(content="no rule proposals yet (made on Saturday with the COMPARE card)")
+            lines = [f"proposals · {d.get('week')} · made {d.get('made')} · rules {compare.rules_hash()}"]
+            for p in props:
+                lines.append(f"`{p['n']}` {p['line']} — {p['support']}" + (f" · ✅ approved {p['approved']}" if p.get("approved") else ""))
+            return Reply(content="\n".join(lines)[:1900])
+        await run(inter, "claude-rules", work)
+
+    @tree.command(name="claude-rules-approve", description="Append proposal <n> (dated) to claude_rules.md — nothing changes without this")
+    @app_commands.describe(n="proposal number from the CLAUDE RULE PROPOSALS card")
+    async def claude_rules_approve_cmd(inter: discord.Interaction, n: int):
+        user = inter.user
+        def work():
+            from . import compare
+            line = compare.approve_proposal(n, cfg.log_dir)
+            journal.log("claude_rule_approved", n=n, line=line, by=str(user), rules_hash=compare.rules_hash())
+            return Reply(content=f"appended to claude_rules.md:\n{line}\nrules hash now {compare.rules_hash()} · takes effect on the next Claude call")
+        await run(inter, "claude-rules-approve", work)
+
     # ------------------------------------------------------------------ v1.11.0 weekly compare (measurement only)
     def _compare_reply(days: int, breakdown: bool) -> Reply:
         from . import compare

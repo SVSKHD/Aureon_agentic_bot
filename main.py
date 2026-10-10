@@ -126,8 +126,8 @@ _COMPARE_RETRY_AT: dict[str, float] = {}
 
 def compare_saturday_tick(cfg, agents, journal, notify, claude=None, now: datetime | None = None, gather=None) -> str | None:
     """Saturday ≥ cfg.weekly_report_ist (10:00 IST), after the WEEKLY report: post the COMPARE card for Mon–Fri once.
-    Restart-safe: a week already in logs/compare_weekly.jsonl is skipped. ema5080 only. Measurement only."""
-    if cfg.mode != "ema5080":
+    Restart-safe: a week already in logs/compare_weekly.jsonl is skipped. Both modes (v2.0.0). Measurement only."""
+    if cfg.mode not in compare.KINDS_BY_MODE:
         return None
     now = now or datetime.now(IST)
     hh, mm = (int(x) for x in cfg.weekly_report_ist.split(":"))
@@ -141,6 +141,11 @@ def compare_saturday_tick(cfg, agents, journal, notify, claude=None, now: dateti
         c = compare.card(res, title=f"AUREON · MT5 · COMPARE · {week}")
         post_compare(notify, f"{cfg.mode}:ALL:COMPARE:{week}", c)
         compare.append_history(cfg.log_dir, week, res)
+        if claude is not None:                                   # v2.0.0: CLAUDE RULE PROPOSALS (no call, no edit; /claude-rules-approve <n>)
+            try:
+                compare.rule_proposals_tick(cfg, journal, notify, res, week, next(iter(agents.values())).S.display_name if agents else cfg.mode)
+            except Exception as e:
+                telemetry.info(f"rule proposals failed: {e!r}")
     except Exception as e:                                   # back off 30 min instead of re-grading every 30 s
         _COMPARE_RETRY_AT[week] = _time.time() + 1800
         telemetry.failure(notify, journal, title="AUREON COMPARE FAILED", key=f"{cfg.mode}:ALL:COMPARE_ERROR:{week}",
