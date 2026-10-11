@@ -231,11 +231,11 @@ def main():
     health_notify = Notifier(cfg.health_webhook) if cfg.health_webhook else notify
     def process_excepthook(typ, value, tb):
         import traceback
-        trace = "\\n".join("".join(traceback.format_exception(typ, value, tb)).splitlines()[-15:])
+        trace = "\n".join("".join(traceback.format_exception(typ, value, tb)).splitlines()[-15:])
         try:
             journal.log("process_exit", reason=f"{typ.__name__}: {value}", trace=trace)
             health_notify.card("AUREON · MT5 · PROCESS EXITING",
-                               f"{typ.__name__}: {str(value)[:180]}\\n```\\n{trace[-1500:]}\\n```")
+                               f"{typ.__name__}: {str(value)[:180]}\n```\n{trace[-1500:]}\n```")
         except Exception:
             pass
         sys.__excepthook__(typ, value, tb)
