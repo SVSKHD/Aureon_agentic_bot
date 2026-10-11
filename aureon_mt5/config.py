@@ -46,6 +46,14 @@ class Config:
     watchdog_ping: bool = os.environ.get("AUREON_WATCHDOG", "0") == "1"     # minute heartbeat to Supabase — off on the free plan
     # your manual SL rules: if you placed an SL wider than the guardian's P-phase stop, the guardian does not close at −pre_stop
     respect_manual_sl: bool = os.environ.get("AUREON_RESPECT_MANUAL_SL", "1") == "1"
+    # Codex read-only advisor (Discord on-demand; never blocks signals or guardian)
+    codex_mode: str = os.environ.get("AUREON_CODEX", "off").strip().lower()
+    codex_bin: str = os.environ.get("AUREON_CODEX_BIN", "codex")
+    codex_model: str = os.environ.get("AUREON_CODEX_MODEL", "")
+    codex_timeout: float = float(os.environ.get("AUREON_CODEX_TIMEOUT", "30"))
+    codex_max_calls: int = int(os.environ.get("AUREON_CODEX_MAX_CALLS", "30"))
+    codex_workdir: str = os.environ.get("AUREON_CODEX_WORKDIR", "") or os.path.join(os.path.expanduser("~"), "aureon_codex")
+
     # v1.10.0 Claude add-on (local `claude -p`, your Claude Code login — no API key, no SDK). off | review | advisory | manage
     claude_mode: str = os.environ.get("AUREON_CLAUDE", "off").strip().lower()
     claude_bin: str = os.environ.get("AUREON_CLAUDE_BIN", "claude")
