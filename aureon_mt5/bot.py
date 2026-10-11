@@ -61,7 +61,7 @@ def _bot_line(monitor) -> str:
     return monitor.summary() if monitor is not None else "—"
 
 
-def status_card(sym: str, ag, cfg, journal=None, monitor=None) -> dict:
+def status_card(sym: str, ag, cfg, journal=None, monitor=None, claude=None) -> dict:
     h = ag.health; S = ag.S; snap = _snap(ag)
     mk = "OPEN" if snap.get("market_open") else ("CLOSED" if snap.get("at") else "—")
     age = snap.get("tick_age"); age_s = f"{age}s" if age is not None else "—"
@@ -105,6 +105,7 @@ def status_card(sym: str, ag, cfg, journal=None, monitor=None) -> dict:
         _field("Secured today", f"+{today['secured']:g}"),
         _field("Last signal", h.get("last_signal") or "—"),
         _field("Last broker action", h.get("last_broker_action") or "—"),
+        _field("Claude", claude_status_word(ag, claude)),                          # v2.0.1
         _field("Bot", _bot_line(monitor), False),
     ]
     return _embed(f"{sym} · MT5 · STATUS", f"AUREON MT5 v{VERSION} · {S.display_name} · {age_text(ag)}", color=color, fields=fields,
@@ -234,17 +235,56 @@ def symbols_text(agents, cfg) -> str:
     return c["title"] + "\n" + "\n".join(f"{f['name']}: {f['value']}" for f in c.get("fields", []))
 
 
-def claude_card(claude, cfg) -> dict:
+def claude_attachment_line(sym: str, ag, claude) -> str:
+    """One line per agent: 'XAUUSD · EMA 20/50 · ATTACHED (advisory) · triggers: … · last verdict 11:40 IST TAKE'."""
     if claude is None:
-        return _embed("AUREON · MT5 · CLAUDE", "Claude add-on is **off** (`AUREON_CLAUDE=off`) — zero Claude calls.", color=GREY)
+        return f"{sym} · {ag.S.display_name} · DETACHED (mode=off)"
+    a = claude.attachment(ag)
+    line = f"{sym} · {ag.S.display_name} · {a['label']}"
+    if a["state"] in ("ATTACHED", "REVIEW"):
+        line += f" · triggers: {a['triggers']}"
+    lv = claude.status().get("last_verdict_by_symbol", {}).get(sym)
+    if lv and a["state"] == "ATTACHED":
+        line += f" · last verdict {lv}"
+    return line
+
+
+def claude_status_word(ag, claude) -> str:
+    """/status one-liner: ATTACHED (mode) | REVIEW | OFF | NOT ATTACHED | DETACHED."""
+    if claude is None:
+        return "OFF"
+    st = claude.attachment(ag)["state"]
+    return {"ATTACHED": f"ATTACHED ({claude.mode})", "REVIEW": "REVIEW (cards only)", "NOT_ATTACHED": "NOT ATTACHED", "DETACHED": "DETACHED"}.get(st, st)
+
+
+def claude_card(claude, cfg, agents: dict | None = None) -> dict:
+    """v2.0.1: 'is Claude Code attached to this agent?' — header (mode, bin, version, login), models, budget, one line per agent."""
+    agents = agents or {}
+    if claude is None:
+        fields = [_field("Mode", "OFF"), _field("Attachment", "\n".join(claude_attachment_line(s, ag, None) for s, ag in agents.items()) or "no agents", False)]
+        return _embed("AUREON · MT5 · CLAUDE", "Claude add-on is **off** (`AUREON_CLAUDE=off`) — zero Claude calls.", color=GREY, fields=fields)
     st = claude.status()
-    lat = f"{st['avg_latency']:.0f} s" if st["avg_latency"] is not None else "—"
     login = st["login"]
-    fields = [_field("Mode", st["mode"].upper()), _field("Login", ("🟢 " if login == "OK" else "🔴 " if login == "FAILED" else "⚪ ") + login),
-              _field("Calls today", f"{st['calls']} / {st['limit']}"), _field("Avg latency", lat), _field("Queue", st["queue"]),
-              _field("Last verdict", st["last_verdict"], False), _field("Last error", st["last_error"][:300], False),
-              _field("Models", st["models"], False)]
-    return _embed("AUREON · MT5 · CLAUDE", "second opinion only — Claude never places a trade", color=BLURPLE, fields=fields)
+    bad_bin = login == "NOT FOUND" or (st.get("version") is None and "not found" in (st.get("version_error") or ""))
+    bad_auth = login == "FAILED"
+    icon = "🔴 " if (bad_bin or bad_auth) else "🟢 " if login == "OK" else "⚪ "
+    ver = st.get("version") or (f"unavailable — {st.get('version_error')}" if st.get("version_error") else "not checked yet (/claude-test)")
+    header = f"mode **{st['mode'].upper()}** · bin `{st['bin_path']}` · {ver} · login {login}"
+    if bad_bin:
+        header += "\n🔴 **Claude Code not found** — install it or set `AUREON_CLAUDE_BIN` to the full path of `claude`, then `/claude-test`"
+    elif bad_auth:
+        header += "\n🔴 **not logged in** — run `claude` in the work folder and log in, then `/claude-test`"
+    ids = st.get("model_ids", {}); rep = st.get("reported_models", {})
+    models = " · ".join(f"{k} `{ids.get(k, '?')}`" + (f" → reported `{rep[k]}`" if rep.get(k) else "") for k in ("entry", "pullback", "review"))
+    ce = st.get("calls_by_event", {})
+    lat_last = f"{st['last_latency']:.0f} s" if st.get("last_latency") is not None else "—"
+    budget = (f"calls **{st['calls']} / {st['limit']}** today · entry {ce.get('entry', 0)} · pullback {ce.get('pullback', 0)} · alert {ce.get('alert', 0)} · "
+              f"fast-exit cancellations {st.get('fast_exit_cancels', 0)} · last latency {lat_last} · last error {st['last_error'][:200]}")
+    per_agent = "\n".join(claude_attachment_line(s, ag, claude) for s, ag in agents.items()) or "no agents running"
+    fields = [_field("Header", (icon + header)[:1024], False), _field("Models", models[:1024], False), _field("Budget", budget[:1024], False),
+              _field("Per agent", per_agent[:1024], False), _field("Last verdict", st["last_verdict"], False), _field("Queue", st["queue"])]
+    return _embed("AUREON · MT5 · CLAUDE", "second opinion only — Claude never places a trade · `/claude-attach <symbol>` · `/claude-detach <symbol>`",
+                  color=RED if (bad_bin or bad_auth) else BLURPLE, fields=fields)
 
 
 # ----------------------------------------------------------------------------- v1.9.8 command wrapper
@@ -565,7 +605,7 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
     @tree.command(name="status", description="Aureon status for the primary symbol")
     async def status(inter: discord.Interaction):
         sym = cfg.symbols[0]
-        await run(inter, "status", lambda: Reply(card=status_card(sym, agents[sym], cfg, journal, monitor)))
+        await run(inter, "status", lambda: Reply(card=status_card(sym, agents[sym], cfg, journal, monitor, claude)))
 
     @tree.command(name="parallel-status", description="All symbols at a glance")
     async def pstatus(inter: discord.Interaction):
@@ -666,9 +706,37 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
     # ------------------------------------------------------------------ v1.10.0 Claude add-on (all off the loop via run())
     claude_wait = float(getattr(cfg, "claude_timeout", 90)) * 2 + 15      # a call may queue behind one in flight
 
-    @tree.command(name="claude", description="Claude add-on: mode, login, calls today, last verdict")
+    @tree.command(name="claude", description="Claude add-on: is Claude Code attached to each agent? mode, bin, version, login, budget")
     async def claude_cmd(inter: discord.Interaction):
-        await run(inter, "claude", lambda: Reply(card=claude_card(claude, cfg)))
+        await run(inter, "claude", lambda: Reply(card=claude_card(claude, cfg, agents)))
+
+    @tree.command(name="claude-attach", description="Re-bind the Claude add-on to a symbol's agent at runtime (advisory/manage only)")
+    @app_commands.describe(symbol="e.g. XAUUSD")
+    async def claude_attach_cmd(inter: discord.Interaction, symbol: str):
+        user = inter.user
+        def work():
+            sym = symbol.upper(); ag = agents.get(sym)
+            if ag is None:
+                return Reply(content=f"{sym}: not running (configured: {', '.join(cfg.symbols)})")
+            if claude is None:
+                return Reply(content="Claude add-on is off (`AUREON_CLAUDE=off`) — set advisory|manage and restart")
+            ok, why = claude.attach(ag, str(user))
+            return Reply(content=(f"🟢 {sym} · {ag.S.display_name} · {why}" if ok else f"⚪ {sym}: cannot attach — {why}"))
+        await run(inter, "claude-attach", work)
+
+    @tree.command(name="claude-detach", description="Detach the Claude add-on from a symbol's agent (cancels its queued jobs)")
+    @app_commands.describe(symbol="e.g. XAUUSD")
+    async def claude_detach_cmd(inter: discord.Interaction, symbol: str):
+        user = inter.user
+        def work():
+            sym = symbol.upper(); ag = agents.get(sym)
+            if ag is None:
+                return Reply(content=f"{sym}: not running (configured: {', '.join(cfg.symbols)})")
+            if claude is None or ag.claude is None:
+                return Reply(content=f"{sym}: already detached ({'mode=off' if claude is None else 'not attached'})")
+            n = claude.detach(ag, str(user))
+            return Reply(content=f"⚪ {sym} · {ag.S.display_name} · DETACHED · {n} queued job(s) cancelled · guardian and signals unaffected")
+        await run(inter, "claude-detach", work)
 
     @tree.command(name="claude-test", description="One tiny Claude call to check the login")
     async def claude_test(inter: discord.Interaction):
