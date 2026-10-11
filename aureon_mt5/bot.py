@@ -1100,6 +1100,19 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             return Reply(card=_embed("AUREON · CLAUDE USAGE", "CLI reported usage; not independently priced at model list rates.", fields=fields))
         await run(inter, "claude-status", work)
 
+    @tree.command(name="claude-report", description="Claude graded performance and usage for this week or month")
+    @app_commands.describe(period="week or month")
+    async def claude_report_cmd(inter: discord.Interaction, period: str = "week"):
+        def work():
+            from .claude_report import report
+            if period not in ("week", "month"):
+                return Reply(content="Choose period: week or month")
+            r = report(cfg, agents, journal, period)
+            em = _embed(r["title"], "Advisory scorecard; ungraded signals excluded. No rules changed.",
+                        fields=r["fields"][:25], footer=f"v{VERSION} · as of now · partial grading possible")
+            return Reply(card=em)
+        await run(inter, "claude-report", work, timeout=40)
+
     # ------------------------------------------------------------------ v2.2.0 admin controls
     from . import ops
 
