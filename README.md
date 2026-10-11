@@ -1,4 +1,4 @@
-# Aureon MT5 v2.0.2
+# Aureon MT5 v2.1.0
 
 You place the trade. Aureon detects (per selected EMA mode), fires a Discord gunshot, then manages what you placed:
 protect → secure +10 → ride in +5 steps → close on the fast-EMA turn → news safeguard. Reports and slash commands.
@@ -49,6 +49,20 @@ Replay / verify:
     python detect.py --mode ema2050 --date 2026-10-07 | --live                   # per bar: EMAs, cross, confirm state, touch, entry allowed, reason
 Replay SL convention (same as the 50/80 replay): a level armed by bar k's extreme is tested from bar k+1. Exit reasons: stop · early ·
 secured · ema20_turn · opposite_cross · news_flat · day_end · open.
+
+## Claude shadow replay (v2.1.0) — `run.py --claude`
+    python run.py --mode ema2050 --from 2026-07-01 --to 2026-10-09 --claude entry --claude-max 60 --claude-sleep 2 [--claude-model opus] [--claude-refresh]
+    python run.py --mode ema5080 --date 2026-10-07 --claude entry+pullback
+Without `--claude` nothing changes. With it, Claude is asked at every ENTER bar the replay produced (and, with `entry+pullback`, at every
+pullback event inside a replayed trade — the live trigger: trend PULLBACK/WEAKENING/CHALLENGED or ≤ 60 % of a ≥ +5 peak, once per pullback)
+**exactly as live**: `claude_advisor.build_snapshot` on `df.iloc[:bar+1]` only (asserted — no future bars; crosses/day P&L recomputed for the
+bar's day), the same rules prompt and reply contract (TAKE/SKIP, `p_win`, `evidence`), `claude_cli.call` with `AUREON_CLAUDE_BIN` and
+`ANTHROPIC_API_KEY` stripped. Verdicts are **recorded, never applied**; a second column **Detector-filtered-by-Claude** = the same trades with
+Claude's SKIPs removed (pullback variant: TIGHTEN / CLOSE-in-profit applied on the M5 bars). Cache `out/claude_replay_<mode>_<symbol>.jsonl`
+keyed by (bar, event, model, rules hash): a re-run makes zero calls; `--claude-max` caps calls per run and the report says how many ENTER
+bars are still unscored. Report `out/claude_replay_<mode>_<symbol>.md` (printed too): Detector · all | Claude TAKE | Claude SKIP |
+Detector-filtered-by-Claude (n, win %, expectancy, total, stops, worst streak, max DD), SKIP precision, p_win calibration table, per-month
+Detector vs Claude-filtered, disagreement list (date, side, detector pts, verdict, reason, evidence). Strategy rules changed: NO.
 
 ## EMA 50/80 (unchanged thresholds — see strategies/ema5080/journeys.py RULES)
 P: price closes through EMA 50 against the 50/80 order for 2 bars · gap ≤ 2× avg range · gap ≥ 1.5× range within 24 bars ·

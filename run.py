@@ -2,6 +2,8 @@
   python run.py --mode ema5080 --date 2026-10-05 --news news_blackout.txt
   python run.py --mode ema2050 --date 2026-10-07                        # one day: trades + the research block for that day
   python run.py --mode ema2050 --from 2026-07-01 --to 2026-10-09 --lot 1  # day-by-day replay + research summary + month table
+  python run.py --mode ema2050 --from 2026-07-01 --to 2026-10-09 --claude entry --claude-max 60   # v2.1.0 shadow replay: Claude asked
+                                                                                # at every ENTER bar exactly as live, recorded never applied
 """
 from __future__ import annotations
 
@@ -71,6 +73,22 @@ def research_summary(days: list[dict], S, symbol: str, lot: float, point_value: 
     return "\n".join(L)
 
 
+def shadow_replay(a, S, off, news, days: list[dict], title: str):
+    """v2.1.0 --claude: the shadow run over the replayed days. Prints and writes out/claude_replay_<mode>_<symbol>.md."""
+    from aureon_mt5.claude_replay import ShadowReplay, write_report
+    from aureon_mt5.config import Config
+    cfg = Config()
+    sr = ShadowReplay(cfg, S, a.symbol, off, news, out_dir=a.out, model=a.claude_model, max_calls=a.claude_max, sleep_s=a.claude_sleep,
+                      refresh=a.claude_refresh, variant=a.claude)
+    print(f"\nCLAUDE SHADOW REPLAY · model {sr.model} · bin {cfg.claude_bin} · cache {sr.path} ({len(sr.cache)} cached verdicts) · max {a.claude_max} calls")
+    for d in days:
+        sr.score_day(d["day"], d["df"], d["journeys"])
+    sc = sr.score()
+    text, path = write_report(sr, sc, title)
+    print("\n" + text); print(path)
+    return sc
+
+
 def trade_line(j, off):
     t = datetime.fromtimestamp(j.entry_time - off * 3600, tz=IST); x = datetime.fromtimestamp(j.exit_time - off * 3600, tz=IST)
     extra = f" · {'pullback' if getattr(j, 'pullback', False) else 'no-pullback'}" if getattr(j, "confirm_index", None) is not None else ""
@@ -86,6 +104,12 @@ def main():
     ap.add_argument("--server-utc-offset", type=float, default=3.0); ap.add_argument("--out", default="out")
     ap.add_argument("--lot", type=float, default=1.0); ap.add_argument("--point-value", type=float, help="$ per point per lot (default: 100 gold, 5000 silver)")
     ap.add_argument("--trades", action="store_true", help="range replay: list every trade")
+    # v2.1.0 shadow replay (measurement only; without --claude nothing changes)
+    ap.add_argument("--claude", choices=["entry", "entry+pullback"], help="ask Claude at every ENTER bar (and pullbacks) exactly as live; verdicts recorded, never applied")
+    ap.add_argument("--claude-max", type=int, default=60, help="max Claude calls per run (default 60); unscored bars continue from the cache next run")
+    ap.add_argument("--claude-sleep", type=float, default=2.0, help="seconds between calls (default 2)")
+    ap.add_argument("--claude-model", help="model id (default AUREON_CLAUDE_ENTRY_MODEL)")
+    ap.add_argument("--claude-refresh", action="store_true", help="ignore the verdict cache and call again")
     a = ap.parse_args()
     try:
         S = get_strategy(resolve_mode(a.mode))
@@ -107,7 +131,7 @@ def main():
             if not len(bars_all["M5"].df[(bars_all["M5"].df["time"] >= rng["day_start"]) & (bars_all["M5"].df["time"] < rng["day_end"])]):
                 continue                                                       # holiday / no bars
             m5 = analyse_day(S, bars_all, rng, a.symbol, off, news)["M5"]; sm = m5["summary"]
-            days.append({"day": rng["day"], "journeys": m5["journeys"], "summary": sm})
+            days.append({"day": rng["day"], "journeys": m5["journeys"], "summary": sm, "df": m5["df"]})
             print(f"{rng['day']:%a %d %b}: {sm['trades']} trades · net {sm['net']:+.1f} · crosses {sm.get('crosses', '—')} · confirmed {sm.get('confirmed', '—')} · multi {sm.get('whipsaws', 0)}")
             if a.trades:
                 for j in m5["journeys"]:
@@ -116,6 +140,8 @@ def main():
             print("no bars in that range"); sys.exit(1)
         block = research_summary(days, S, a.symbol, a.lot, pv, off)
         print("\n" + block)
+        if a.claude:
+            shadow_replay(a, S, off, news, days, f"{a.symbol} · {d0} → {d1}")
         tag = f"_{d0:%Y%m%d}_{d1:%Y%m%d}_{S.name}"
         with open(os.path.join(a.out, f"{a.symbol}{tag}.json"), "w") as f:
             json.dump({"mode": S.name, "symbol": a.symbol, "from": str(d0), "to": str(d1), "lot": a.lot, "point_value": pv, "summary_text": block,
@@ -144,6 +170,9 @@ def main():
                 print(f"    {datetime.fromtimestamp(e.time - off * 3600, tz=IST):%H:%M} IST  {e.label:<9} {e.direction:<4} {e.reason}")
         if rng:
             print("\n" + research_summary([{"day": rng["day"], "journeys": m5["journeys"], "summary": sm}], S, a.symbol, a.lot, pv, off))
+    if a.claude:
+        shadow_replay(a, S, off, news, [{"day": rng["day"] if rng else date.today(), "journeys": m5["journeys"], "summary": sm, "df": m5["df"]}],
+                      f"{a.symbol} · {rng['day'] if rng else 'latest bars'}")
     with open(os.path.join(a.out, f"{a.symbol}{tag}.json"), "w") as f:
         json.dump({"mode": S.name, "symbol": a.symbol, "summary": sm, "journeys": [j.to_dict() for j in m5["journeys"]]}, f, indent=2, default=str)
     print(png); print(html)

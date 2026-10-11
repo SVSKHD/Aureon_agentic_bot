@@ -1,4 +1,4 @@
-"""Aureon MT5 v2.0.2 — runtime configuration. Strategy thresholds and guardian profiles live inside each strategy package."""
+"""Aureon MT5 v2.1.0 — runtime configuration. Strategy thresholds and guardian profiles live inside each strategy package."""
 from __future__ import annotations
 
 import os
@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from dotenv import load_dotenv
 load_dotenv()   # load .env if present
 
-VERSION = "2.0.2"
+VERSION = "2.1.0"
 
 
 @dataclass
