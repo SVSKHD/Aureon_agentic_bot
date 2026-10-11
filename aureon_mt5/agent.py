@@ -52,6 +52,7 @@ class SymbolAgent(threading.Thread):
         self.last_confirmed_cross: dict | None = None   # v2.0.0 ema2050: {"bar_time", "direction"} — the guardian's exit signal
         self.last_bar: int | None = None
         self.caught_up = False            # late-start catch-up card sent once
+        self.started_wall = _time.time()
         self.last_bar_wall: float | None = None   # wall clock of the last processed closed bar (heartbeat)
         self.closed_by_aureon: set = set()        # tickets Aureon closed (anything else that disappears was closed by you)
         self._evidence = {"at": 0.0, "graded": [], "busy": False}
@@ -137,9 +138,10 @@ class SymbolAgent(threading.Thread):
                 self._refresh_snapshot(True)
                 self._check_alerts(closed, df, bar_t)
             except Exception as e:
+                from .crashes import report as report_crash
                 self.health["errors"] += 1; self.health["status"] = f"error: {e}"
-                telemetry.failure(self.notify, self.journal, title="AUREON AGENT ERROR", key=self.key("ERROR", f"loop-{type(e).__name__}"),
-                                  mode=self.S.name, symbol=self.symbol, action="loop", exc=e)
+                report_crash(self, e)
+                return  # supervisor restarts this agent, unless crash guard paused it
             _time.sleep(self.cfg.poll_seconds)
 
     def chart_now(self) -> str | None:

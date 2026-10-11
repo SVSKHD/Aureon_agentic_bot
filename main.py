@@ -10,6 +10,7 @@ import argparse
 import os
 import subprocess
 import sys
+import threading
 import time as _time
 from datetime import date, datetime, timedelta, timezone
 
@@ -109,10 +110,12 @@ def greet(notify, cfg, S, why, news_line):
 def supervise(agents: dict, factory, notify, mode: str) -> list[str]:
     """Restart ONLY dead agents; the others are never touched. Returns the symbols restarted."""
     restarted = []
+    from aureon_mt5.crashes import should_restart, reason
     for sym, ag in list(agents.items()):
-        if not ag.is_alive():
+        if not ag.is_alive() and should_restart(sym):
+            why = reason(sym)
             agents[sym] = factory(sym); agents[sym].start(); restarted.append(sym)
-            notify.send(f"{mode}:{sym}:RESTART:{int(_time.time()) // 60}", f"{sym} · MT5 · AGENT RESTARTED", ["other symbols unaffected"])
+            notify.send(f"{mode}:{sym}:RESTART:{int(_time.time()) // 60}", f"{sym} · MT5 · AGENT RESTARTED", [f"reason: {why or 'thread ended'}", "other symbols unaffected"])
     return restarted
 
 
@@ -165,6 +168,50 @@ def compare_saturday_tick(cfg, agents, journal, notify, claude=None, now: dateti
     return week
 
 
+_CLAUDE_REPORT_RUNNING: set[str] = set()
+
+
+def claude_report_tick(cfg, agents, journal, notify, now=None):
+    """Non-blocking, restart-safe weekly/monthly report scheduling."""
+    import threading
+    from aureon_mt5 import claude_report
+    now = now or datetime.now(IST)
+    if (now.hour, now.minute) < (10, 0):
+        return
+    periods = []
+    # Weekly report follows COMPARE on Saturday after 10:00 IST.
+    if now.weekday() == 5:
+        from aureon_mt5.compare import read_history, week_window
+        week_key, _, _ = week_window(now)
+        if any(row.get("week") == week_key for row in read_history(cfg.log_dir)):
+            periods.append(("week", week_key))
+    if now.day == 1:
+        previous = now.replace(day=1) - timedelta(days=1)
+        month_key = previous.strftime("%Y-%m")
+        records = journal.read(int((previous - timedelta(days=32)).timestamp()))
+        earliest = min((r["t"] for r in records), default=int(now.timestamp()))
+        if int(now.timestamp()) - earliest >= 21 * 86400:
+            periods.append(("month", month_key))
+    posted = {(r.get("period"), r.get("key")) for r in claude_report.read_history(cfg.log_dir)}
+    for period, key in periods:
+        token = f"{period}:{key}"
+        if (period, key) in posted or token in _CLAUDE_REPORT_RUNNING:
+            continue
+        _CLAUDE_REPORT_RUNNING.add(token)
+        def post(period=period, key=key, token=token):
+            try:
+                r = claude_report.report(cfg, agents, journal, period, now=now)
+                notify.card(r["title"], "Graded Claude advisory performance; no strategy changes.",
+                            fields=r["fields"], footer=f"v{VERSION} · {key}")
+                claude_report.append_history(cfg.log_dir, period, key)
+            except Exception as e:
+                telemetry.failure(notify, journal, title="AUREON CLAUDE REPORT FAILED",
+                                  key=f"claude-report:{token}", action="scheduled report", exc=e)
+            finally:
+                _CLAUDE_REPORT_RUNNING.discard(token)
+        threading.Thread(target=post, daemon=True, name=f"claude-report-{token}").start()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode"); ap.add_argument("--symbols"); ap.add_argument("--dry", action="store_true")
@@ -183,6 +230,29 @@ def main():
 
     notify = Notifier(cfg.webhook); journal = Journal(cfg.log_dir); telemetry.setup(cfg.log_dir)
     health_notify = Notifier(cfg.health_webhook) if cfg.health_webhook else notify
+    def process_excepthook(typ, value, tb):
+        import traceback
+        trace = "\n".join("".join(traceback.format_exception(typ, value, tb)).splitlines()[-15:])
+        try:
+            journal.log("process_exit", reason=f"{typ.__name__}: {value}", trace=trace)
+            health_notify.card("AUREON · MT5 · PROCESS EXITING",
+                               f"{typ.__name__}: {str(value)[:180]}\n```\n{trace[-1500:]}\n```")
+        except Exception:
+            pass
+        sys.__excepthook__(typ, value, tb)
+    sys.excepthook = process_excepthook
+    previous_thread_hook = threading.excepthook
+    def agent_thread_hook(args):
+        if isinstance(args.thread, SymbolAgent):
+            try:
+                from aureon_mt5.crashes import report
+                report(args.thread, args.exc_value)
+            except Exception:
+                pass
+        else:
+            previous_thread_hook(args)
+    threading.excepthook = agent_thread_hook
+
     if not cfg.dry:
         if not broker.connect():
             print("MT5 not available — is the terminal open and logged in? (use --dry for a pipe test)"); sys.exit(1)
@@ -202,7 +272,10 @@ def main():
                                footer="Aureon MT5 · Claude")
 
     def start_agents():
+        from aureon_mt5.crashes import should_restart
         for s in cfg.symbols:
+            if not should_restart(s):
+                continue
             if s not in agents or not agents[s].is_alive():
                 agents[s] = SymbolAgent(s, cfg, S, notify, journal, news, claude=claude, alerts=alerts); agents[s].start()
 
@@ -210,6 +283,10 @@ def main():
     try:
         last_msg = subprocess.run(["git", "log", "-1", "--pretty=%s"], capture_output=True, text=True, timeout=10).stdout.strip()
         last_hash = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, timeout=10).stdout.strip()
+        manual_reason = os.environ.pop("AUREON_RESTART_REASON", "")
+        if manual_reason:
+            why = f"restarted · {manual_reason}"
+            notify.card("AUREON · MT5 · BACK ONLINE", f"{manual_reason}\\nRunning `{last_hash}` · {S.display_name}")
         if os.environ.get("AUREON_AUTO_RESTARTED"):
             why = f"restarted · auto-update · {last_hash}"
             notify.card("AUREON · MT5 · BACK ONLINE", f"Auto-update restart complete.\nRunning `{last_hash}` · {last_msg}",
@@ -257,8 +334,10 @@ def main():
             was_open = is_open
             review_day = claude_review_tick(claude, cfg, review_day)
             compare_saturday_tick(cfg, agents, journal, notify, claude)
+            claude_report_tick(cfg, agents, journal, notify)
             supervise(agents, lambda sym: SymbolAgent(sym, cfg, S, notify, journal, news, claude=claude, alerts=alerts), notify, cfg.mode)
         except KeyboardInterrupt:
+            notify.card("AUREON · MT5 · PROCESS EXITING", "KeyboardInterrupt")
             broker.close_connection(); print("bye"); return
         except Exception as e:
             telemetry.failure(notify, journal, title="AUREON SUPERVISOR ERROR", key="supervisor", mode=cfg.mode, action="supervisor", exc=e)

@@ -207,3 +207,18 @@ snapshot fields. The prompt is mode-aware (first line names the fast/slow EMA; `
 placeholder until `research/claude_rules_v2.md` is supplied). Saturday, after the COMPARE card: **CLAUDE RULE PROPOSALS** — wrong calls and their
 snapshot fields → up to 3 proposed rule lines with the supporting count (`logs/claude_rule_proposals.json`). `/claude-rules` lists them;
 `/claude-rules-approve <n>` appends the line, dated, to `claude_rules.md`. Nothing changes without approval.
+
+
+## v2.2.0 operations (staging)
+See `STATE.md`. Voice commands are **NOT IMPLEMENTED**; planned intents and safety controls: `docs/VOICE_SCOPE.md`. Existing trading strategy rules are unchanged. Do not operate deployment from unreviewed branches.
+
+### v2.2.0 operator command reference (draft)
+| Group | Commands | Operator versus automatic behavior |
+| --- | --- | --- |
+| Monitoring | `/status`, `/agents`, `/parallel-status`, `/market`, `/chart`, `/symbols`, `/symbol-present` | Read-only snapshots; bot polls automatically |
+| Trading | `/take`, `/skip`, `/alert`, `/alerts`, `/alert-cancel`, `/alert-clear` | Alerts monitored automatically after arming; trading decision belongs to operator |
+| Claude | `/claude`, `/claude-status`, `/claude-test`, `/claude-review`, `/claude-rules`, `/claude-rules-approve`, `/claude-report` | Status/report read-only; CLI calls consume usage; rule approval manual |
+| Reports | `/report`, `/compare`, `/compare-breakdown`, `/git-history`, `/pull-history` | On-demand historical diagnostics |
+| Control | `/restart`, `/mode`, `/discord-bot sync` | Administrator actions only where implemented; restart/mode require configured role ID |
+
+Set `AUREON_ADMIN_ROLE_ID` in your private environment to the Discord server administrator role ID; when missing, privileged restart/mode commands are denied. Changes are not live until the draft branch is merged and validated. `/commands` lists live registered commands. Voice command interface is **NOT IMPLEMENTED**.

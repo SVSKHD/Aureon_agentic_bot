@@ -369,13 +369,18 @@ class ClaudeAdvisor:
         self.fired.pop((symbol, ticket), None)
 
     # ------------------------------------------------------------------ the call (worker / command threads)
-    def _call(self, prompt: str, model: str, event: str) -> claude_cli.CliResult | None:
+    def _call(self, prompt: str, model: str, event: str, *, kind_override: str | None = None) -> claude_cli.CliResult | None:
         """None = budget used (no call made)."""
         if not self.budget.take():
             self._budget_card(); return None
         with self._call_lock:
             res = self.caller(prompt, model, event=event, bin=self.cfg.claude_bin, workdir=self.cfg.claude_workdir,
                               timeout=self.cfg.claude_timeout)
+        from .claude_usage import append as append_usage
+        try:
+            append_usage(self.cfg.log_dir, kind_override or {"pullback": "pullback", "ALERT": "alert", "review": "review", "test": "test"}.get(event, "entry"), res)
+        except OSError as exc:
+            telemetry.info(f"Claude usage ledger unavailable: {exc!r}")
         self.stats["latencies"].append(res.latency_s); self.stats["last_latency"] = res.latency_s
         kind = {"pullback": "pullback", "ALERT": "alert", "review": "review", "test": "test"}.get(event, "entry")
         self.stats["calls_by_event"][kind] = self.stats["calls_by_event"].get(kind, 0) + 1
@@ -463,6 +468,7 @@ class ClaudeAdvisor:
         if p is None:
             note = "position no longer open — nothing to do"
             self.stats["fast_exit_cancels"] += 1                 # v2.0.1: the trade closed before the verdict arrived
+            self.journal.log("claude_fast_exit_cancel", symbol=agent.symbol)
         elif stale:
             note = "STALE — arrived after the next bar closed; not acted"
         elif dec == "HOLD":
