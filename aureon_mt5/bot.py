@@ -1026,6 +1026,80 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
                 codex_lock.release()
         await run(inter, "codex-alert", work, timeout=cfg.codex_timeout + 15)
 
+    # ------------------------------------------------------------------ v2.2.0 command directory, taken from actual tree registrations
+    _help = {
+        "Monitoring": {
+            "status": "Primary symbol snapshot — automatic, read-only",
+            "agents": "Running agent phases and health — automatic, read-only",
+            "parallel-status": "All symbols — automatic, read-only",
+            "market": "Market state — automatic, read-only",
+            "chart": "Current chart — automatic, read-only",
+            "symbols": "Configured symbols — automatic, read-only",
+            "symbol-present": "Symbol presence — user supplies symbol",
+        },
+        "Trading": {
+            "take": "Accept pending ask — user places order unless AUREON_EXECUTION=1",
+            "skip": "Reject pending ask — user action",
+            "alert": "Arm price watch — user chooses price; bot monitors",
+            "alerts": "Show armed watches — automatic",
+            "alert-cancel": "Cancel one alert — user action",
+            "alert-clear": "Clear alerts — user action",
+        },
+        "Claude": {
+            "claude": "Health, attachment and login — read-only",
+            "claude-status": "Usage and spend — automatic ledger",
+            "claude-test": "One CLI test — consumes usage",
+            "claude-review": "Review day — consumes usage",
+            "claude-rules": "Pending rule proposals — read-only",
+            "claude-rules-approve": "Approve rule proposal — manual operator",
+            "claude-report": "Performance report — historical, read-only",
+        },
+        "Reports": {
+            "report": "Weekly trade summary — automatic",
+            "compare": "Detector, Claude, trader outcomes — automatic",
+            "compare-breakdown": "Compare by signal/session — automatic",
+            "git-history": "Commit history — automatic",
+            "pull-history": "MT5 history — automatic",
+        },
+        "Control": {
+            "restart": "Restart bot — admin only",
+            "mode": "Change process mode and restart — admin only",
+            "discord-bot": "Bot administration — admin",
+        },
+    }
+
+    @tree.command(name="commands", description="Grouped Aureon command directory: automatic versus user actions")
+    async def commands_cmd(inter: discord.Interaction):
+        def work():
+            actual = {c.name for c in tree.get_commands()}
+            fields = []
+            for group, entries in _help.items():
+                lines = [f"`/{name}` — {description}" for name, description in entries.items() if name in actual]
+                if lines: fields.append(_field(group, "\n".join(lines)[:1024], False))
+            others = sorted(actual - {"commands"} - set().union(*(set(x) for x in _help.values())))
+            if others: fields.append(_field("Other installed", ", ".join("/" + x for x in others)[:1024], False))
+            return Reply(card=_embed("AUREON · COMMANDS", "Only registered commands appear.", fields=fields))
+        await run(inter, "commands", work)
+
+    @tree.command(name="claude-status", description="Claude usage today/week/month: calls, tokens, cost, latency, errors")
+    async def claude_status_cmd(inter: discord.Interaction):
+        def work():
+            from .claude_usage import summarize
+            fields = []
+            for span in ("today", "week", "month"):
+                x = summarize(cfg.log_dir, span)
+                by_kind = ", ".join(f"{k}:{v}" for k, v in sorted(x["by_kind"].items())) or "none"
+                verdicts = ", ".join(f"{k}:{v}" for k, v in sorted(x["verdicts"].items())) or "none"
+                val = (f"Calls {x['calls']} · ok {x['ok']} · errors {x['errors']} · timeout {x['timeouts']}\n"
+                       f"Kinds {by_kind}\nVerdicts {verdicts}\n"
+                       f"Tokens in/out {x['input_tokens']}/{x['output_tokens']} · "
+                       f"cache read/write {x['cache_read_input_tokens']}/{x['cache_creation_input_tokens']}\n"
+                       f"CLI reported cost ${x['cost_usd']:.4f} · "
+                       f"avg/max {x['avg_latency']:.1f}/{x['max_latency']:.1f}s")
+                fields.append(_field(span.title(), val[:1024], False))
+            return Reply(card=_embed("AUREON · CLAUDE USAGE", "CLI reported usage; not independently priced at model list rates.", fields=fields))
+        await run(inter, "claude-status", work)
+
     # ------------------------------------------------------------------ v1.10.0 Claude add-on (all off the loop via run())
     claude_wait = float(getattr(cfg, "claude_timeout", 90)) * 2 + 15      # a call may queue behind one in flight
 
