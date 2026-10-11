@@ -240,6 +240,17 @@ def main():
             pass
         sys.__excepthook__(typ, value, tb)
     sys.excepthook = process_excepthook
+    previous_thread_hook = threading.excepthook
+    def agent_thread_hook(args):
+        if isinstance(args.thread, SymbolAgent):
+            try:
+                from aureon_mt5.crashes import report
+                report(args.thread, args.exc_value)
+            except Exception:
+                pass
+        else:
+            previous_thread_hook(args)
+    threading.excepthook = agent_thread_hook
 
     if not cfg.dry:
         if not broker.connect():
