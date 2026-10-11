@@ -2,6 +2,22 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.3.2 — 2026-10-11  (PATCH: ema2050 advisor rules corrected)
+- `prompts/advisor_rules.md`, ema2050 section (both advisors): the detector has already validated confirmation, the EMA20 touch
+  (its 1.5-pt tolerance), the hour and news — the advisor does not re-test them. Default TAKE; SKIP only for a listed reason cited
+  verbatim: `|dist_to_fast_ema_pts| > 5` · `swing_against_last6_pts >= 8` (no ATR rule) · `crosses_today >= 5 in Asia/London-early`
+  (session asia, or london before 11:00 server). Base rate stated: ~80% of entries close >= 0; SKIP rate > 30% = misreading.
+  Old "Good ENTER" / "Be sceptical" criteria (atr20, gap growing, trend_state) removed. "When unsure" is TAKE for ema2050
+  (ema5080 unchanged: SKIP). Rules hash changes → shadow-replay caches re-ask once.
+- Snapshot adds `bar_time_server` (HH:MM) for the London-early test.
+- Shadow-replay cache rows now store the snapshot sent; `python -m aureon_mt5.claude_replay export <cache> <out> [YYYY-MM]` writes them
+  as a fixture.
+- `common/rules.py`: `SKIP_REASONS_2050`, `ema2050_skip_reasons()`, `cites_listed_reason()` (tests / measurement only).
+- `tests/test_v232_prompt_rules.py`: rules-file content, reason boundaries, snapshot field, cache export (always run); July snapshots
+  SKIP rate <= 35% by the listed reasons (needs `tests/fixtures/ema2050_jul2026_snapshots.jsonl`) and through the live prompt with
+  every SKIP citing a listed reason (also `AUREON_PROMPT_TEST=1`, calls `claude -p`).
+- Strategy rules changed: NO (advisor prompt only).
+
 ## v2.3.1 — 2026-10-11  (PATCH: ema2050 port = research/ema2050_scan.py)
 - **Strategy rules changed: YES — ema2050 entry only** (the port deviated from the research; July 2026 replay 51 trades +113 vs research
   63 trades +222.5). ema5080: UNTOUCHED. Guardian / exits: unchanged.
