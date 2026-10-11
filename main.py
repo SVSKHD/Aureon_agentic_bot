@@ -167,6 +167,50 @@ def compare_saturday_tick(cfg, agents, journal, notify, claude=None, now: dateti
     return week
 
 
+_CLAUDE_REPORT_RUNNING: set[str] = set()
+
+
+def claude_report_tick(cfg, agents, journal, notify, now=None):
+    """Non-blocking, restart-safe weekly/monthly report scheduling."""
+    import threading
+    from aureon_mt5 import claude_report
+    now = now or datetime.now(IST)
+    if (now.hour, now.minute) < (10, 0):
+        return
+    periods = []
+    # Weekly report follows COMPARE on Saturday after 10:00 IST.
+    if now.weekday() == 5:
+        from aureon_mt5.compare import read_history, week_window
+        week_key, _, _ = week_window(now)
+        if any(row.get("week") == week_key for row in read_history(cfg.log_dir)):
+            periods.append(("week", week_key))
+    if now.day == 1:
+        previous = now.replace(day=1) - timedelta(days=1)
+        month_key = previous.strftime("%Y-%m")
+        records = journal.read(int((previous - timedelta(days=32)).timestamp()))
+        earliest = min((r["t"] for r in records), default=int(now.timestamp()))
+        if int(now.timestamp()) - earliest >= 21 * 86400:
+            periods.append(("month", month_key))
+    posted = {(r.get("period"), r.get("key")) for r in claude_report.read_history(cfg.log_dir)}
+    for period, key in periods:
+        token = f"{period}:{key}"
+        if (period, key) in posted or token in _CLAUDE_REPORT_RUNNING:
+            continue
+        _CLAUDE_REPORT_RUNNING.add(token)
+        def post(period=period, key=key, token=token):
+            try:
+                r = claude_report.report(cfg, agents, journal, period, now=now)
+                notify.card(r["title"], "Graded Claude advisory performance; no strategy changes.",
+                            fields=r["fields"], footer=f"v{VERSION} · {key}")
+                claude_report.append_history(cfg.log_dir, period, key)
+            except Exception as e:
+                telemetry.failure(notify, journal, title="AUREON CLAUDE REPORT FAILED",
+                                  key=f"claude-report:{token}", action="scheduled report", exc=e)
+            finally:
+                _CLAUDE_REPORT_RUNNING.discard(token)
+        threading.Thread(target=post, daemon=True, name=f"claude-report-{token}").start()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode"); ap.add_argument("--symbols"); ap.add_argument("--dry", action="store_true")
@@ -263,6 +307,7 @@ def main():
             was_open = is_open
             review_day = claude_review_tick(claude, cfg, review_day)
             compare_saturday_tick(cfg, agents, journal, notify, claude)
+            claude_report_tick(cfg, agents, journal, notify)
             supervise(agents, lambda sym: SymbolAgent(sym, cfg, S, notify, journal, news, claude=claude, alerts=alerts), notify, cfg.mode)
         except KeyboardInterrupt:
             notify.card("AUREON · MT5 · PROCESS EXITING", "KeyboardInterrupt")
