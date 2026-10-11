@@ -48,6 +48,22 @@ def report(cfg, agents, journal, period="week", now=None):
     since, until = int(start.timestamp()), int(now.timestamp())
     result = compare.gather(cfg, agents, journal, since, until)
     stats = summarize_rows(result.rows)
+    # Confidence calibration: directional correctness, not a probability forecast.
+    logs = journal.read(since, until)
+    confidence_by_signal = {
+        (r.get("symbol"), r.get("claude_event"), r.get("bar")): r.get("confidence")
+        for r in logs if r.get("event") == "claude_verdict" and not r.get("stale")
+    }
+    confidence = {}
+    for row in result.rows:
+        if row.status != "GRADED" or row.claude not in ("TAKE", "SKIP"): continue
+        level = confidence_by_signal.get((row.symbol, row.kind, row.bar))
+        if level not in ("low", "medium", "high"): continue
+        bucket = confidence.setdefault(level, {"n": 0, "correct": 0})
+        bucket["n"] += 1
+        bucket["correct"] += int((row.claude == "TAKE" and row.points > 0) or
+                                 (row.claude == "SKIP" and row.points < 0))
+    stats["confidence"] = confidence
     usage = summarize(cfg.log_dir, period, now=now - timedelta(seconds=1) if period == "month" else now)
     pullback = result.pullback
     by_decision = pullback.by_decision
@@ -57,7 +73,9 @@ def report(cfg, agents, journal, period="week", now=None):
         {"name": "SKIP precision", "value": f"{stats['skip_precision']}" if stats["skip_precision"] is not None else "—", "inline": True},
         {"name": "Expectancy (pts)", "value": f"Claude TAKE {stats['take_expectancy']} · detector all {stats['detector_expectancy']}", "inline": True},
         {"name": "TIGHTEN / CLOSE grading", "value": " · ".join(f"{k} {by_decision.get(k, {}).get('right', 0)}/{by_decision.get(k, {}).get('n', 0)} right" for k in ("TIGHTEN", "CLOSE")) + f" · {pullback.ungraded} ungraded", "inline": False},
-        {"name": "Calibration", "value": "Unavailable: journal confidence outcomes not yet matched; no synthetic score", "inline": False},
+        {"name": "Confidence correctness", "value": " · ".join(
+            f"{k} {v['correct']}/{v['n']}" for k, v in confidence.items()
+        ) or "No graded confidence evidence", "inline": False},
         {"name": "Usage", "value": f"{usage['calls']} calls · {usage['input_tokens']}/{usage['output_tokens']} tokens · CLI reported cost ${usage['cost_usd']:.4f}", "inline": False},
         {"name": "Top disagreements", "value": "\n".join(f"{d['symbol']} {d['bar']}: Claude {d['claude']} / trader {d['trader']} ({d['points']:+.1f}pts)" for d in stats["top_disagreements"]) or "None", "inline": False},
     ]
