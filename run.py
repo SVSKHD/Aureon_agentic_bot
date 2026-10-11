@@ -105,6 +105,8 @@ def shadow_replay(a, S, off, news, days: list[dict], title: str):
             continue
         sr = ShadowReplay(cfg, S, a.symbol, off, news, out_dir=a.out, model=getattr(a, f"{adv}_model"), max_calls=getattr(a, f"{adv}_max"),
                           sleep_s=getattr(a, f"{adv}_sleep"), refresh=getattr(a, f"{adv}_refresh"), variant=variant, advisor=adv)
+        if sr.stale_bars:
+            print(f"rules hash changed -> {sr.stale_bars} bars will be re-asked")
         binary = cfg.claude_bin if adv == "claude" else cfg.codex_bin
         print(f"\n{adv.upper()} SHADOW REPLAY · model {sr.model or 'CLI default'} · bin {binary} · cache {sr.path} "
               f"({len(sr.cache)} cached verdicts) · max {getattr(a, f'{adv}_max')} calls")

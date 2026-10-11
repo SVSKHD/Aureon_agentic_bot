@@ -2,6 +2,22 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.3.3 — 2026-10-11  (PATCH: Claude rules wording + shadow report fixes)
+- `prompts/advisor_rules.md` (alias `claude_rules.md`), ema2050 section: the four operator paragraphs verbatim (detector already validated
+  confirmation and the EMA20 touch · no ATR rule, swing matters only >= 8 · crosses_today >= 5 only before 11:00 server · default TAKE,
+  cite a listed reason, p_win on every verdict). Listed reason 3 is now "crosses_today >= 5 before 11:00 server" (no session condition).
+  Removed every other "1.5" and the gap / 3-bar confirmation detail. Reply contract asks for `p_win` on every verdict.
+  **Not done: the base text of research/claude_rules_v2.md — it was not in the chat or the repo.**
+- Snapshot `confirm_state` is words only (`confirmed` / `confirmed N bars ago` / `not confirmed` / `no cross`): the detector's own
+  strings carried its thresholds ("gap 1.20 < 1.5").
+- Shadow report (`run.py --claude/--codex`): win% counts result > 0 (was the scorecard's +10-and-better grades); calibration from
+  p_win only, with the count of verdicts that had none; `rules hash changed -> N bars will be re-asked` printed first when the cache
+  holds bars under another rules hash.
+- `tests/test_claude_rules_replay.py`: the July snapshots through the current rules, answered live once (AUREON_PROMPT_TEST=1) and
+  cached per rules hash in `tests/fixtures/claude_rules_replay_jul2026.jsonl`; asserts SKIP rate <= 35%, no reason containing "1.5"
+  or "atr", every SKIP citing a listed reason, p_win present. A rules change without a refreshed cache fails. Needs the snapshot fixture.
+- Strategy rules changed: NO.
+
 ## v2.3.2 — 2026-10-11  (PATCH: ema2050 advisor rules corrected)
 - `prompts/advisor_rules.md`, ema2050 section (both advisors): the detector has already validated confirmation, the EMA20 touch
   (its 1.5-pt tolerance), the hour and news — the advisor does not re-test them. Default TAKE; SKIP only for a listed reason cited
