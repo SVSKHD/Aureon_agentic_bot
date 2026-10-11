@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -35,39 +36,37 @@ IST = timezone(timedelta(hours=5, minutes=30))
 AUTO_UPDATE_INTERVAL = 300  # check remote every 5 minutes
 
 
-_update_skipped_day = None  # date of the last UPDATE SKIPPED card (posted once per IST day)
+_update_failed_at = 0.0  # last UPDATE FAILED card (posted at most once per hour)
 
 
-def check_for_updates(notify, run=subprocess.run, execv=os.execv) -> bool:
-    """Fetch remote master; if ahead of local and the checkout is clean, fast-forward and restart the process.
-    A dirty checkout (modified tracked files) is never pulled: one UPDATE SKIPPED card per day, nothing else."""
-    global _update_skipped_day
+def discarded_card(notify, res) -> None:
+    from aureon_mt5.common.updater import discarded_title
+    notify.card(discarded_title(res),
+                f"Server is authoritative: checkout reset to origin/master `{res['new'][:8]}`.\npatch saved `{res['patch']}`",
+                fields=[{"name": "Restore", "value": f"git apply {res['patch']}", "inline": False}],
+                footer="Aureon MT5 · Auto-Update")
+
+
+def check_for_updates(notify, run=subprocess.run, execv=os.execv, log_dir: str = "logs", cwd: str | None = None) -> bool:
+    """Server-authoritative: if origin/master moved, bring the checkout exactly to it (local edits → patch, then reset)
+    and restart. Restarts only after HEAD == origin/master; any failure keeps the current build running."""
+    global _update_failed_at
     try:
-        run(["git", "fetch", "origin", "master"], capture_output=True, timeout=30)
-        local = run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10).stdout.strip()
-        remote = run(["git", "rev-parse", "origin/master"], capture_output=True, text=True, timeout=10).stdout.strip()
-        if not local or not remote or local == remote:
+        from aureon_mt5.common.updater import update_to_origin
+        res = update_to_origin(log_dir, run=run, **({"cwd": cwd} if cwd else {}))
+        if res["status"] == "failed":
+            if _time.time() - _update_failed_at >= 3600:
+                _update_failed_at = _time.time()
+                notify.card("AUREON · MT5 · UPDATE FAILED", res["error"][:300],
+                            fields=[{"name": "Action", "value": "Running on the current build; retried every 5 min", "inline": False}],
+                            footer="Aureon MT5 · Auto-Update · shown once per hour")
             return False
-        status = run(["git", "status", "--porcelain", "--untracked-files=no"], capture_output=True, text=True, timeout=10)
-        dirty = [line[3:] for line in (status.stdout or "").splitlines() if line.strip()]
-        if status.returncode != 0 or dirty:
-            today = datetime.now(IST).date()
-            if _update_skipped_day != today:
-                _update_skipped_day = today
-                files = ", ".join(dirty[:10]) or "git status failed"
-                notify.card(f"AUREON · MT5 · UPDATE SKIPPED · {files}"[:250],
-                            f"Local changes to tracked files block the auto-update.\n`{local[:8]}` → `{remote[:8]}`",
-                            fields=[{"name": "Action", "value": "git checkout -- <files> (or commit them), then git pull --ff-only", "inline": False}],
-                            footer="Aureon MT5 · Auto-Update · shown once per day")
+        if res["status"] != "updated":
             return False
-        result = run(["git", "pull", "--ff-only", "origin", "master"], capture_output=True, text=True, timeout=60)
-        if result.returncode != 0:
-            notify.card("AUREON · MT5 · UPDATE FAILED", f"git pull --ff-only failed: {(result.stderr or '')[:200]}",
-                        fields=[{"name": "Action", "value": "Manual pull required", "inline": False}],
-                        footer="Aureon MT5 · Auto-Update")
-            return False
-        notify.card("AUREON · MT5 · RESTARTING", f"New commits pulled from master.\n`{local[:8]}` → `{remote[:8]}`",
-                    fields=[{"name": "Pull", "value": "Success", "inline": True},
+        if res["discarded"]:
+            discarded_card(notify, res)
+        notify.card("AUREON · MT5 · RESTARTING", f"Updated to origin/master.\n`{res['old'][:8]}` → `{res['new'][:8]}`",
+                    fields=[{"name": "Update", "value": "Success", "inline": True},
                             {"name": "Action", "value": "Restarting now...", "inline": True}],
                     footer=f"Aureon MT5 · Auto-Update · {datetime.now(IST):%H:%M} IST")
         _time.sleep(2)
@@ -76,6 +75,21 @@ def check_for_updates(notify, run=subprocess.run, execv=os.execv) -> bool:
     except Exception as e:
         print(f"auto-update check failed: {e}")
     return False
+
+
+def seed_news_file(path: str | None) -> bool:
+    """v2.2.2: news_blackout.txt is server-local (ignored). If it is missing (first run, or the update that stopped
+    tracking it removed it), copy news_blackout.example.txt next to it. Never overwrites an existing file."""
+    if not path or os.path.exists(path):
+        return False
+    example = os.path.join(os.path.dirname(path), "news_blackout.example.txt")
+    if not os.path.exists(example):
+        return False
+    try:
+        shutil.copyfile(example, path)
+        return True
+    except OSError:
+        return False
 
 
 def banner() -> str:
@@ -276,6 +290,7 @@ def main():
         if not broker.connect():
             print("MT5 not available — is the terminal open and logged in? (use --dry for a pipe test)"); sys.exit(1)
         cfg.server_utc_offset = broker.server_offset_hours(cfg.symbols[0], cfg.server_utc_offset)
+    seed_news_file(cfg.news_file)
     news = load_news(cfg.news_file if cfg.news_file and os.path.exists(cfg.news_file) else None, date.today().year)
     news_line, unverified = news_status(cfg.news_file)
 
@@ -342,7 +357,7 @@ def main():
             now = _time.time()
             if now - last_update_check >= AUTO_UPDATE_INTERVAL:
                 last_update_check = now
-                check_for_updates(notify)
+                check_for_updates(notify, log_dir=cfg.log_dir)
             is_open = broker.market_open(cfg.symbols[0], cfg.server_utc_offset, cfg.dry)
             if was_open and not is_open:
                 notify.send(f"{cfg.mode}:ALL:MARKET:closed-{date.today()}", "AUREON · MT5 · MARKET CLOSED", ["agents sleeping"], footer=f"{S.display_name} · {datetime.now(IST):%H:%M} IST")

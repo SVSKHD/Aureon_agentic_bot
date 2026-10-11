@@ -1,4 +1,4 @@
-# Aureon MT5 v2.2.1
+# Aureon MT5 v2.2.2
 
 You place the trade. Aureon detects (per selected EMA mode), fires a Discord gunshot, then manages what you placed:
 protect → secure +10 → ride in +5 steps → close on the fast-EMA turn → news safeguard. Reports and slash commands.
@@ -208,6 +208,12 @@ placeholder until `research/claude_rules_v2.md` is supplied). Saturday, after th
 snapshot fields → up to 3 proposed rule lines with the supporting count (`logs/claude_rule_proposals.json`). `/claude-rules` lists them;
 `/claude-rules-approve <n>` appends the line, dated, to `claude_rules.md`. Nothing changes without approval.
 
+
+## Auto-update (v2.2.2) — the server follows origin/master
+Every 5 min, and before `/restart` / `/mode`: if origin/master moved, local edits to tracked files are saved to
+`logs/local_changes_<hash>_<ts>.patch` and discarded (`git reset --hard origin/master`), otherwise `git pull --ff-only`; restart only once
+HEAD == origin/master. Never edit tracked files on the server — commit them. Server-local, never touched: `.env`, `logs/`, `out/`,
+`news_blackout.txt` (copied from `news_blackout.example.txt` when missing). No network → `UPDATE FAILED` once per hour, current build keeps running.
 
 ## Codex read-only advisor (PR #7–#10)
 | `AUREON_CODEX` | what happens |

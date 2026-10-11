@@ -33,9 +33,23 @@ def write_mode(env_path, mode, symbols=None):
         return names
     return None
 
-def restart_process(agents, journal, notify, user, reason="", mode=None, symbols=None, argv=None, executor=os.execv):
-    """Only after permission/position gates passed by the invoking command."""
+def restart_process(agents, journal, notify, user, reason="", mode=None, symbols=None, argv=None, executor=os.execv,
+                    log_dir="logs", update=None):
+    """Only after permission/position gates passed by the invoking command.
+    Brings the checkout to origin/master first (same rules as auto-update); a failed update aborts the restart
+    before any agent is stopped, so the current build keeps running."""
     reason = (reason or "requested").strip()[:120]
+    from .common.updater import discarded_title, update_to_origin
+    if update is None:
+        update = lambda: update_to_origin(log_dir)
+    res = update()
+    if res["status"] == "failed":
+        notify.card("AUREON · MT5 · RESTART ABORTED", f"Update failed: {res['error'][:200]}\nAgents still running on the current build."
+                    + (f"\n.env already says {mode}; it takes effect on the next restart." if mode else ""))
+        journal.log("manual_restart_aborted", by=str(user), reason=reason, error=res["error"][:200])
+        return False
+    if res["discarded"]:
+        notify.card(discarded_title(res), f"Checkout reset to origin/master. Restore: `git apply {res['patch']}`")
     notify.card("AUREON · MT5 · RESTARTING", f"Requested by {user} · {reason}")
     journal.log("manual_restart", by=str(user), reason=reason, mode=mode)
     for ag in list(agents.values()):

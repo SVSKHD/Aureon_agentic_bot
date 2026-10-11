@@ -1169,7 +1169,8 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
 
     def _restart_later(*args):
         # after the followup is sent: restart_process stops agents and re-execs (the process does not return)
-        threading.Timer(2.0, ops.restart_process, args=(agents, journal, notify) + args).start()
+        threading.Timer(2.0, ops.restart_process, args=(agents, journal, notify) + args,
+                        kwargs={"log_dir": cfg.log_dir}).start()
 
     @tree.command(name="restart", description="Admin: stop agents cleanly and restart process; requires role")
     @app_commands.describe(reason="Reason shown on the BACK ONLINE card")

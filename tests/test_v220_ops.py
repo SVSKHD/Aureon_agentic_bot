@@ -43,7 +43,7 @@ def test_restart_stops_joins_posts_and_execs(monkeypatch):
     journal, notify, execv = Mock(), Mock(), Mock()
     ops.restart_process({"XAUUSD": ag}, journal, notify, "operator",
                         "test", argv=["main.py", "--mode", "ema2050"],
-                        executor=execv)
+                        executor=execv, update=lambda: {"status": "current", "discarded": []})
     notify.card.assert_called_once()
     journal.log.assert_called_once()
     ag.stop.assert_called_once()
