@@ -73,7 +73,7 @@ class SymbolAgent(threading.Thread):
         self.snapshot: dict = {"at": None}
         self._pos_seen: list | None = None
         self._today_cache: tuple = (0.0, None)
-        self._stop = threading.Event()
+        self._stop_evt = threading.Event()   # v2.0.1: was self._stop, which shadowed Thread._stop() and broke join()
         for t, st in list(self.state.items()):
             if st.get("mode") and st["mode"] != strategy.name:
                 notify.card(ctitle(symbol, "MODE MISMATCH"), "Guardian keeps the existing SL (never loosened); no cross-strategy rules applied.",
@@ -81,7 +81,7 @@ class SymbolAgent(threading.Thread):
                             color=EVENT_COLOURS["flip"], footer=cfooter(strategy.display_name))
                 st["frozen"] = True
 
-    def stop(self): self._stop.set()
+    def stop(self): self._stop_evt.set()
 
     def key(self, event: str, ident) -> str:
         """Symbol-aware dedupe key: mode:symbol:event:ticket|bar."""
@@ -92,7 +92,7 @@ class SymbolAgent(threading.Thread):
         if not self.dry:
             self.off = broker.server_offset_hours(self.symbol, self.cfg.server_utc_offset); self.health["offset_h"] = self.off
         announced_closed = False
-        while not self._stop.is_set():
+        while not self._stop_evt.is_set():
             try:
                 if not broker.market_open(self.symbol, self.off, self.dry):
                     self.health["status"] = "market closed"

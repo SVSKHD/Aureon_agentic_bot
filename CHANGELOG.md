@@ -2,6 +2,22 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.0.1 — 2026-10-11  (thread stop fix · /claude attachment card)
+- FIX `SymbolAgent` set `self._stop = threading.Event()`, shadowing `threading.Thread._stop()`: `join()` raised `TypeError: 'Event' object is
+  not callable` (`tests/test_claude_advisor.py::test_off_means_zero_calls`; the supervisor restart / shutdown path live). Renamed to
+  `_stop_evt` everywhere. New `tests/test_v201_thread.py`: start → stop → join(timeout=2) returns cleanly in dry mode.
+- `/claude` now answers "is Claude Code attached to this agent?": header (mode · resolved bin path · `claude --version`, cached at start and
+  refreshed by `/claude-test` · login state ok / auth error / not found — red with what to run when the binary is missing or the login failed) ·
+  models (configured ids and the id the CLI reported in its last JSON result) · budget (calls used / max, entry / pullback / alert calls,
+  fast-exit cancellations = pullback verdicts that arrived after the trade had closed, last latency, last error) · one line per running agent:
+  `XAUUSD · EMA 20/50 · ATTACHED (advisory) · triggers: ENTER bar, pullback-in-trade · last verdict 11:40 IST TAKE`, or
+  `NOT ATTACHED (advisor.advises()=False)`, `DETACHED (mode=off)`, `DETACHED (/claude-detach)`, `REVIEW (cards only, nothing applied)`.
+- `/claude-attach <symbol>` / `/claude-detach <symbol>`: toggle `agent.claude` at runtime without a restart (detach sets it to None and cancels
+  the symbol's queued jobs and inbox; attach re-binds only when advises() and the mode allow). Journal `claude_attach` / `claude_detach`.
+  `/status` gets a `Claude: ATTACHED (mode) | REVIEW | OFF | NOT ATTACHED | DETACHED` field.
+- `claude_cli.version()` and `CliResult.model` (model id reported by the CLI). 8 new tests (196 in this repository).
+- Strategy rules changed: NO.
+
 ## v2.0.0 — 2026-10-10  (ema2050 un-frozen: a NEW ACTIVE strategy · /alert price alerts · Claude add-on for both modes)
 - **ema2050 is ACTIVE** with its own rules and live guardian profile; `ema5080` stays the default and is untouched (thresholds, guardian
   values and all its tests unchanged; a test pins its Guardian dataclass byte-identical).

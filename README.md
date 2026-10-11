@@ -1,4 +1,4 @@
-# Aureon MT5 v2.0.0
+# Aureon MT5 v2.0.1
 
 You place the trade. Aureon detects (per selected EMA mode), fires a Discord gunshot, then manages what you placed:
 protect → secure +10 → ride in +5 steps → close on the fast-EMA turn → news safeguard. Reports and slash commands.
@@ -65,7 +65,10 @@ rejected modifications → `❌ AUREON GUARDIAN FAILURE` with retcode, retried, 
 
 ## Commands
 `/alert <price> [symbol] [note]` · `/alerts` · `/alert-cancel <id>` · `/alert-clear [symbol]` (v2.0.0, see below) · `/claude-rules` · `/claude-rules-approve <n>` ·
-`/status` (version, mode, market, tick age, MT5, agent, guardian, position phase/SL/secured/peak, IST-day counters, last broker action) ·
+`/claude` (v2.0.1: is Claude Code attached to each agent? header mode · bin · `claude --version` · login; models as configured and as the CLI reported;
+budget calls/max, entry/pullback/alert calls, fast-exit cancellations, last latency/error; one line per agent ATTACHED / REVIEW / NOT ATTACHED / DETACHED) ·
+`/claude-attach <symbol>` · `/claude-detach <symbol>` (runtime toggle, no restart; detach cancels queued jobs; journaled `claude_attach` / `claude_detach`) ·
+`/status` (version, mode, market, tick age, MT5, agent, guardian, position phase/SL/secured/peak, IST-day counters, last broker action, Claude ATTACHED/REVIEW/OFF) ·
 `/parallel-status` · `/agents` (components ✅/❌) · `/symbols` (mode, profile) · `/symbol-present` · `/market` · `/report [current]` (mode, signals by kind, secure steps, exits).
 Every command is acknowledged at once and answered by a followup. Status commands read a per-symbol snapshot the agent refreshes
 each poll ("as of N s ago"), so a busy MT5 never delays them. `/status` and `/agents` also show event-loop lag and gateway latency.

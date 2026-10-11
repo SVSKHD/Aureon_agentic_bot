@@ -39,6 +39,7 @@ class CliResult:
     timed_out: bool = False
     raw: str = ""
     text: str = ""                       # free text result (daily review / test)
+    model: str = ""                      # v2.0.1: the model id the CLI reported in its JSON result (when present)
 
 
 # ----------------------------------------------------------------------------- environment
@@ -120,17 +121,47 @@ def parse_output(stdout: str, event: str) -> CliResult:
     if not isinstance(outer, dict):
         return CliResult(False, error="CLI output has no result", raw=(stdout or "")[:500])
     result = outer.get("result")
+    model = reported_model(outer)
     if outer.get("is_error") or outer.get("subtype", "success") not in ("success",):
         msg = str(result or outer.get("error") or outer.get("subtype") or "error")[:200]
         return CliResult(False, error=msg, auth_error=_is_auth(msg), raw=(stdout or "")[:500])
     if not isinstance(result, str):
         return CliResult(False, error="CLI result missing", raw=(stdout or "")[:500])
     if event in ("review", "test"):
-        return CliResult(True, text=result.strip(), raw=result[:500])
+        return CliResult(True, text=result.strip(), raw=result[:500], model=model)
     try:
-        return CliResult(True, verdict=validate(extract_json(result), event), raw=result[:500])
+        return CliResult(True, verdict=validate(extract_json(result), event), raw=result[:500], model=model)
     except Exception as e:
-        return CliResult(False, error=f"invalid verdict: {e}", raw=result[:500])
+        return CliResult(False, error=f"invalid verdict: {e}", raw=result[:500], model=model)
+
+
+def reported_model(outer: dict) -> str:
+    """The model id in a `--output-format json` result: `model`, else the first key of `modelUsage`. '' when absent."""
+    try:
+        m = outer.get("model")
+        if isinstance(m, str) and m:
+            return m
+        mu = outer.get("modelUsage")
+        if isinstance(mu, dict) and mu:
+            return str(next(iter(mu)))
+    except Exception:
+        pass
+    return ""
+
+
+def version(bin: str = "claude", timeout: float = 15.0, run=subprocess.run) -> dict:
+    """`claude --version` → {"ok", "version", "path", "error"}. Never raises; 'not found' when the binary is missing."""
+    path = resolve_bin(bin)
+    try:
+        r = run([path, "--version"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, env=clean_env())
+        out = (r.stdout or r.stderr or "").strip().splitlines()
+        if r.returncode == 0 and out:
+            return {"ok": True, "version": out[0][:80], "path": path, "error": ""}
+        return {"ok": False, "version": "", "path": path, "error": (out[0] if out else f"exit {r.returncode}")[:160]}
+    except FileNotFoundError:
+        return {"ok": False, "version": "", "path": path, "error": f"'{bin}' not found — install Claude Code or set AUREON_CLAUDE_BIN"}
+    except Exception as e:
+        return {"ok": False, "version": "", "path": path, "error": f"{e!r}"[:160]}
 
 
 # ----------------------------------------------------------------------------- the call

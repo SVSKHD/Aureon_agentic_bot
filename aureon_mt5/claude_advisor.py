@@ -192,7 +192,12 @@ class ClaudeAdvisor:
         self.fired: dict[tuple, float] = {}                 # (symbol, ticket) -> peak when the pullback verdict was requested
         self._unavail_last: dict[str, float] = {}
         self._budget_day: str | None = None
-        self.stats = {"login": None, "last_verdict": None, "last_error": "", "latencies": deque(maxlen=50), "dropped": 0}
+        self.stats = {"login": None, "last_verdict": None, "last_error": "", "latencies": deque(maxlen=50), "dropped": 0,
+                      # v2.0.1 /claude attachment card
+                      "version": None, "bin_path": claude_cli.resolve_bin(cfg.claude_bin), "version_error": "",
+                      "calls_by_event": {"entry": 0, "pullback": 0, "alert": 0, "review": 0, "test": 0},
+                      "fast_exit_cancels": 0, "detach_cancels": 0, "last_latency": None,
+                      "reported_models": {}, "last_verdict_by_symbol": {}}
         self._worker: threading.Thread | None = None
         try:
             with open(RULES_PATH, encoding="utf-8") as f:
@@ -218,7 +223,75 @@ class ClaudeAdvisor:
     # ------------------------------------------------------------------ worker
     def start(self):
         if self._worker is None:
+            self.refresh_version()
             self._worker = threading.Thread(target=self._loop, daemon=True, name="claude-worker"); self._worker.start()
+
+    # ------------------------------------------------------------------ v2.0.1 attachment: version, attach / detach, cancel
+    def refresh_version(self) -> dict:
+        """`claude --version` (cached; refreshed by /claude-test). Never raises."""
+        try:
+            v = claude_cli.version(self.cfg.claude_bin)
+        except Exception as e:
+            v = {"ok": False, "version": "", "path": self.stats["bin_path"], "error": f"{e!r}"[:160]}
+        self.stats["version"] = v["version"] if v["ok"] else None
+        self.stats["version_error"] = v["error"]; self.stats["bin_path"] = v["path"]
+        if not v["ok"] and "not found" in v["error"]:
+            self.stats["login"] = "NOT FOUND"
+        return v
+
+    def attachment(self, agent) -> dict:
+        """{state, label, triggers} for one agent. state: ATTACHED | REVIEW | NOT_ATTACHED | DETACHED."""
+        S = agent.S
+        triggers = "ENTER bar, pullback-in-trade" if getattr(S, "name", "") == "ema2050" else "P / CROSS / RE, pullback-in-trade"
+        if getattr(agent, "claude", None) is self and self.mode in ADVISE_MODES:
+            return {"state": "ATTACHED", "label": f"ATTACHED ({self.mode})", "triggers": triggers}
+        if self.mode == "review":
+            return {"state": "REVIEW", "label": "REVIEW (cards only, nothing applied)", "triggers": "23:00 IST review, /alert add-on line"}
+        if self.mode == "off":
+            return {"state": "DETACHED", "label": "DETACHED (mode=off)", "triggers": "—"}
+        if not self.advises(S):
+            return {"state": "NOT_ATTACHED", "label": "NOT ATTACHED (advisor.advises()=False)", "triggers": "—"}
+        return {"state": "DETACHED", "label": "DETACHED (/claude-detach)", "triggers": "—"}
+
+    def cancel_jobs(self, symbol: str, agent=None) -> int:
+        """Drop queued jobs for `symbol` (and its inbox). Returns how many were cancelled. A call already in flight finishes;
+        its result finds agent.claude is None and is journaled only."""
+        kept = []; n = 0
+        while True:
+            try:
+                job = self.q.get_nowait()
+            except queue.Empty:
+                break
+            if job.get("symbol") == symbol:
+                n += 1
+            else:
+                kept.append(job)
+        for job in kept:
+            self.q.put_nowait(job)
+        inbox = getattr(agent, "claude_inbox", None)
+        while inbox is not None:
+            try:
+                inbox.get_nowait(); n += 1
+            except queue.Empty:
+                break
+        self.stats["detach_cancels"] += n
+        return n
+
+    def detach(self, agent, by: str = "") -> int:
+        n = self.cancel_jobs(agent.symbol, agent)
+        agent.claude = None
+        self.journal.log("claude_detach", symbol=agent.symbol, mode=agent.S.name, cancelled=n, by=by)
+        return n
+
+    def attach(self, agent, by: str = "") -> tuple[bool, str]:
+        """Re-bind at runtime. False with the reason when the mode or advises() does not allow it."""
+        if self.mode not in ADVISE_MODES:
+            return False, f"mode={self.mode} — {'review: cards only, nothing applied' if self.mode == 'review' else 'off'}; set AUREON_CLAUDE=advisory|manage and restart"
+        if not self.advises(agent.S):
+            return False, f"advisor.advises()=False for {agent.S.name}"
+        agent.claude = self
+        self.journal.log("claude_attach", symbol=agent.symbol, mode=agent.S.name, by=by)
+        return True, f"ATTACHED ({self.mode})"
 
     def _loop(self):
         while True:
@@ -300,9 +373,13 @@ class ClaudeAdvisor:
         with self._call_lock:
             res = self.caller(prompt, model, event=event, bin=self.cfg.claude_bin, workdir=self.cfg.claude_workdir,
                               timeout=self.cfg.claude_timeout)
-        self.stats["latencies"].append(res.latency_s)
+        self.stats["latencies"].append(res.latency_s); self.stats["last_latency"] = res.latency_s
+        kind = {"pullback": "pullback", "ALERT": "alert", "review": "review", "test": "test"}.get(event, "entry")
+        self.stats["calls_by_event"][kind] = self.stats["calls_by_event"].get(kind, 0) + 1
+        if getattr(res, "model", ""):
+            self.stats["reported_models"][kind] = res.model
         if res.auth_error:
-            self.stats["login"] = "FAILED"
+            self.stats["login"] = "NOT FOUND" if "not found" in (res.error or "") else "FAILED"
         elif res.ok or res.raw:
             self.stats["login"] = "OK"
         if not res.ok:
@@ -341,6 +418,7 @@ class ClaudeAdvisor:
             self._journal(job, None, latency=res.latency_s, acted=False, stale=False, error=res.error or "no verdict")
             return
         self.stats["last_verdict"] = f"{job['symbol']} {job['event']} {v['decision']} · {v['confidence']} · {datetime.now(IST):%H:%M} IST"
+        self.stats["last_verdict_by_symbol"][job["symbol"]] = f"{datetime.now(IST):%H:%M} IST {v['decision']}"
         job["latency"] = res.latency_s
         if job["type"] == "entry":
             stale = now_server(job["off"]) >= job["bar_t"] + 2 * BAR_S
@@ -377,6 +455,7 @@ class ClaudeAdvisor:
         acted = False; note = ""
         if p is None:
             note = "position no longer open — nothing to do"
+            self.stats["fast_exit_cancels"] += 1                 # v2.0.1: the trade closed before the verdict arrived
         elif stale:
             note = "STALE — arrived after the next bar closed; not acted"
         elif dec == "HOLD":
@@ -453,6 +532,7 @@ class ClaudeAdvisor:
         return self._enqueue({"type": "review", "event": "review", "symbol": "ALL", "day": day, "force": force})
 
     def test_call(self) -> claude_cli.CliResult | None:
+        self.refresh_version()
         return self._call("Reply only: OK", self.cfg.claude_review_model, "test")
 
     # ------------------------------------------------------------------ status for /claude
@@ -462,7 +542,13 @@ class ClaudeAdvisor:
                 "calls": self.budget.used(), "limit": self.cfg.claude_max_calls, "last_verdict": self.stats["last_verdict"] or "—",
                 "avg_latency": (sum(lats) / len(lats)) if lats else None, "queue": self.q.qsize(),
                 "last_error": self.stats["last_error"] or "—", "dropped": self.stats["dropped"],
-                "models": f"entry {self.cfg.claude_entry_model} · pullback {self.cfg.claude_pullback_model} · review {self.cfg.claude_review_model}"}
+                "models": f"entry {self.cfg.claude_entry_model} · pullback {self.cfg.claude_pullback_model} · review {self.cfg.claude_review_model}",
+                # v2.0.1
+                "version": self.stats["version"], "version_error": self.stats["version_error"], "bin_path": self.stats["bin_path"],
+                "bin": self.cfg.claude_bin, "calls_by_event": dict(self.stats["calls_by_event"]), "fast_exit_cancels": self.stats["fast_exit_cancels"],
+                "detach_cancels": self.stats["detach_cancels"], "last_latency": self.stats["last_latency"],
+                "reported_models": dict(self.stats["reported_models"]), "last_verdict_by_symbol": dict(self.stats["last_verdict_by_symbol"]),
+                "model_ids": {"entry": self.cfg.claude_entry_model, "pullback": self.cfg.claude_pullback_model, "review": self.cfg.claude_review_model}}
 
     # ------------------------------------------------------------------ journal + cards
     def _journal(self, job, v, *, latency, acted, stale, error="", note=""):
