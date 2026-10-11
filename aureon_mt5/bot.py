@@ -760,7 +760,7 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
     def _latest_open():
         return next((i for i in reversed(list(pending.values())) if not i.get("decided")), None)
 
-    @tree.command(name="take", description="Take the latest open trade question")
+    @tree.command(name="take", description="Accept pending ask; operator places order unless AUREON_EXECUTION=1")
     async def take_cmd(inter: discord.Interaction):
         user = inter.user
         def work():
@@ -771,7 +771,7 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             return Reply(content=f"✅ taking **{item['meta'].get('side')}** {item['meta'].get('symbol')} — place it in MT5, I manage it from there")
         await run(inter, "take", work)
 
-    @tree.command(name="skip", description="Skip the latest open trade question")
+    @tree.command(name="skip", description="Skip pending ask; records operator decision")
     async def skip_cmd(inter: discord.Interaction):
         user = inter.user
         def work():
@@ -805,34 +805,34 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
     async def on_resumed():
         monitor.gateway_up()
 
-    @tree.command(name="status", description="Aureon status for the primary symbol")
+    @tree.command(name="status", description="Read primary symbol health and trade status")
     async def status(inter: discord.Interaction):
         sym = cfg.symbols[0]
         await run(inter, "status", lambda: Reply(card=status_card(sym, agents[sym], cfg, journal, monitor, claude)))
 
-    @tree.command(name="parallel-status", description="All symbols at a glance")
+    @tree.command(name="parallel-status", description="Show all monitored symbols and positions")
     async def pstatus(inter: discord.Interaction):
         await run(inter, "parallel-status", lambda: Reply(card=parallel_card(agents, cfg, journal)))
 
-    @tree.command(name="agents", description="Components and health")
+    @tree.command(name="agents", description="Show each agent phase, health, uptime and guardian state")
     async def agents_cmd(inter: discord.Interaction):
         await run(inter, "agents", lambda: Reply(card=agents_card(agents, cfg, started_at, monitor, claude, journal)))
 
-    @tree.command(name="symbols", description="Configured symbols and mode")
+    @tree.command(name="symbols", description="List configured trading symbols and modes")
     async def symbols(inter: discord.Interaction):
         await run(inter, "symbols", lambda: Reply(card=symbols_card(agents, cfg)))
 
-    @tree.command(name="symbol-present", description="Is a symbol running here?")
+    @tree.command(name="symbol-present", description="Check whether a symbol is monitored")
     @app_commands.describe(symbol="e.g. XAUUSD")
     async def present(inter: discord.Interaction, symbol: str):
         await run(inter, "symbol-present", lambda: Reply(card=present_card(symbol, agents, cfg)))
 
-    @tree.command(name="market", description="Is the market open?")
+    @tree.command(name="market", description="Show market open or closed status; read-only")
     async def market(inter: discord.Interaction):
         sym = cfg.symbols[0]
         await run(inter, "market", lambda: Reply(card=market_card(sym, agents[sym], cfg)))
 
-    @tree.command(name="report", description="Weekly report (previous week by default)")
+    @tree.command(name="report", description="Weekly trade report; read-only")
     @app_commands.describe(current="true = this week so far")
     async def report(inter: discord.Interaction, current: bool = False):
         def work():
@@ -840,7 +840,7 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             return Reply(card=card, source=source)
         await run(inter, "report", work, timeout=20)
 
-    @tree.command(name="chart", description="Market context chart with EMA lines")
+    @tree.command(name="chart", description="Show latest cached EMA market context")
     @app_commands.describe(symbol="e.g. XAUUSD (default: primary symbol)")
     async def chart(inter: discord.Interaction, symbol: str = ""):
         sym = (symbol or cfg.symbols[0]).upper()
@@ -854,7 +854,7 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
         await run(inter, "chart", work, timeout=20)
 
     # ------------------------------------------------------------------ v2.0.0 price alerts
-    @tree.command(name="alert", description="Price alert: fires once when the tick reaches the level (both modes)")
+    @tree.command(name="alert", description="Arm price alert; Aureon watches ticks automatically")
     @app_commands.describe(price="price level, e.g. 4120", symbol="default: primary symbol", note="optional note shown on the card")
     async def alert_cmd(inter: discord.Interaction, price: float, symbol: str = "", note: str = ""):
         user = inter.user
@@ -870,12 +870,12 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             return Reply(content=alerts_mod.armed_reply(a, cur), card=card, source="live" if cur is not None else "cache")
         await run(inter, "alert", work)
 
-    @tree.command(name="pull-history", description="MT5 closed deals of the last N days matched to the journal by ticket")
+    @tree.command(name="pull-history", description="Compare MT5 closed deals with Aureon journal")
     @app_commands.describe(days="window in days (default 7)", symbol="default: all symbols")
     async def pull_history_cmd(inter: discord.Interaction, days: int = 7, symbol: str = ""):
         await run(inter, "pull-history", lambda: pull_history(cfg, agents, journal, days, symbol.upper() or None), timeout=30)
 
-    @tree.command(name="git-history", description="Merges on master, the running build, origin/master status (or: tags)")
+    @tree.command(name="git-history", description="Show running version and recent Git changes")
     @app_commands.describe(n="merges to show (default 10)", tags="true = the last 10 tags with dates")
     async def git_history_cmd(inter: discord.Interaction, n: int = 10, tags: bool = False):
         def work():
@@ -904,7 +904,7 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
 
     tree.add_command(bot_group)
 
-    @tree.command(name="alerts", description="Armed price alerts with the distance to the current price")
+    @tree.command(name="alerts", description="List armed price watches; read-only")
     @app_commands.describe(symbol="default: primary symbol")
     async def alerts_cmd(inter: discord.Interaction, symbol: str = ""):
         def work():
@@ -914,7 +914,7 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             return Reply(content=alerts_mod.list_reply(alerts, sym, current_price(sym, agents.get(sym), cfg))[:1900])
         await run(inter, "alerts", work)
 
-    @tree.command(name="alert-cancel", description="Cancel one price alert by id (see /alerts)")
+    @tree.command(name="alert-cancel", description="Cancel one armed alert by ID; operator action")
     @app_commands.describe(id="alert id, e.g. A3")
     async def alert_cancel_cmd(inter: discord.Interaction, id: str):
         user = inter.user
@@ -928,7 +928,7 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             return Reply(content=f"cancelled {a['id']} · {a['symbol']} {a['price']:.2f}")
         await run(inter, "alert-cancel", work)
 
-    @tree.command(name="alert-clear", description="Cancel every armed alert for a symbol")
+    @tree.command(name="alert-clear", description="Cancel all armed alerts for a symbol; operator action")
     @app_commands.describe(symbol="default: primary symbol")
     async def alert_clear_cmd(inter: discord.Interaction, symbol: str = ""):
         user = inter.user
@@ -1184,7 +1184,7 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
     # ------------------------------------------------------------------ v1.10.0 Claude add-on (all off the loop via run())
     claude_wait = float(getattr(cfg, "claude_timeout", 90)) * 2 + 15      # a call may queue behind one in flight
 
-    @tree.command(name="claude", description="Claude add-on: is Claude Code attached to each agent? mode, bin, version, login, budget")
+    @tree.command(name="claude", description="Claude CLI health, authentication and attachment status")
     async def claude_cmd(inter: discord.Interaction):
         await run(inter, "claude", lambda: Reply(card=claude_card(claude, cfg, agents)))
 
@@ -1216,7 +1216,7 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             return Reply(content=f"⚪ {sym} · {ag.S.display_name} · DETACHED · {n} queued job(s) cancelled · guardian and signals unaffected")
         await run(inter, "claude-detach", work)
 
-    @tree.command(name="claude-test", description="One tiny Claude call to check the login")
+    @tree.command(name="claude-test", description="Verify Claude login by consuming one CLI test call")
     async def claude_test(inter: discord.Interaction):
         def work():
             if claude is None:
@@ -1228,7 +1228,7 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             return Reply(content=(f"🟢 Claude login OK · {r.latency_s:.0f} s" if ok else f"🔴 Claude test failed: {r.error or r.text[:200]}"), source="live")
         await run(inter, "claude-test", work, timeout=claude_wait)
 
-    @tree.command(name="claude-review", description="Claude review of a day's journal (default today, IST)")
+    @tree.command(name="claude-review", description="Request Claude day review; uses CLI quota")
     @app_commands.describe(date="YYYY-MM-DD (IST), default today")
     async def claude_review(inter: discord.Interaction, date: str = ""):
         def work():
@@ -1241,7 +1241,7 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             return Reply(content=f"CLAUDE REVIEW {day or 'today'}:\n{text}"[:1900], source="live")
         await run(inter, "claude-review", work, timeout=claude_wait)
 
-    @tree.command(name="claude-rules", description="Latest CLAUDE RULE PROPOSALS (Saturday card) and their status")
+    @tree.command(name="claude-rules", description="Show current Claude rule proposals")
     async def claude_rules_cmd(inter: discord.Interaction):
         def work():
             from . import compare
@@ -1254,7 +1254,7 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             return Reply(content="\n".join(lines)[:1900])
         await run(inter, "claude-rules", work)
 
-    @tree.command(name="claude-rules-approve", description="Append proposal <n> (dated) to claude_rules.md — nothing changes without this")
+    @tree.command(name="claude-rules-approve", description="Approve one Claude rule proposal; operator action")
     @app_commands.describe(n="proposal number from the CLAUDE RULE PROPOSALS card")
     async def claude_rules_approve_cmd(inter: discord.Interaction, n: int):
         user = inter.user
@@ -1278,12 +1278,12 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             em["image"] = {"url": f"attachment://{os.path.basename(c['png'])}"}
         return Reply(card=em, file=c.get("png"), source="cache" if (res.grading_note or "").startswith("MT5 busy") else "live")
 
-    @tree.command(name="compare", description="Detector vs Claude vs Me on the same signals (measurement only)")
+    @tree.command(name="compare", description="Compare detector, Claude and trader on graded signals")
     @app_commands.describe(days="window in days (default 7)", private="only you see the answer")
     async def compare_cmd(inter: discord.Interaction, days: int = 7, private: bool = False):
         await run(inter, "compare", lambda: _compare_reply(days, False), ephemeral=private, timeout=30)
 
-    @tree.command(name="compare-breakdown", description="Compare by event type (P/CROSS/RE) and session")
+    @tree.command(name="compare-breakdown", description="Compare signals by event type and market session")
     @app_commands.describe(days="window in days (default 7)")
     async def compare_breakdown_cmd(inter: discord.Interaction, days: int = 7):
         await run(inter, "compare-breakdown", lambda: _compare_reply(days, True), timeout=30)
