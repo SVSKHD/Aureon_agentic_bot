@@ -13,6 +13,8 @@ import sys
 import threading
 import time as _time
 from datetime import date, datetime, timedelta, timezone
+from dotenv import load_dotenv
+load_dotenv()
 
 from aureon_mt5 import broker, telemetry
 from aureon_mt5.agent import SymbolAgent
