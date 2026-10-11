@@ -40,6 +40,8 @@ class CliResult:
     raw: str = ""
     text: str = ""                       # free text result (daily review / test)
     model: str = ""                      # v2.0.1: the model id the CLI reported in its JSON result (when present)
+    usage: dict | None = None            # v2.2.1: token counts the CLI reported (input/output/cache), for the usage ledger
+    total_cost_usd: float | None = None  # v2.2.1: CLI-reported cost of the call (metadata only)
 
 
 # ----------------------------------------------------------------------------- environment

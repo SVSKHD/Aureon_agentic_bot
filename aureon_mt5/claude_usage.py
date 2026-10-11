@@ -12,12 +12,13 @@ KEYS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creat
 
 def append(log_dir, kind, result):
     os.makedirs(log_dir, exist_ok=True)
-    row = {"ts": time.time(), "kind": kind, "model": result.model or "",
+    usage = getattr(result, "usage", None) or {}
+    row = {"ts": time.time(), "kind": kind, "model": getattr(result, "model", "") or "",
            "latency": float(result.latency_s), "ok": bool(result.ok),
            "error": (result.error or "")[:160], "timed_out": bool(result.timed_out),
            "decision": (result.verdict or {}).get("decision"),
-           "total_cost_usd": result.total_cost_usd,
-           **{k: int((result.usage or {}).get(k, 0) or 0) for k in KEYS}}
+           "total_cost_usd": getattr(result, "total_cost_usd", None),
+           **{k: int(usage.get(k, 0) or 0) for k in KEYS}}
     with _lock, open(os.path.join(log_dir, "claude_usage.jsonl"), "a", encoding="utf-8") as f:
         f.write(json.dumps(row, default=str) + "\n")
     return row

@@ -94,7 +94,8 @@ def test_agent_failure_isolation(tmp_path, monkeypatch):
     monkeypatch.setattr(broker, "bars", bars)
     au = SymbolAgent("XAUUSD", cfg, S, n, j, ()); ag = SymbolAgent("XAGUSD", cfg, S, n, j, ())
     au.start(); ag.start(); time.sleep(4)
-    assert au.is_alive() and au.health["errors"] >= 1 and "error" in au.health["status"]
+    # v2.2.0: a crashing agent reports and exits (the supervisor restarts it); the other agent is unaffected
+    assert not au.is_alive() and au.health["errors"] >= 1 and "error" in au.health["status"]
     assert ag.is_alive() and ag.health["errors"] == 0 and ag.health["status"] == "running"
     au.stop(); ag.stop()
 

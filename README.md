@@ -1,4 +1,4 @@
-# Aureon MT5 v2.1.0
+# Aureon MT5 v2.2.1
 
 You place the trade. Aureon detects (per selected EMA mode), fires a Discord gunshot, then manages what you placed:
 protect → secure +10 → ride in +5 steps → close on the fast-EMA turn → news safeguard. Reports and slash commands.
@@ -209,6 +209,17 @@ snapshot fields → up to 3 proposed rule lines with the supporting count (`logs
 `/claude-rules-approve <n>` appends the line, dated, to `claude_rules.md`. Nothing changes without approval.
 
 
+## Codex read-only advisor (PR #7–#10)
+| `AUREON_CODEX` | what happens |
+|---|---|
+| `off` (default) | no Codex process is started |
+| `advisory` | `/codex-test` and `/codex-alert` may call `codex exec --sandbox read-only`; verdicts journaled, never applied |
+
+`/codex` · `/codex-status` (version, login, local calls today) · `/codex-test` (one schema-constrained verdict) ·
+`/codex-alert [symbol] [side]` (frozen closed-bar snapshot; refused when the cached bar is stale). CLI login only — run `codex login`;
+`OPENAI_API_KEY` / `CODEX_API_KEY` are stripped from the child environment. Optional: `AUREON_CODEX_BIN`, `AUREON_CODEX_MODEL`,
+`AUREON_CODEX_TIMEOUT` (30 s), `AUREON_CODEX_MAX_CALLS` (30/day), `AUREON_CODEX_WORKDIR`. One call at a time, no queue.
+
 ## v2.2.0 operations (staging)
 See `STATE.md`. Voice commands are **NOT IMPLEMENTED**; planned intents and safety controls: `docs/VOICE_SCOPE.md`. Existing trading strategy rules are unchanged. Do not operate deployment from unreviewed branches.
 
@@ -218,6 +229,7 @@ See `STATE.md`. Voice commands are **NOT IMPLEMENTED**; planned intents and safe
 | Monitoring | `/status`, `/agents`, `/parallel-status`, `/market`, `/chart`, `/symbols`, `/symbol-present` | Read-only snapshots; bot polls automatically |
 | Trading | `/take`, `/skip`, `/alert`, `/alerts`, `/alert-cancel`, `/alert-clear` | Alerts monitored automatically after arming; trading decision belongs to operator |
 | Claude | `/claude`, `/claude-status`, `/claude-test`, `/claude-review`, `/claude-rules`, `/claude-rules-approve`, `/claude-report` | Status/report read-only; CLI calls consume usage; rule approval manual |
+| Codex | `/codex`, `/codex-status`, `/codex-test`, `/codex-alert` | Read-only advisor, off unless `AUREON_CODEX=advisory`; test/alert consume a local call; never applied |
 | Reports | `/report`, `/compare`, `/compare-breakdown`, `/git-history`, `/pull-history` | On-demand historical diagnostics |
 | Control | `/restart`, `/mode`, `/discord-bot sync` | Administrator actions only where implemented; restart/mode require configured role ID |
 
