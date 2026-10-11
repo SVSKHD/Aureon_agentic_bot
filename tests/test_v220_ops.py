@@ -1,5 +1,6 @@
 """v2.2.0 operational helpers; no live MT5 or Discord connectivity required."""
 import json
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -20,10 +21,13 @@ def test_admin_role_rejects_unconfigured_and_accepts_matching():
 
 
 def test_mode_rejects_open_positions_and_unverified_snapshots(tmp_path):
-    ag = SimpleNamespace(snapshot={"at": 100, "positions": [{"ticket": 7}], "connected": True})
+    now = time.time()
+    ag = SimpleNamespace(snapshot={"at": now, "positions": [{"ticket": 7}], "connected": True})
     assert ops.positions_block_mode_change({"XAUUSD": ag})
-    ag.snapshot = {"at": 100, "positions": [], "connected": True}
+    ag.snapshot = {"at": now, "positions": [], "connected": True}
     assert not ops.positions_block_mode_change({"XAUUSD": ag})
+    ag.snapshot = {"at": now - 120, "positions": [], "connected": True}     # stale snapshot cannot prove flat
+    assert ops.positions_block_mode_change({"XAUUSD": ag})
     ag.snapshot = {"at": None}
     assert ops.positions_block_mode_change({"XAUUSD": ag})
     env = tmp_path / ".env"

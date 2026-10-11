@@ -2,6 +2,31 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.2.1 — 2026-10-11  (PATCH: fixes only)
+- `CliResult` gains `usage: dict | None` and `total_cost_usd: float | None`. `claude_cli.parse_output` already passed them, so every Claude
+  verdict call raised `TypeError` (44 tests red). `claude_usage.append` reads them with `getattr` defaults.
+- Auto-update (`main.check_for_updates`): checks `git status --porcelain --untracked-files=no` first; a modified tracked file posts one
+  `UPDATE SKIPPED · <files>` card per IST day and nothing else (no pull, no restart). Pull is `git pull --ff-only`; never `execv` after a failed pull.
+- `/restart` and `/mode` go through `run()` (defer → work off the loop → one followup) like every other command; the restart starts 2 s
+  after the reply. Same role, position and `.env` gates.
+- Tests brought in line with v2.2.0 behaviour: a crashing agent exits for the supervisor (isolation still asserted on the other agent);
+  the `/mode` position gate test uses a fresh snapshot (stale snapshots fail closed, also asserted).
+- `prompts/claude_rules.md`: test that the file loads and both mode sections exist. `research/claude_rules_v2.md` is **not in the repository**,
+  so the placeholder text is unchanged.
+- 5 new tests (236 in this repository).
+- Strategy rules changed: NO.
+
+## Codex read-only advisor — PR #7–#10, merged before v2.2.0 (no own tag; entry added in v2.2.1)
+- `AUREON_CODEX=off` (default) | `advisory`. Off → no Codex process is ever started. Codex never touches MT5, positions, the guardian or
+  alert buttons; verdicts are journaled (`codex_test`, `codex_alert`) and shown, never applied.
+- `/codex` (mode, `codex --version`, login, local calls today), `/codex-status` (login, version, call count), `/codex-test` (one
+  schema-constrained verdict, consumes one call), `/codex-alert [symbol] [side=BUY]` (frozen closed-bar snapshot + `claude_rules.md`, refused
+  when the cached bar is stale).
+- `codex exec --sandbox read-only --skip-git-repo-check` in `AUREON_CODEX_WORKDIR`; one process at a time, no queue; daily cap
+  `AUREON_CODEX_MAX_CALLS` (30); `AUREON_CODEX_TIMEOUT` (30 s); `AUREON_CODEX_BIN`, `AUREON_CODEX_MODEL`.
+- CLI login only (`codex login`): `OPENAI_API_KEY` / `CODEX_API_KEY` and Aureon secrets are stripped from the child environment.
+- Strategy rules changed: NO.
+
 ## v2.2.0 — 2026-10-11 (operational diagnostics and control; draft)
 - /agents: per-symbol phase, M5 bar server/IST, day counters, guardian, Claude, thread status and uptime; no MT5 reads in slash commands.
 - /commands grouped live directory; command descriptions clarify automatic work versus operator actions.

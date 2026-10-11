@@ -35,17 +35,34 @@ IST = timezone(timedelta(hours=5, minutes=30))
 AUTO_UPDATE_INTERVAL = 300  # check remote every 5 minutes
 
 
-def check_for_updates(notify) -> bool:
-    """Fetch remote master; if ahead of local, pull and restart the process."""
+_update_skipped_day = None  # date of the last UPDATE SKIPPED card (posted once per IST day)
+
+
+def check_for_updates(notify, run=subprocess.run, execv=os.execv) -> bool:
+    """Fetch remote master; if ahead of local and the checkout is clean, fast-forward and restart the process.
+    A dirty checkout (modified tracked files) is never pulled: one UPDATE SKIPPED card per day, nothing else."""
+    global _update_skipped_day
     try:
-        subprocess.run(["git", "fetch", "origin", "master"], capture_output=True, timeout=30)
-        local = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10).stdout.strip()
-        remote = subprocess.run(["git", "rev-parse", "origin/master"], capture_output=True, text=True, timeout=10).stdout.strip()
+        run(["git", "fetch", "origin", "master"], capture_output=True, timeout=30)
+        local = run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10).stdout.strip()
+        remote = run(["git", "rev-parse", "origin/master"], capture_output=True, text=True, timeout=10).stdout.strip()
         if not local or not remote or local == remote:
             return False
-        result = subprocess.run(["git", "pull", "origin", "master"], capture_output=True, text=True, timeout=60)
+        status = run(["git", "status", "--porcelain", "--untracked-files=no"], capture_output=True, text=True, timeout=10)
+        dirty = [line[3:] for line in (status.stdout or "").splitlines() if line.strip()]
+        if status.returncode != 0 or dirty:
+            today = datetime.now(IST).date()
+            if _update_skipped_day != today:
+                _update_skipped_day = today
+                files = ", ".join(dirty[:10]) or "git status failed"
+                notify.card(f"AUREON · MT5 · UPDATE SKIPPED · {files}"[:250],
+                            f"Local changes to tracked files block the auto-update.\n`{local[:8]}` → `{remote[:8]}`",
+                            fields=[{"name": "Action", "value": "git checkout -- <files> (or commit them), then git pull --ff-only", "inline": False}],
+                            footer="Aureon MT5 · Auto-Update · shown once per day")
+            return False
+        result = run(["git", "pull", "--ff-only", "origin", "master"], capture_output=True, text=True, timeout=60)
         if result.returncode != 0:
-            notify.card("AUREON · MT5 · UPDATE FAILED", f"git pull failed: {result.stderr[:200]}",
+            notify.card("AUREON · MT5 · UPDATE FAILED", f"git pull --ff-only failed: {(result.stderr or '')[:200]}",
                         fields=[{"name": "Action", "value": "Manual pull required", "inline": False}],
                         footer="Aureon MT5 · Auto-Update")
             return False
@@ -55,7 +72,7 @@ def check_for_updates(notify) -> bool:
                     footer=f"Aureon MT5 · Auto-Update · {datetime.now(IST):%H:%M} IST")
         _time.sleep(2)
         os.environ["AUREON_AUTO_RESTARTED"] = "1"
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+        execv(sys.executable, [sys.executable] + sys.argv)
     except Exception as e:
         print(f"auto-update check failed: {e}")
     return False
