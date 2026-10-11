@@ -12,3 +12,10 @@
 
 ## Unresolved validation
 Full Windows/MT5 integration, restart behavior, authenticated CLI usage accounting and new Discord slash-command registration require a staging run before deployment.
+
+## Operator release checks
+- Configure `AUREON_ADMIN_ROLE_ID` as an environment variable on the machine hosting the Discord bot.
+- Run `pytest tests/test_v220_ops.py` and the full regression suite, then verify slash-command sync.
+- Test `/mode` and `/restart` only without open exposure, on a staging/demo MT5 instance.
+- Confirm CLI usage ledger writes and weekend/month-end reports do not stall the 10-second market poll.
+- Check commit hashes and crash-recovery notifications from a staged intentional exception.
