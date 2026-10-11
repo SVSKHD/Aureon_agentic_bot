@@ -561,7 +561,7 @@ def self_review(claude, res: CompareResult, notify, week: str) -> str | None:
     cases = self_review_cases(res)
     if not cases or claude is None:
         return None
-    r = claude._call(SELF_REVIEW_PROMPT + json.dumps(cases, default=str), claude.cfg.claude_review_model, "review")
+    r = claude._call(SELF_REVIEW_PROMPT + json.dumps(cases, default=str), claude.cfg.claude_review_model, "review", kind_override="compare")
     if r is None or not r.ok or not r.text:
         return None
     text = "\n".join(r.text.strip().splitlines()[:5])[:1800]
