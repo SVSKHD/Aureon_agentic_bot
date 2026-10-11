@@ -16,8 +16,9 @@ dist_to_sl · secured_level.
 == MODE ema2050 (fast = EMA 20, slow = EMA 50) ==
 - A cross counts only when CONFIRMED: the order held 3 bars AND |gap| >= 1.5 pts, within 18 bars (confirm_state says it).
   A flip before that is a multi cross — never a trade.
-- Entry = the pullback: price back at EMA 20 (within 1.5 pts). Never chase: |dist_to_fast_ema_pts| > 5 is NO.
-- No entries 21:00–23:59 server, outside 05:30–23:00 IST, or inside the news block (60 min before / 30 after).
+- Entry = the pullback: price back at EMA 20 (within 1.5 pts) on a bar after the cross. Without a touch in 12 bars after the confirm,
+  a fallback entry only if |dist_to_fast_ema_pts| <= 5 (the 5-point cap is the fallback's only).
+- No entries 21:00–23:59 server or inside the news block (60 min before / 30 after). There is no IST window.
 - Guardian: stop −12 · +3 seen → SL +1 · +10 → SL +10 · ride +5 steps · close on an EMA 20 turn once secured ·
   exit on the next confirmed opposite cross. No EMA 50 follow-stop (tested: wicked on normal bounces).
 - Good ENTER: confirm_state confirmed, |dist_to_fast_ema_pts| <= 1.5, gap growing, crosses_today <= 4, trend_state not WEAKENING.

@@ -2,6 +2,23 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.3.1 — 2026-10-11  (PATCH: ema2050 port = research/ema2050_scan.py)
+- **Strategy rules changed: YES — ema2050 entry only** (the port deviated from the research; July 2026 replay 51 trades +113 vs research
+  63 trades +222.5). ema5080: UNTOUCHED. Guardian / exits: unchanged.
+  1. Pullback touch window starts the bar AFTER the cross: a touch on any bar in (cross, confirm] → enter at the confirm bar close
+     ("pullback"); else the first touch in (confirm, confirm+12]; else the fallback at confirm+12 only if |close − EMA20| ≤ 5 and the order holds.
+  2. No IST entry window (`entry_hours_ist=None`); the only time filter is server 21:00–23:59 (`no_entry_server_hours=(21, 24)`).
+     News block kept. Setting `entry_hours_ist` to a tuple still re-enables a window.
+  3. `max_chase=5` applies to the fallback entry only, never to a touch entry.
+- `common.source.fetch_csv` (the one CSV reader; the ema2050 copy delegates to it): MT5 exports with `tick_volume` + `real_volume` (+ `spread`)
+  → volume = tick_volume, real_volume / spread dropped (before: two `volume` columns). Text timestamps parsed resolution-independently
+  (pandas 3 gives datetime64[us]; the old `// 10**9` divided every bar time by 1000) and MT5 `2026.07.01 00:05` dates are accepted.
+- Live agent and run.py share `journeys.build` (no second implementation; a test checks `agent.py` holds none of the rule parameters).
+  `run.replay_range()` is the `--from/--to` loop, shared with the tests. Card texts no longer say "never more than 5" for touches.
+- `prompts/advisor_rules.md` ema2050 section updated to the same rules (its hash changes: shadow-replay caches re-ask once).
+- `tests/test_v231_parity.py`: 13 rule tests; replay-vs-research entry-time parity and the July acceptance (63 trades, +222.5, 8 stops)
+  run once `research/ema2050_scan.py` and `tests/fixtures/xauusd_m5_jul2026.csv` are committed (skipped until then).
+
 ## v2.3.0 — 2026-10-11  (MINOR: Codex parity with Claude)
 - `codex_advisor.CodexAdvisor` subclasses `ClaudeAdvisor` (now parameterised by SOURCE / ATTR / budget / ledger / CLI call), so triggers,
   `build_snapshot` (no account data), validation, fail-closed, STALE and fast-exit are the same code. Own worker thread, own budget

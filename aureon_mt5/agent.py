@@ -738,7 +738,7 @@ class SymbolAgent(threading.Thread):
                 self.journal.log("cross_confirmed", symbol=self.symbol, mode=self.S.name, side=side, price=close, bar=bar_t,
                                  cross_bar=info.get("cross_time"), shoot=info.get("shoot"))
                 self.notify.send(self.key(f"CROSS_CONFIRMED_{side}", bk), ctitle(self.symbol, "CROSS CONFIRMED", side),
-                                 [ev.reason, f"waiting for the pullback to EMA {self.S.fast} (±1.5) — up to 12 bars, never more than 5 from it"],
+                                 [ev.reason, f"waiting for the pullback to EMA {self.S.fast} (±1.5) — up to 12 bars, then a fallback only within 5 of it"],
                                  fields=info_fields(info) + [field("Price", f"**{close:.2f}**")], color=EVENT_COLOURS["cross"],
                                  footer=cfooter(self.S.display_name, f"bar {ist(bar_t, off)}"))
             elif ev.label == "MULTI":
@@ -753,7 +753,7 @@ class SymbolAgent(threading.Thread):
             elif ev.label == "F":
                 self.journal.log("no_entry", symbol=self.symbol, mode=self.S.name, side=side, bar=bar_t, why=ev.reason)
                 self.notify.send(self.key(f"NO_ENTRY_{side}", bk), ctitle(self.symbol, f"NO ENTRY ({ev.reason.split(' (')[0]})", side),
-                                 [f"**{ev.reason}**", "still watching the pullback window" if "too far" in ev.reason or "position" in ev.reason else "this cross is skipped"],
+                                 [f"**{ev.reason}**", "still watching the pullback window" if "position" in ev.reason else "this cross is skipped"],
                                  fields=info_fields(info) + [field("Price", f"**{close:.2f}**")], color=EVENT_COLOURS["info"],
                                  footer=cfooter(self.S.display_name, "no entry"))
             elif ev.label in ("EB", "ES"):

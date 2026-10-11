@@ -110,11 +110,12 @@ def test_post_confirm_first_touch_enters():
     assert res["bar_states"][11]["verdict"] == "LONG"
 
 
-def test_chase_cap_rejects_far_close_then_takes_next_touch():
-    res = build(_bull(touch_at=(9, 12), close_at={9: 4006.0}))             # bar 9 touches but closes 6 above EMA20 -> too far
+def test_touch_entry_has_no_chase_cap():
+    # v2.3.1 (research parity): max_chase is the fallback's condition only — a touch that closes 6 above EMA20 still enters
+    res = build(_bull(touch_at=(9, 12), close_at={9: 4006.0}))
     x = res["cross_infos"][0]
-    assert 9 in x.fails and x.fails[9].startswith("too far from EMA20") and x.entry_index == 12
-    assert (9, "F") in labels(res) and res["bar_states"][9]["verdict"] == "NO TRADE"
+    assert x.entry_index == 9 and x.entry_kind == "pullback" and not x.fails
+    assert (9, "EB") in labels(res) and res["bar_states"][9]["verdict"] == "LONG"
 
 
 def test_fallback_at_confirm_plus_12_within_5_of_ema20():
@@ -136,12 +137,13 @@ def test_no_entry_hour_server_21_to_24():
     assert any(e.label == "F" and "no-entry hour" in e.reason for e in res["events"])
 
 
-def test_ist_window_is_the_stricter_one():
-    df = _bull(touch_at=(11,)); df["time"] = DAY0 + 1 * 3600 + np.arange(len(df)) * 300          # 01:55 server = 04:25 IST (< 05:30)
-    res = build(df)
+def test_no_ist_window_server_hours_only():
+    # v2.3.1 (research parity): the only time filter is server 21:00-23:59 — 01:55 server (04:25 IST) is allowed
+    assert RULES.entry_hours_ist is None and RULES.no_entry_server_hours == (21.0, 24.0)
+    df = _bull(touch_at=(11,)); df["time"] = DAY0 + 1 * 3600 + np.arange(len(df)) * 300
+    assert build(df)["cross_infos"][0].entry_index == 11
+    res = build(df, entry_hours_ist=(5.5, 23.0))                              # an explicit IST window still works when set
     assert res["cross_infos"][0].fails[11].startswith("no-entry hour (outside 5.5-23 IST)")
-    df2 = _bull(touch_at=(11,)); df2["time"] = DAY0 + 4 * 3600 + np.arange(len(df2)) * 300       # 04:55 server = 07:25 IST -> allowed
-    assert build(df2)["cross_infos"][0].entry_index == 11
 
 
 def test_news_block_60_30():
@@ -333,7 +335,7 @@ def test_detect_2050_cards(tmp_path):
     for key in ("Cross", "Confirm", "Pre-cross shoot", "Session", "EMA 20", "EMA 50", "Bars since cross"):
         assert key in body
     assert ag.latest_signal["kind"] == "pullback" and any(r["event"] == "signal" and r["signal_kind"] == "pullback" for r in ag.journal.read(0))
-    d = _bull(touch_at=(9,), close_at={9: 4006.0}).iloc[:10].reset_index(drop=True)
+    d = _bull(close_at={19: 4006.0}).iloc[:20].reset_index(drop=True)        # no touch; the fallback bar closes 6 away
     res = J.build(d, RULES, OFF); res["df"] = d
     ag._detect_2050(res, d, int(d["time"].iloc[-1]), 4006.0, 4000.0, 3998.0)
     assert any("NO ENTRY (TOO FAR FROM EMA20)" in t for t in n.titles)
