@@ -154,7 +154,7 @@ def agents_card(agents, cfg, started_at, monitor=None, claude=None, journal=None
             r = getattr(ag, "last_res", None) or {}
             bars = r.get("bar_states") or []
             confirm = bars[-1].get("confirm") if bars else None
-            phase = ("confirmed, waiting pullback" if getattr(ag, "last_confirmed_cross", None) or confirm == "confirmed" else
+            phase = ("confirmed, waiting pullback" if getattr(ag, "last_confirmed_cross", None) or str(confirm).startswith("confirmed") else
                      f"cross seen, confirming {confirm}" if confirm else "waiting cross")
         t = ag.last_bar
         off = float(getattr(ag, "off", cfg.server_utc_offset))
@@ -182,7 +182,8 @@ def agents_card(agents, cfg, started_at, monitor=None, claude=None, journal=None
                 pnl_by_ticket[str(rec.get("ticket"))] = float(rec["final_points"])
         pnl = sum(pnl_by_ticket.values())
         ai = claude.attachment(ag).get("state", "OFF") if claude else "OFF"
-        err = str(h.get("status", ""))
+        from .crashes import reason as last_crash_reason
+        err = last_crash_reason(sym) or str(h.get("status", ""))
         if "error" not in err.lower(): err = "—"
         lines = [
             f"Phase **{phase}**",
@@ -190,7 +191,7 @@ def agents_card(agents, cfg, started_at, monitor=None, claude=None, journal=None
             f"Bars today **{bars_today}** · crosses **{crosses_today}**",
             f"Trades **{len(trade_ids)}** · pnl pts **{pnl:+.1f}**",
             f"Guardian **{'ON' if ag.g else 'OFF'}** · Claude **{ai}**",
-            f"Thread **{'alive' if ag.is_alive() else 'DEAD'}** · uptime **{int((_time.time()-started_at)//60)}m**",
+            f"Thread **{'alive' if ag.is_alive() else 'DEAD'}** · uptime **{int((_time.time()-getattr(ag, "started_wall", started_at))//60)}m**",
             f"Last error {err[:150]}",
         ]
         fields.append(_field(f"{sym} · {ag.S.display_name}", "\n".join(lines)[:1024], False))
