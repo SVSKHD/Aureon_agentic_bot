@@ -27,7 +27,7 @@ def read_rules(default: str = "Reply with one JSON object only.") -> str:
 
 # ----------------------------------------------------------------------------- v2.3.2 ema2050 entry SKIP reasons (the rules file lists
 # exactly these strings; tests check the file and this list agree). Measurement / tests only — nothing in the live path calls this.
-SKIP_REASONS_2050 = ("|dist_to_fast_ema_pts| > 5", "swing_against_last6_pts >= 8", "crosses_today >= 5 in Asia/London-early")
+SKIP_REASONS_2050 = ("|dist_to_fast_ema_pts| > 5", "swing_against_last6_pts >= 8", "crosses_today >= 5 before 11:00 server")
 
 
 def ema2050_skip_reasons(snap: dict) -> list[str]:
@@ -40,8 +40,7 @@ def ema2050_skip_reasons(snap: dict) -> list[str]:
     if isinstance(swing, (int, float)) and swing >= 8:
         out.append(SKIP_REASONS_2050[1])
     hhmm = str(snap.get("bar_time_server") or "")
-    early_london = snap.get("session") == "london" and hhmm[:2].isdigit() and int(hhmm[:2]) < 11
-    if (snap.get("crosses_today") or 0) >= 5 and (snap.get("session") == "asia" or early_london):
+    if (snap.get("crosses_today") or 0) >= 5 and hhmm[:2].isdigit() and int(hhmm[:2]) < 11:
         out.append(SKIP_REASONS_2050[2])
     return out
 

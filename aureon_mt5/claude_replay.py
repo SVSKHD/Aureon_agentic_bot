@@ -22,7 +22,17 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 
 from .common import claude_cli
-from .compare import Metrics, Row, metrics as compare_metrics, rules_hash
+from .compare import Metrics, Row, metrics as _scorecard_metrics, rules_hash
+
+
+def compare_metrics(rows: list[Row]) -> Metrics:
+    """v2.3.3: the shadow report's metrics — a winner is a trade with result > 0 (the scorecard's WIN10/WIN20 grades count
+    only +10 and better, which made the replay win% far too low)."""
+    m = _scorecard_metrics(rows)
+    g = [r for r in rows if r.status == "GRADED" and r.points is not None]
+    m.wins = sum(1 for r in g if r.points > 0)
+    m.win_rate = (m.wins / len(g)) if g else None
+    return m
 from .strategies.ema5080.trend import state_of
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -109,6 +119,16 @@ def load_cache(path: str) -> dict:
     return out
 
 
+def stale_bars(cache: dict, rules_h: str, model: str) -> int:
+    """v2.3.3: bars (bar_t, event) cached for this model under another rules hash and not yet under the current one —
+    they will be re-asked on this run."""
+    current = {(int(r.get("bar_t", 0)), r.get("event")) for r in cache.values()
+               if r.get("rules_hash") == rules_h and r.get("model") == model}
+    old = {(int(r.get("bar_t", 0)), r.get("event")) for r in cache.values()
+           if r.get("rules_hash") != rules_h and r.get("model") == model}
+    return len(old - current)
+
+
 def append_cache(path: str, row: dict):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
@@ -173,6 +193,7 @@ class ShadowReplay:
             pass
         self.path = cache_path(out_dir, S.name, symbol, advisor)
         self.cache = load_cache(self.path)
+        self.stale_bars = stale_bars(self.cache, self.rules_h, self.model)
         self.res = ShadowResult(model=self.model, rules_hash=self.rules_h, variant=variant)
 
     # ------------------------------------------------------------------ one call (cache first)
@@ -290,6 +311,7 @@ class ShadowReplay:
         skips = [r for r in det if r["claude"] == "SKIP"]
         skip_precision = (sum(1 for r in skips if r["points"] < 0) / len(skips)) if skips else None
         calib = calibration(det)
+        no_pwin = sum(1 for r in det if r["claude"] in ("TAKE", "SKIP") and r.get("p_win") is None)
         conf_calib = confidence_calibration(det)
         dis = [{"date": r["ist"], "side": r["side"], "points": r["points"], "claude": r["claude"], "p_win": r["p_win"], "reason": r["reason"],
                 "evidence": r["evidence"]} for r in det if r["claude"] == "SKIP" or (r["claude"] == "TAKE" and r["points"] < 0)]
@@ -301,6 +323,7 @@ class ShadowReplay:
                 mo["filt_n"] += 1; mo["filt_pts"] += r["points"] if r.get("filtered_points") is None else r["filtered_points"]
         self.res.months = months
         return {"metrics": m, "skip_precision": skip_precision, "skips": len(skips), "calibration": calib, "confidence_calibration": conf_calib,
+                "no_p_win": no_pwin,
                 "disagreements": dis, "months": months,
                 "no_verdict": sum(1 for r in det if r["claude"] is None), "unscored": self.res.unscored, "calls": self.res.calls,
                 "cache_hits": self.res.cache_hits, "errors": self.res.errors, "pullbacks": self.res.pullbacks}
@@ -339,7 +362,8 @@ def report_text(sr: ShadowReplay, sc: dict, title: str) -> str:
     rows = [("Detector · all", m["detector"]), (f"{lb} TAKE", m["claude_take"]), (f"{lb} SKIP", m["claude_skip"]),
             (f"Detector-filtered-by-{lb}", m["filtered"])]
     head = f"{'group':<30}{'n':>5}{'win%':>7}{'exp':>8}{'total':>9}{'stops':>7}{'streak':>8}{'maxDD':>8}"
-    L = [f"# {lb.upper()} SHADOW REPLAY · {title}",
+    L = ([f"rules hash changed -> {sr.stale_bars} bars will be re-asked"] if getattr(sr, "stale_bars", 0) else []) + [
+         f"# {lb.upper()} SHADOW REPLAY · {title}",
          f"model `{sr.model or 'CLI default'}` · rules `{sr.rules_h}` · variant {sr.variant} · calls this run {sc['calls']} · cache hits {sc['cache_hits']} · "
          f"errors {sc['errors']} · no verdict {sc['no_verdict']} · **unscored ENTER bars {sc['unscored']}** (next run continues from the cache)",
          "", "```", head, "-" * len(head)]
@@ -348,13 +372,11 @@ def report_text(sr: ShadowReplay, sc: dict, title: str) -> str:
     L.append("```")
     sp = sc["skip_precision"]
     L.append(f"SKIP precision (share of {lb} SKIPs that lost): {_f(sp, '{:.0%}')} over {sc['skips']} SKIPs")
-    L += ["", "## Calibration — p_win bucket vs actual win%", "```", f"{'p_win':<10}{'n':>5}{'actual win%':>13}{'mean p_win':>12}", "-" * 40]
+    L += ["", "## Calibration — p_win bucket vs actual win% (win = result > 0)"
+          + (f" · {sc['no_p_win']} verdicts without p_win (not calibrated)" if sc.get("no_p_win") else ""), "```", f"{'p_win':<10}{'n':>5}{'actual win%':>13}{'mean p_win':>12}", "-" * 40]
     for c in sc["calibration"]:
         L.append(f"{c['bucket']:<10}{c['n']:>5}{_f(c['win_rate'], '{:.0%}'):>13}{_f(c['mean_p'], '{:.2f}'):>12}")
     L.append("```")
-    cc = sc.get("confidence_calibration") or {}
-    if cc:
-        L.append("by confidence (TAKE won / SKIP lost): " + " · ".join(f"{k} {v['correct']}/{v['n']}" for k, v in sorted(cc.items())))
     L += ["", f"## Per month — Detector vs {lb}-filtered", "```", f"{'month':<10}{'det n':>7}{'det pts':>9}{'filt n':>8}{'filt pts':>10}{'diff':>8}", "-" * 52]
     for mo, v in sc["months"].items():
         L.append(f"{mo:<10}{v['det_n']:>7}{v['det_pts']:>+9.1f}{v['filt_n']:>8}{v['filt_pts']:>+10.1f}{v['filt_pts'] - v['det_pts']:>+8.1f}")
@@ -423,8 +445,7 @@ def combined_text(c: dict, title: str) -> str:
     L.append("```")
     for src, lb in (("claude", "Claude"), ("codex", "Codex")):
         L.append(f"SKIP precision {lb}: {_f(c['skip_precision'][src], '{:.0%}')} over {c['skips'][src]} SKIPs · calibration "
-                 + (" · ".join(f"p {b['bucket']} n{b['n']} win {_f(b['win_rate'], '{:.0%}')}" for b in c["calibration"][src] if b["n"]) or "no p_win")
-                 + " · by confidence " + (" · ".join(f"{k} {v['correct']}/{v['n']}" for k, v in sorted(c["confidence_calibration"][src].items())) or "—"))
+                 + (" · ".join(f"p {b['bucket']} n{b['n']} win {_f(b['win_rate'], '{:.0%}')}" for b in c["calibration"][src] if b["n"]) or "no p_win"))
     sp = c["splits"]
     L += ["", f"## SPLIT ({len(sp)} of {c['both_judged']} bars both judged) — bar · side · detector pts · Claude · Codex"]
     for d in sp[:80]:

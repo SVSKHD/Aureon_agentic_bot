@@ -78,7 +78,9 @@ def build_snapshot(agent, event: str, side: str, bar_t: int, df, *, position: di
     confirm_state = None
     res = getattr(agent, "last_res", None)
     if agent.S.name == "ema2050" and res is not None and res.get("bar_states") and len(res["bar_states"]) == len(df):
-        confirm_state = res["bar_states"][-1]["confirm"]
+        raw = str(res["bar_states"][-1]["confirm"])
+        # v2.3.3: words only — the detector's own strings carry its thresholds ("bar 2 of 3 · gap 1.20 < 1.5")
+        confirm_state = raw if raw.startswith("confirmed") else ("no cross" if raw == "no cross" else "not confirmed")
     s_dir = 1 if _side_word(side) == "BUY" else -1 if _side_word(side) == "SELL" else 0
     h6 = float(df["high"].iloc[-6:].max()); l6 = float(df["low"].iloc[-6:].min())
     swing_against = round((h6 - close) if s_dir > 0 else (close - l6) if s_dir < 0 else max(h6 - close, close - l6), 2)

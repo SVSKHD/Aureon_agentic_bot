@@ -1,5 +1,5 @@
 """v2.3.2 — ema2050 advisor rules: the detector already validated confirmation / touch / hour / news; default TAKE; SKIP only for a
-listed reason cited verbatim (|dist| > 5 · swing >= 8 · crosses_today >= 5 in Asia / London before 11:00 server); no ATR rule.
+listed reason cited verbatim (|dist| > 5 · swing >= 8 · crosses_today >= 5 before 11:00 server); no ATR rule.
 
 Fixture: tests/fixtures/ema2050_jul2026_snapshots.jsonl — the July 2026 ENTER snapshots, made from a shadow-replay cache with
   python run.py --mode ema2050 --source csv --csv xauusd_m5.csv --no-nfp --from 2026-07-01 --to 2026-07-31 --claude entry
@@ -31,9 +31,14 @@ def test_rules_file_ema2050_section():
     s = section_2050()
     for reason in SKIP_REASONS_2050:
         assert f'"{reason}"' in s, reason
-    assert "default is TAKE" in s and "VERBATIM" in s and "80%" in s and "30%" in s
-    assert "Do NOT re-test" in s and "not yours" in s
-    assert "atr20" in s and "never compare it to atr20" in s                    # mentioned only to forbid it
+    assert "Default TAKE. A SKIP must cite one listed reason. Produce p_win (0-1) on every verdict." in s
+    assert "Never re-test the pullback; the 1.5-pt\ntouch tolerance is the detector's." in s
+    assert "There is no ATR rule. Never compare swing_against_last6_pts to atr20; it matters only if >= 8." in s
+    assert "crosses_today >= 5 is a SKIP reason only when bar_time is before 11:00 server." in s
+    assert "80%" in s and "30%" in s and '"p_win": 0-1' in rules.read_rules()
+    assert s.count("1.5") == 1                                                    # only in the detector sentence
+    for gone in ("good-entry limit", "Good ENTER", "gap growth", "gap growing", "2 × atr20", "2x ATR", "Be sceptical"):
+        assert gone.lower() not in s.lower(), gone
     assert not re.search(r"atr20\s*[<>]|2\s*×\s*atr20", s)                        # no ATR threshold left
     assert "Good ENTER" not in s and "Be sceptical" not in s                      # the old extra criteria are gone
     assert "When unsure: ema2050 entries → TAKE" in rules.read_rules()
@@ -54,6 +59,7 @@ BASE = {"dist_to_fast_ema_pts": 1.0, "swing_against_last6_pts": 2.0, "crosses_to
     ({"crosses_today": 5, "session": "asia", "bar_time_server": "03:00"}, [SKIP_REASONS_2050[2]]),
     ({"crosses_today": 5, "session": "london", "bar_time_server": "10:55"}, [SKIP_REASONS_2050[2]]),
     ({"crosses_today": 5, "session": "london", "bar_time_server": "11:00"}, []),
+    ({"crosses_today": 6, "session": "ny", "bar_time_server": "09:30"}, [SKIP_REASONS_2050[2]]),   # v2.3.3: the hour decides, not the session
     ({"crosses_today": 4, "session": "asia"}, []),
 ])
 def test_listed_reasons(over, reasons):
@@ -101,20 +107,4 @@ def test_july_snapshots_listed_reasons_skip_rate():
     assert snaps and len(skips) / len(snaps) <= MAX_SKIP_RATE, f"{len(skips)}/{len(snaps)} SKIP by the listed reasons"
 
 
-@needs_fixture
-@pytest.mark.skipif(os.environ.get("AUREON_PROMPT_TEST") != "1", reason="live prompt test: set AUREON_PROMPT_TEST=1 (calls `claude -p`)")
-def test_july_snapshots_through_the_live_prompt():
-    from aureon_mt5.claude_advisor import ClaudeAdvisor
-    from aureon_mt5.claude_replay import _NoJournal, _Quiet
-    from aureon_mt5.config import Config
-    cfg = Config()
-    adv = ClaudeAdvisor(cfg, _Quiet(), _NoJournal(), start=False)
-    verdicts = []
-    for snap in load_fixture():
-        r = adv._invoke(adv.prompt_for(snap), cfg.claude_entry_model, "ENTER")
-        assert r.ok, r.error
-        verdicts.append(r.verdict)
-    skips = [v for v in verdicts if v["decision"] == "SKIP"]
-    uncited = [v["reason"] for v in skips if not cites_listed_reason(v["reason"])]
-    assert len(skips) / len(verdicts) <= MAX_SKIP_RATE, f"{len(skips)}/{len(verdicts)} SKIP"
-    assert not uncited, f"SKIPs without a listed reason: {uncited}"
+# The live prompt check lives in tests/test_claude_rules_replay.py (live once, cached per rules hash).
