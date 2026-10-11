@@ -135,6 +135,27 @@ def parallel_card(agents, cfg, journal=None) -> dict:
     return _embed("AUREON · MT5 · PARALLEL STATUS", f"v{VERSION} · {len(agents)} symbol(s)", color=GREEN if all_ok else YELLOW, fields=fields)
 
 
+def command_directory(tree, descriptions):
+    """Return grouped, rendered entries for *every* registered root command."""
+    actual = {c.name: c for c in tree.get_commands()}
+    seen = set()
+    result = {}
+    for group, entries in descriptions.items():
+        lines = []
+        for name, explanation in entries.items():
+            if name in actual:
+                lines.append(f"/{name} — {explanation}")
+                seen.add(name)
+        if lines: result[group] = lines
+    leftovers = sorted(set(actual) - seen)
+    if leftovers:
+        result["Other installed"] = [
+            f"/{name} — {getattr(actual[name], 'description', 'Registered command')}"
+            for name in leftovers
+        ]
+    return result
+
+
 def agents_card(agents, cfg, started_at, monitor=None, claude=None, journal=None) -> dict:
     """One operational block per running agent, using cached data only."""
     from .common.timeutil import ist_str, server_str
@@ -1095,13 +1116,9 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
     @tree.command(name="commands", description="Grouped Aureon command directory: automatic versus user actions")
     async def commands_cmd(inter: discord.Interaction):
         def work():
-            actual = {c.name for c in tree.get_commands()}
-            fields = []
-            for group, entries in _help.items():
-                lines = [f"`/{name}` — {description}" for name, description in entries.items() if name in actual]
-                if lines: fields.append(_field(group, "\n".join(lines)[:1024], False))
-            others = sorted(actual - {"commands"} - set().union(*(set(x) for x in _help.values())))
-            if others: fields.append(_field("Other installed", ", ".join("/" + x for x in others)[:1024], False))
+            groups = command_directory(tree, _help)
+            fields = [_field(group, "\n".join(lines)[:1024], False)
+                      for group, lines in groups.items()]
             return Reply(card=_embed("AUREON · COMMANDS", "Only registered commands appear.", fields=fields))
         await run(inter, "commands", work)
 
