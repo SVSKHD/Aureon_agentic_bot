@@ -212,7 +212,7 @@ def agents_card(agents, cfg, started_at, monitor=None, claude=None, journal=None
             f"Bars today **{bars_today}** · crosses **{crosses_today}**",
             f"Trades **{len(trade_ids)}** · pnl pts **{pnl:+.1f}**",
             f"Guardian **{'ON' if ag.g else 'OFF'}** · Claude **{ai}**",
-            f"Thread **{'alive' if ag.is_alive() else 'DEAD'}** · uptime **{int((_time.time()-getattr(ag, "started_wall", started_at))//60)}m**",
+            f"Thread **{'alive' if ag.is_alive() else 'DEAD'}** · uptime **{int((_time.time()-getattr(ag, 'started_wall', started_at))//60)}m**",
             f"Last error {err[:150]}",
         ]
         fields.append(_field(f"{sym} · {ag.S.display_name}", "\n".join(lines)[:1024], False))
