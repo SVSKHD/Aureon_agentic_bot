@@ -6,7 +6,8 @@ controls guardian execution.
 """
 from __future__ import annotations
 
-import asyncio
+import asy
+import jsonncio
 import os
 import threading
 import time as _time
@@ -891,6 +892,109 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             journal.log("alert_cleared", symbol=sym, count=n, by=str(user))
             return Reply(content=f"cleared {n} alert(s) for {sym}")
         await run(inter, "alert-clear", work)
+
+    # ------------------------------------------------------------------ Read-only Codex commands (off Discord event loop)
+    # Codex never blocks the market poll, changes a position or gates immediate alerts.
+    from .common import codex_cli
+    from .common.claude_cli import Budget
+    from .claude_advisor import build_snapshot, RULES_PATH
+    codex_budget = Budget(os.path.join(cfg.log_dir, "codex_budget.json"), cfg.codex_max_calls)
+    codex_lock = threading.Lock()   # one child process at a time, no queue of stale alerts
+
+    @tree.command(name="codex", description="Codex CLI status and read-only advisory configuration")
+    async def codex_cmd(inter: discord.Interaction):
+        def work():
+            mode = cfg.codex_mode
+            if mode == "off":
+                return Reply(content="CODEX · OFF · set AUREON_CODEX=advisory and restart. Signals and guardian unaffected.")
+            status = codex_cli.version(cfg.codex_bin)
+            auth = codex_cli.login_status(cfg.codex_bin)
+            return Reply(content=(f"CODEX · {mode.upper()} · {status} · {auth}\n"
+                                  f"Local calls today: {codex_budget.used()}/{cfg.codex_max_calls} "
+                                  f"(not your ChatGPT plan quota)\n"
+                                  "Read-only commands: /codex-test and /codex-alert. "
+                                  "Claude and MT5 guardian remain independent."))
+        await run(inter, "codex", work, timeout=30)
+
+    @tree.command(name="codex-status", description="Codex CLI login, version and local daily call count")
+    async def codex_status_cmd(inter: discord.Interaction):
+        await codex_cmd(inter)
+
+    @tree.command(name="codex-test", description="Test Codex CLI using a read-only schema-constrained verdict")
+    async def codex_test_cmd(inter: discord.Interaction):
+        def work():
+            if cfg.codex_mode != "advisory":
+                return Reply(content="Codex disabled: set AUREON_CODEX=advisory and restart")
+            if not codex_lock.acquire(blocking=False):
+                return Reply(content="Codex already busy. No additional job queued.")
+            try:
+                if not codex_budget.take():
+                    return Reply(content="Codex daily local call limit reached.")
+                prompt = ('Return a JSON verdict for event ALERT. No market data is provided, '
+                          'so decision must be SKIP, side null, confidence low, tighten_to null, '
+                          'reason "No market data", evidence empty. JSON only.')
+                r = codex_cli.call(prompt, event="ALERT", binary=cfg.codex_bin,
+                                   model=cfg.codex_model or None, workdir=cfg.codex_workdir,
+                                   timeout=cfg.codex_timeout)
+                journal.log("codex_test", ok=r.ok, latency_s=round(r.latency_s, 2), error=r.error[:120])
+                return Reply(content=(f"Codex test OK · {r.latency_s:.1f}s · {r.verdict['decision']}"
+                                     if r.ok else f"Codex test failed · {r.error}"))
+            finally:
+                codex_lock.release()
+        await run(inter, "codex-test", work, timeout=cfg.codex_timeout + 15)
+
+    @tree.command(name="codex-alert", description="Read-only Codex evaluation of a frozen closed-bar snapshot")
+    @app_commands.describe(symbol="XAUUSD or XAGUSD (default: primary)", side="BUY or SELL")
+    async def codex_alert_cmd(inter: discord.Interaction, symbol: str = "", side: str = "BUY"):
+        def work():
+            if cfg.codex_mode != "advisory":
+                return Reply(content="Codex disabled: set AUREON_CODEX=advisory and restart")
+            sym = (symbol or cfg.symbols[0]).upper()
+            direction = side.upper()
+            if direction not in ("BUY", "SELL"):
+                return Reply(content="Side must be BUY or SELL")
+            ag = agents.get(sym)
+            if ag is None or getattr(ag, "last_df", None) is None:
+                return Reply(content=f"{sym}: no cached closed-bar snapshot available")
+            # Snapshot and bar timestamp are frozen BEFORE the blocking subprocess.
+            frame = ag.last_df.copy(deep=True)
+            if frame.empty:
+                return Reply(content=f"{sym}: empty cached frame")
+            bar_t = int(frame["time"].iloc[-1])
+            # MT5 bar timestamps are server-local shifted by ag.off hours.
+            age = _time.time() - (bar_t - float(ag.off) * 3600)
+            if age < -60 or age > 600:
+                return Reply(content=f"{sym}: cached bar stale or clock offset invalid; no Codex call")
+            if not codex_lock.acquire(blocking=False):
+                return Reply(content="Codex busy; no new snapshot queued. Aureon alerts unaffected.")
+            try:
+                if not codex_budget.take():
+                    return Reply(content="Codex local daily call limit reached.")
+                snap = build_snapshot(ag, "ALERT", direction, bar_t, frame)
+                with open(RULES_PATH, encoding="utf-8") as source:
+                    rules = source.read()
+                prompt = (rules + "\n\nRead-only second opinion. Never propose executing orders. "
+                          "Event ALERT. Return exactly one JSON object following the decision contract.\n"
+                          + json.dumps(snap, default=str))
+                r = codex_cli.call(prompt, event="ALERT", binary=cfg.codex_bin,
+                                   model=cfg.codex_model or None, workdir=cfg.codex_workdir,
+                                   timeout=cfg.codex_timeout)
+                elapsed = _time.time() - (bar_t - float(ag.off) * 3600)
+                # Research verdict only. Never attach it to a live trade or alert's action buttons.
+                v = r.verdict or {}
+                journal.log("codex_alert", symbol=sym, side=direction, bar_t=bar_t,
+                            verdict=v if r.ok else None, error=r.error[:120],
+                            latency_s=round(r.latency_s, 2), stale=elapsed > 300)
+                if not r.ok:
+                    return Reply(content=f"Codex unavailable · {r.error} · original Aureon signals unaffected")
+                stale = " · STALE (journal only)" if elapsed > 300 else " · ADVISORY ONLY"
+                return Reply(content=(f"CODEX · {sym} · {direction} · {v['decision']} "
+                                      f"({v['confidence']}){stale}\n"
+                                      f"{v['reason']}\nbar timestamp: {snap.get('bar_time_ist')} IST · "
+                                      f"CLI {r.latency_s:.1f}s · no orders or SL changes"))
+            finally:
+                codex_lock.release()
+        await run(inter, "codex-alert", work, timeout=cfg.codex_timeout + 15)
 
     # ------------------------------------------------------------------ v1.10.0 Claude add-on (all off the loop via run())
     claude_wait = float(getattr(cfg, "claude_timeout", 90)) * 2 + 15      # a call may queue behind one in flight
