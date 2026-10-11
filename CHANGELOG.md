@@ -17,7 +17,7 @@ Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are a
 - Report `out/claude_replay_<mode>_<symbol>.md` + console: groups in the compare.card() shape (Detector · all | Claude TAKE | Claude SKIP |
   Detector-filtered-by-Claude: n, win %, expectancy, total, stops, worst streak, max DD), SKIP precision, p_win calibration table, per-month
   Detector vs Claude-filtered, disagreement list (date, side, detector pts, verdict, reason, evidence), pullback verdict counts.
-- `aureon_mt5/claude_replay.py` (ShadowAgent, cut_frame, snapshot_for_bar, ShadowReplay, calibration, report). 8 new tests (219).
+- `aureon_mt5/claude_replay.py` (ShadowAgent, cut_frame, snapshot_for_bar, ShadowReplay, calibration, report). 9 new tests (220 in this repository).
 - Strategy rules changed: NO.
 
 ## v2.0.2 — 2026-10-11  (/alert: two verdicts · placement feedback · /pull-history · /git-history · command sync)
