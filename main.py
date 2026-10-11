@@ -272,7 +272,10 @@ def main():
                                footer="Aureon MT5 · Claude")
 
     def start_agents():
+        from aureon_mt5.crashes import should_restart
         for s in cfg.symbols:
+            if not should_restart(s):
+                continue
             if s not in agents or not agents[s].is_alive():
                 agents[s] = SymbolAgent(s, cfg, S, notify, journal, news, claude=claude, alerts=alerts); agents[s].start()
 
