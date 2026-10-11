@@ -2,6 +2,34 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.3.0 — 2026-10-11  (MINOR: Codex parity with Claude)
+- `codex_advisor.CodexAdvisor` subclasses `ClaudeAdvisor` (now parameterised by SOURCE / ATTR / budget / ledger / CLI call), so triggers,
+  `build_snapshot` (no account data), validation, fail-closed, STALE and fast-exit are the same code. Own worker thread, own budget
+  (`AUREON_CODEX_MAX_CALLS`, `logs/codex_budget.json`), own ledger `logs/codex_usage.jsonl`, journal `codex_verdict` / `codex_event`.
+  `AUREON_CODEX`: off · review · advisory (anything else → off). In review and advisory a Codex verdict is **journaled and shown only** —
+  `CodexAdvisor.apply_pullback` has no path to `_move_sl` / `_close` (property test over every verdict kind, price, staleness, closed trade;
+  AST test on the module).
+- `common/codex_cli.call`: per-event schema (pullback → HOLD / TIGHTEN / CLOSE with numeric `tighten_to`; entries / ALERT → TAKE / SKIP),
+  nullable `p_win`, validated by `claude_cli.validate` (invalid → fail closed), free-text mode for reviews, `--json` token usage parsed
+  (`parse_usage`; null when absent), fallback without `--json` for older CLIs. CLI login only: `OPENAI_API_KEY` / `CODEX_API_KEY` stripped.
+- Shared rules prompt `prompts/advisor_rules.md` (`prompts/claude_rules.md` kept as a symlink alias; `common/rules.py`).
+- Agents: `codex=` hook beside `claude=` at every call site (`SymbolAgent.advisors()`), drained after the guardian, Claude first.
+  23:00 IST CODEX REVIEW (CLI default model); Saturday CODEX REVIEW (self-review of its wrong calls) after COMPARE.
+- Cards: ENTER / pullback / ALERT REACHED carry `CLAUDE:` and `CODEX :` lines and an AGREE / SPLIT tag (`advisor_board.py`); ALERT card has
+  a CODEX VERDICT block when Codex is on. `/claude` and `/codex` share `advisor_card` (per-agent ATTACHED / REVIEW / OFF); `/status` adds a
+  Codex line; `/codex-status` has the same today / week / month usage block as `/claude-status`. New: `/codex-attach`, `/codex-detach`,
+  `/codex-review`, `/codex-rules`, `/codex-rules-approve`. `/codex-test` and `/codex-alert` now go through the advisor (one budget, one lock).
+- `compare.py`: Codex column (`Row.codex`, `codex_take` / `codex_skip`), Codex verdict line, `head_to_head()` (agreement %, SPLIT winner
+  count and points), Codex pullback score, breakdown `Cx` column, chart series, batch summary; CODEX RULE PROPOSALS card; approvals append
+  `- [claude|codex] [approved date · week] …` to the shared file.
+- `/advisor-report [week|month]` (alias `/claude-report`): a section per advisor + head-to-head; scheduled Saturday after COMPARE and on the 1st.
+- `run.py --codex entry|entry+pullback`, `--codex-max`, `--codex-sleep`, `--codex-model`, `--codex-refresh`; own cache
+  `out/codex_replay_<mode>_<symbol>.jsonl`; with `--claude` too: Detector-all · filtered-by-Claude · filtered-by-Codex ·
+  filtered-by-BOTH-agree, SKIP precision / calibration each (p_win buckets and by confidence), SPLIT list (`out/advisors_replay_*.md`).
+- Usage ledger rows: token fields are null when the CLI reports none (was 0).
+- 80 new tests (325 in this repository).
+- Strategy rules changed: **NO**. ema5080 strategy files: **UNTOUCHED**.
+
 ## v2.2.2 — 2026-10-11  (PATCH: server-authoritative auto-update)
 - `common/updater.update_to_origin`: when origin/master moved, the checkout ends exactly at origin/master or is left untouched.
   Modified tracked files → `git diff HEAD` saved to `logs/local_changes_<hash>_<ts>.patch` (no patch on disk → nothing discarded), then

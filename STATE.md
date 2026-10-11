@@ -7,6 +7,15 @@
 - Market polling and deterministic position guardian must not await AI or Discord commands.
 - Trading actions remain explicitly human driven unless AUREON_EXECUTION is enabled and validated.
 - Existing Claude advisor offers off/review/advisory/manage; Codex is an independent read-only optional advisor.
+
+## v2.3.0 advisors
+- Claude and Codex share one code path (`CodexAdvisor` subclasses `ClaudeAdvisor`), one rules prompt (`prompts/advisor_rules.md`,
+  alias `claude_rules.md`) and one reply contract. Both are CLI-login only; never add an API-key path.
+- Codex modes: off · review · advisory. Codex verdicts are journaled and shown only — never applied (keep `CodexAdvisor.apply_pullback`
+  free of `_move_sl` / `_close`; tests enforce it). Only Claude in `manage` may TIGHTEN / CLOSE-in-profit.
+- Each advisor: own worker, budget, usage ledger (`logs/<source>_usage.jsonl`), journal rows (`<source>_verdict`), rule proposals file.
+- Approved rule lines are appended to the tracked `prompts/advisor_rules.md`; with the v2.2.2 server-authoritative auto-update an
+  approval made on the server is saved to a patch and discarded at the next update — commit approved lines to master.
 - Operator functions require strict permission checks, position guards, and controlled process restart.
 - Voice commands remain NOT IMPLEMENTED; see docs/VOICE_SCOPE.md.
 

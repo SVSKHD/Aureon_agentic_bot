@@ -26,7 +26,7 @@ from datetime import datetime, timedelta
 
 import numpy as np
 
-from . import telemetry
+from . import advisor_board, telemetry
 from .common import claude_cli
 from .common.claude_cli import Budget, IST, ist_day
 from .common.news import session_of
@@ -40,7 +40,7 @@ STRATEGIES = ("ema5080", "ema2050")        # v2.0.0: the add-on advises both mod
 UNAVAILABLE_BACKOFF_S = 300
 BAR_S = 300
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RULES_PATH = os.path.join(ROOT, "prompts", "claude_rules.md")
+from .common.rules import RULES_PATH, read_rules   # v2.3.0: prompts/advisor_rules.md, shared with Codex
 KIND_TO_EVENT = {"P": "P", "cross": "CROSS", "reentry": "RE", "enter": "ENTER", "pullback": "ENTER", "no-pullback": "ENTER"}
 EMA_NAMES = {"ema5080": ("EMA 50", "EMA 80"), "ema2050": ("EMA 20", "EMA 50")}
 TREND_PULLBACK = ("PULLBACK", "WEAKENING", "CHALLENGED")
@@ -181,40 +181,83 @@ def _compact(snap: dict) -> dict:
 
 # ============================================================================= advisor
 class ClaudeAdvisor:
+    # v2.3.0: one class, two advisors. CodexAdvisor (codex_advisor.py) overrides these and the CLI call; everything else —
+    # triggers, snapshot, validation, fail-closed, STALE, fast-exit — is this code.
+    SOURCE = "claude"                     # journal source · usage ledger logs/<SOURCE>_usage.jsonl · budget logs/<SOURCE>_budget.json
+    LABEL = "Claude"
+    TAG = "CLAUDE"
+    ATTR = "claude"                       # agent.claude / agent.claude_any / agent.claude_inbox
+    MODES = MODES
+    ADVISE_MODES = ADVISE_MODES
+    ENV = "AUREON_CLAUDE"
+
     def __init__(self, cfg, notify, journal, *, health_notify=None, caller=claude_cli.call, start: bool = True):
         self.cfg, self.notify, self.journal = cfg, notify, journal
         self.health = health_notify or notify
-        self.mode = normalise_mode(getattr(cfg, "claude_mode", "off"))
+        self.mode = self.mode_of(cfg)
         self.caller = caller
         self.q: "queue.Queue[dict]" = queue.Queue(maxsize=20)
-        self.budget = Budget(os.path.join(cfg.log_dir, "claude_budget.json"), cfg.claude_max_calls)
-        self._call_lock = threading.Lock()                  # one `claude -p` at a time, worker and commands alike
+        self.budget = Budget(os.path.join(cfg.log_dir, f"{self.SOURCE}_budget.json"), self.max_calls)
+        self._call_lock = threading.Lock()                  # one CLI call at a time, worker and commands alike
         self.fired: dict[tuple, float] = {}                 # (symbol, ticket) -> peak when the pullback verdict was requested
         self._unavail_last: dict[str, float] = {}
         self._budget_day: str | None = None
         self.stats = {"login": None, "last_verdict": None, "last_error": "", "latencies": deque(maxlen=50), "dropped": 0,
                       # v2.0.1 /claude attachment card
-                      "version": None, "bin_path": claude_cli.resolve_bin(cfg.claude_bin), "version_error": "",
+                      "version": None, "bin_path": self._resolve_bin(), "version_error": "",
                       "calls_by_event": {"entry": 0, "pullback": 0, "alert": 0, "review": 0, "test": 0},
                       "fast_exit_cancels": 0, "detach_cancels": 0, "last_latency": None,
                       "reported_models": {}, "last_verdict_by_symbol": {}}
         self._worker: threading.Thread | None = None
-        try:
-            with open(RULES_PATH, encoding="utf-8") as f:
-                self.rules = f.read()
-        except Exception:
-            self.rules = "Reply with one JSON object only."
+        self.rules = read_rules()
         if start and self.mode != "off":
             self.start()
 
     @classmethod
+    def mode_of(cls, cfg) -> str:
+        return normalise_mode(getattr(cfg, "claude_mode", "off"))
+
+    @classmethod
     def create(cls, cfg, notify, journal, **kw):
-        """None when AUREON_CLAUDE=off → zero Claude calls, zero behaviour change."""
-        return None if normalise_mode(getattr(cfg, "claude_mode", "off")) == "off" else cls(cfg, notify, journal, **kw)
+        """None when the mode is off → zero calls, zero behaviour change."""
+        return None if cls.mode_of(cfg) == "off" else cls(cfg, notify, journal, **kw)
+
+    # ------------------------------------------------------------------ per-advisor settings (CodexAdvisor overrides)
+    @property
+    def max_calls(self) -> int:
+        return int(self.cfg.claude_max_calls)
+
+    @property
+    def entry_model(self) -> str:
+        return self.cfg.claude_entry_model
+
+    @property
+    def pullback_model(self) -> str:
+        return self.cfg.claude_pullback_model
+
+    @property
+    def review_model(self) -> str:
+        return self.cfg.claude_review_model
+
+    def _resolve_bin(self) -> str:
+        return claude_cli.resolve_bin(self.cfg.claude_bin)
+
+    def _version(self) -> dict:
+        return claude_cli.version(self.cfg.claude_bin)
+
+    def _invoke(self, prompt: str, model: str, event: str, *, free_text: bool = False):
+        return self.caller(prompt, model, event=event, bin=self.cfg.claude_bin, workdir=self.cfg.claude_workdir,
+                           timeout=self.cfg.claude_timeout)
+
+    def _inbox(self, agent):
+        return getattr(agent, f"{self.ATTR}_inbox", None)
+
+    def bound(self, agent) -> bool:
+        return getattr(agent, self.ATTR, None) is self
 
     # ------------------------------------------------------------------ who gets hooks
     def advises(self, strategy) -> bool:
-        return self.mode in ADVISE_MODES and getattr(strategy, "name", "") in STRATEGIES
+        return self.mode in self.ADVISE_MODES and getattr(strategy, "name", "") in STRATEGIES
 
     @property
     def manage(self) -> bool:
@@ -224,13 +267,13 @@ class ClaudeAdvisor:
     def start(self):
         if self._worker is None:
             self.refresh_version()
-            self._worker = threading.Thread(target=self._loop, daemon=True, name="claude-worker"); self._worker.start()
+            self._worker = threading.Thread(target=self._loop, daemon=True, name=f"{self.SOURCE}-worker"); self._worker.start()
 
     # ------------------------------------------------------------------ v2.0.1 attachment: version, attach / detach, cancel
     def refresh_version(self) -> dict:
-        """`claude --version` (cached; refreshed by /claude-test). Never raises."""
+        """`<cli> --version` (cached; refreshed by /claude-test, /codex-test). Never raises."""
         try:
-            v = claude_cli.version(self.cfg.claude_bin)
+            v = self._version()
         except Exception as e:
             v = {"ok": False, "version": "", "path": self.stats["bin_path"], "error": f"{e!r}"[:160]}
         self.stats["version"] = v["version"] if v["ok"] else None
@@ -243,7 +286,7 @@ class ClaudeAdvisor:
         """{state, label, triggers} for one agent. state: ATTACHED | REVIEW | NOT_ATTACHED | DETACHED."""
         S = agent.S
         triggers = "ENTER bar, pullback-in-trade" if getattr(S, "name", "") == "ema2050" else "P / CROSS / RE, pullback-in-trade"
-        if getattr(agent, "claude", None) is self and self.mode in ADVISE_MODES:
+        if self.bound(agent) and self.mode in self.ADVISE_MODES:
             return {"state": "ATTACHED", "label": f"ATTACHED ({self.mode})", "triggers": triggers}
         if self.mode == "review":
             return {"state": "REVIEW", "label": "REVIEW (cards only, nothing applied)", "triggers": "23:00 IST review, /alert add-on line"}
@@ -251,11 +294,11 @@ class ClaudeAdvisor:
             return {"state": "DETACHED", "label": "DETACHED (mode=off)", "triggers": "—"}
         if not self.advises(S):
             return {"state": "NOT_ATTACHED", "label": "NOT ATTACHED (advisor.advises()=False)", "triggers": "—"}
-        return {"state": "DETACHED", "label": "DETACHED (/claude-detach)", "triggers": "—"}
+        return {"state": "DETACHED", "label": f"DETACHED (/{self.SOURCE}-detach)", "triggers": "—"}
 
     def cancel_jobs(self, symbol: str, agent=None) -> int:
         """Drop queued jobs for `symbol` (and its inbox). Returns how many were cancelled. A call already in flight finishes;
-        its result finds agent.claude is None and is journaled only."""
+        its result finds agent.<advisor> is None and is journaled only."""
         kept = []; n = 0
         while True:
             try:
@@ -268,7 +311,7 @@ class ClaudeAdvisor:
                 kept.append(job)
         for job in kept:
             self.q.put_nowait(job)
-        inbox = getattr(agent, "claude_inbox", None)
+        inbox = self._inbox(agent)
         while inbox is not None:
             try:
                 inbox.get_nowait(); n += 1
@@ -279,18 +322,19 @@ class ClaudeAdvisor:
 
     def detach(self, agent, by: str = "") -> int:
         n = self.cancel_jobs(agent.symbol, agent)
-        agent.claude = None
-        self.journal.log("claude_detach", symbol=agent.symbol, mode=agent.S.name, cancelled=n, by=by)
+        setattr(agent, self.ATTR, None)
+        self.journal.log(f"{self.SOURCE}_detach", symbol=agent.symbol, mode=agent.S.name, cancelled=n, by=by)
         return n
 
     def attach(self, agent, by: str = "") -> tuple[bool, str]:
         """Re-bind at runtime. False with the reason when the mode or advises() does not allow it."""
-        if self.mode not in ADVISE_MODES:
-            return False, f"mode={self.mode} — {'review: cards only, nothing applied' if self.mode == 'review' else 'off'}; set AUREON_CLAUDE=advisory|manage and restart"
+        if self.mode not in self.ADVISE_MODES:
+            return False, (f"mode={self.mode} — {'review: cards only, nothing applied' if self.mode == 'review' else 'off'}; "
+                           f"set {self.ENV}={'|'.join(self.ADVISE_MODES)} and restart")
         if not self.advises(agent.S):
             return False, f"advisor.advises()=False for {agent.S.name}"
-        agent.claude = self
-        self.journal.log("claude_attach", symbol=agent.symbol, mode=agent.S.name, by=by)
+        setattr(agent, self.ATTR, self)
+        self.journal.log(f"{self.SOURCE}_attach", symbol=agent.symbol, mode=agent.S.name, by=by)
         return True, f"ATTACHED ({self.mode})"
 
     def _loop(self):
@@ -299,14 +343,14 @@ class ClaudeAdvisor:
             try:
                 self.process(job)
             except Exception as e:
-                telemetry.info(f"claude worker error: {e!r}")
+                telemetry.info(f"{self.SOURCE} worker error: {e!r}")
 
     def _enqueue(self, job: dict) -> bool:
         try:
             self.q.put_nowait(job); return True
         except queue.Full:
             self.stats["dropped"] += 1
-            telemetry.info(f"claude queue full — dropped {job.get('event')} {job.get('symbol')}")
+            telemetry.info(f"{self.SOURCE} queue full — dropped {job.get('event')} {job.get('symbol')}")
             return False
 
     # ------------------------------------------------------------------ triggers (agent thread; enqueue only)
@@ -317,7 +361,7 @@ class ClaudeAdvisor:
         snap = build_snapshot(agent, event, side, bar_t, df, kind=kind)
         return self._enqueue({"type": "entry", "event": event, "symbol": agent.symbol, "side": side, "bar_t": bar_t,
                               "off": agent.off, "snapshot": snap, "card_key": card_key, "agent": agent,
-                              "model": self.cfg.claude_entry_model, "mode_name": agent.S.name, "display": agent.S.display_name})
+                              "model": self.entry_model, "mode_name": agent.S.name, "display": agent.S.display_name})
 
     def pullback_reason(self, agent, p: dict, st: dict, advisor_codes) -> str | None:
         long = p["direction"] == "long"
@@ -346,7 +390,7 @@ class ClaudeAdvisor:
         snap["trigger"] = why
         return self._enqueue({"type": "pullback", "event": "pullback", "symbol": agent.symbol, "side": p["direction"].upper(),
                               "ticket": p["ticket"], "bar_t": bar_t, "off": agent.off, "snapshot": snap, "agent": agent,
-                              "open_profit": p["points"], "trigger": why, "model": self.cfg.claude_pullback_model,
+                              "open_profit": p["points"], "trigger": why, "model": self.pullback_model,
                               "mode_name": agent.S.name, "display": agent.S.display_name})
 
     def request_alert(self, agent, alert: dict, card: dict, df, bar_t: int) -> bool:
@@ -362,25 +406,26 @@ class ClaudeAdvisor:
         return self._enqueue({"type": "alert", "event": "ALERT", "symbol": agent.symbol, "side": sug, "bar_t": bar_t, "off": agent.off,
                               "snapshot": snap, "card_key": card.get("key"), "agent": agent, "alert_id": alert["id"],
                               "agent_block": meta.get("agent_block") or meta.get("agent_verdict") or "", "agent_side": sug,
-                              "title": card.get("title", ""), "model": self.cfg.claude_entry_model, "mode_name": agent.S.name,
+                              "title": card.get("title", ""), "model": self.entry_model, "mode_name": agent.S.name,
                               "display": agent.S.display_name})
 
     def forget(self, symbol: str, ticket):
         self.fired.pop((symbol, ticket), None)
 
     # ------------------------------------------------------------------ the call (worker / command threads)
-    def _call(self, prompt: str, model: str, event: str, *, kind_override: str | None = None) -> claude_cli.CliResult | None:
+    def _call(self, prompt: str, model: str, event: str, *, kind_override: str | None = None,
+              free_text: bool = False) -> claude_cli.CliResult | None:
         """None = budget used (no call made)."""
         if not self.budget.take():
             self._budget_card(); return None
         with self._call_lock:
-            res = self.caller(prompt, model, event=event, bin=self.cfg.claude_bin, workdir=self.cfg.claude_workdir,
-                              timeout=self.cfg.claude_timeout)
+            res = self._invoke(prompt, model, event, free_text=free_text)
         from .claude_usage import append as append_usage
         try:
-            append_usage(self.cfg.log_dir, kind_override or {"pullback": "pullback", "ALERT": "alert", "review": "review", "test": "test"}.get(event, "entry"), res)
+            append_usage(self.cfg.log_dir, kind_override or {"pullback": "pullback", "ALERT": "alert", "review": "review", "test": "test"}.get(event, "entry"),
+                         res, source=self.SOURCE)
         except OSError as exc:
-            telemetry.info(f"Claude usage ledger unavailable: {exc!r}")
+            telemetry.info(f"{self.LABEL} usage ledger unavailable: {exc!r}")
         self.stats["latencies"].append(res.latency_s); self.stats["last_latency"] = res.latency_s
         kind = {"pullback": "pullback", "ALERT": "alert", "review": "review", "test": "test"}.get(event, "entry")
         self.stats["calls_by_event"][kind] = self.stats["calls_by_event"].get(kind, 0) + 1
@@ -439,13 +484,13 @@ class ClaudeAdvisor:
         else:
             job["verdict"] = v
             agent = job["agent"]
-            inbox = getattr(agent, "claude_inbox", None)
+            inbox = self._inbox(agent)
             if inbox is not None:
                 inbox.put(job)                           # applied/shown on the agent thread, after the guardian
 
     # ------------------------------------------------------------------ verdict on a position (AGENT thread)
     def drain(self, agent, positions: list[dict]):
-        inbox = getattr(agent, "claude_inbox", None)
+        inbox = self._inbox(agent)
         while inbox is not None:
             try:
                 job = inbox.get_nowait()
@@ -457,8 +502,8 @@ class ClaudeAdvisor:
                     p = None                             # the guardian already closed it: hard exits win
                 self.apply_pullback(agent, job, p, agent.state.get(job["ticket"], {}) if p else {})
             except Exception as e:
-                telemetry.failure(self.health, self.journal, title="AUREON CLAUDE ERROR", key=f"{agent.S.name}:{agent.symbol}:CLAUDE_ERROR:apply",
-                                  mode=agent.S.name, symbol=agent.symbol, action="claude pullback verdict", exc=e)
+                telemetry.failure(self.health, self.journal, title=f"AUREON {self.TAG} ERROR", key=f"{agent.S.name}:{agent.symbol}:{self.TAG}_ERROR:apply",
+                                  mode=agent.S.name, symbol=agent.symbol, action=f"{self.SOURCE} pullback verdict", exc=e)
 
     def apply_pullback(self, agent, job: dict, p: dict | None, st: dict) -> bool:
         """Returns True when an action was applied in MT5. Order: MT5 → confirm → state → journal → Discord."""
@@ -468,7 +513,7 @@ class ClaudeAdvisor:
         if p is None:
             note = "position no longer open — nothing to do"
             self.stats["fast_exit_cancels"] += 1                 # v2.0.1: the trade closed before the verdict arrived
-            self.journal.log("claude_fast_exit_cancel", symbol=agent.symbol)
+            self.journal.log(f"{self.SOURCE}_fast_exit_cancel", symbol=agent.symbol)
         elif stale:
             note = "STALE — arrived after the next bar closed; not acted"
         elif dec == "HOLD":
@@ -506,7 +551,7 @@ class ClaudeAdvisor:
         start = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=IST)
         recs = self.journal.read(int(start.timestamp()), int((start + timedelta(days=1)).timestamp()))
         keep = ("t", "event", "symbol", "side", "signal_kind", "decision", "reason", "points", "price", "secured", "peak", "level",
-                "best", "against", "why", "claude_event", "confidence", "acted", "stale", "trigger")
+                "best", "against", "why", "claude_event", "codex_event", "source", "confidence", "acted", "stale", "trigger")
         out = []
         for r in recs:
             if r.get("event") in ("error",):
@@ -520,25 +565,25 @@ class ClaudeAdvisor:
         """Runs on the worker or a command thread (never the event loop / poll). Returns the text it posted.
         force=False (the 23:00 schedule): skipped when the journal already has that day's review (restart-safe)."""
         day = day or ist_day()
-        if not force and any(r.get("event") == "claude_review" and r.get("day") == day
+        if not force and any(r.get("event") == f"{self.SOURCE}_review" and r.get("day") == day
                              for r in self.journal.read(int(_time.time()) - 2 * 86400)):
             return f"already reviewed {day}"
         events = self.review_events(day)
         if not events:
             text = f"no journal events on {day}"
-            self.notify.card(f"AUREON · MT5 · CLAUDE REVIEW · {day}", text, color=EVENT_COLOURS["info"], footer="Aureon MT5 · Claude review")
+            self.notify.card(f"AUREON · MT5 · {self.TAG} REVIEW · {day}", text, color=EVENT_COLOURS["info"], footer=f"Aureon MT5 · {self.LABEL} review")
             return text
-        res = self._call(REVIEW_PROMPT + json.dumps(events, default=str), self.cfg.claude_review_model, "review")
+        res = self._call(REVIEW_PROMPT + json.dumps(events, default=str), self.review_model, "review", free_text=True)
         if res is None:
             return "budget used — no review today"
         if not res.ok or not res.text:
             return f"review unavailable: {res.error or 'empty reply'}"
         text = res.text[:3800]
-        self.journal.log("claude_review", source="claude", day=day, model=self.cfg.claude_review_model, latency_s=round(res.latency_s, 1),
-                         events=len(events))
-        self.notify.card(f"AUREON · MT5 · CLAUDE REVIEW · {day}", text, color=EVENT_COLOURS["info"],
-                         fields=[field("Events", len(events)), field("Model", self.cfg.claude_review_model), field("Latency", f"{res.latency_s:.0f} s")],
-                         footer="Aureon MT5 · Claude review · advisory only")
+        self.journal.log(f"{self.SOURCE}_review", source=self.SOURCE, day=day, model=self.review_model or "CLI default",
+                         latency_s=round(res.latency_s, 1), events=len(events))
+        self.notify.card(f"AUREON · MT5 · {self.TAG} REVIEW · {day}", text, color=EVENT_COLOURS["info"],
+                         fields=[field("Events", len(events)), field("Model", self.review_model or "CLI default"), field("Latency", f"{res.latency_s:.0f} s")],
+                         footer=f"Aureon MT5 · {self.LABEL} review · advisory only")
         return text
 
     def request_review(self, day: str | None = None, force: bool = False) -> bool:
@@ -546,27 +591,30 @@ class ClaudeAdvisor:
 
     def test_call(self) -> claude_cli.CliResult | None:
         self.refresh_version()
-        return self._call("Reply only: OK", self.cfg.claude_review_model, "test")
+        return self._call("Reply only: OK", self.review_model, "test", free_text=True)
 
     # ------------------------------------------------------------------ status for /claude
     def status(self) -> dict:
         lats = list(self.stats["latencies"])
         return {"mode": self.mode, "login": self.stats["login"] or "unknown — run /claude-test",
-                "calls": self.budget.used(), "limit": self.cfg.claude_max_calls, "last_verdict": self.stats["last_verdict"] or "—",
+                "calls": self.budget.used(), "limit": self.max_calls, "last_verdict": self.stats["last_verdict"] or "—",
                 "avg_latency": (sum(lats) / len(lats)) if lats else None, "queue": self.q.qsize(),
                 "last_error": self.stats["last_error"] or "—", "dropped": self.stats["dropped"],
-                "models": f"entry {self.cfg.claude_entry_model} · pullback {self.cfg.claude_pullback_model} · review {self.cfg.claude_review_model}",
+                "models": f"entry {self.entry_model or 'CLI default'} · pullback {self.pullback_model or 'CLI default'} · review {self.review_model or 'CLI default'}",
                 # v2.0.1
                 "version": self.stats["version"], "version_error": self.stats["version_error"], "bin_path": self.stats["bin_path"],
-                "bin": self.cfg.claude_bin, "calls_by_event": dict(self.stats["calls_by_event"]), "fast_exit_cancels": self.stats["fast_exit_cancels"],
+                "bin": self._bin_name(), "calls_by_event": dict(self.stats["calls_by_event"]), "fast_exit_cancels": self.stats["fast_exit_cancels"],
                 "detach_cancels": self.stats["detach_cancels"], "last_latency": self.stats["last_latency"],
                 "reported_models": dict(self.stats["reported_models"]), "last_verdict_by_symbol": dict(self.stats["last_verdict_by_symbol"]),
-                "model_ids": {"entry": self.cfg.claude_entry_model, "pullback": self.cfg.claude_pullback_model, "review": self.cfg.claude_review_model}}
+                "model_ids": {"entry": self.entry_model, "pullback": self.pullback_model, "review": self.review_model}}
+
+    def _bin_name(self) -> str:
+        return self.cfg.claude_bin
 
     # ------------------------------------------------------------------ journal + cards
     def _journal(self, job, v, *, latency, acted, stale, error="", note=""):
         try:
-            self.journal.log("claude_verdict", source="claude", claude_event=job["event"], symbol=job["symbol"], model=job.get("model"),
+            self.journal.log(f"{self.SOURCE}_verdict", source=self.SOURCE, **{f"{self.SOURCE}_event": job["event"]}, symbol=job["symbol"], model=job.get("model"),
                              latency_s=round(latency, 1), decision=(v or {}).get("decision"), side=(v or {}).get("side"),
                              confidence=(v or {}).get("confidence"), reason=(v or {}).get("reason"),
                              tighten_to=(v or {}).get("tighten_to"), my_action=None, acted=bool(acted), stale=bool(stale),
@@ -575,56 +623,77 @@ class ClaudeAdvisor:
                              evidence=(v or {}).get("evidence") or [], alert_id=job.get("alert_id"),
                              snapshot_fields=_compact(job.get("snapshot") or {}))
         except Exception as e:
-            telemetry.info(f"claude journal failed: {e!r}")
+            telemetry.info(f"{self.SOURCE} journal failed: {e!r}")
 
     def _alert_line(self, job, v, error: str = ""):
-        """v2.0.2: EDIT the ALERT REACHED card's CLAUDE VERDICT block (AGREES / DISAGREES with the agent). If the card cannot be
-        edited (webhook only, expired), post a follow-up 'ALERT VERDICT · <id>' card repeating the AGENT and CLAUDE blocks.
-        The agent block always exists first — the hit card carried it before this call was even queued."""
+        """v2.0.2: EDIT the ALERT REACHED card's <TAG> VERDICT block (AGREES / DISAGREES with the agent). If the card cannot be
+        edited (webhook only, expired), post a follow-up 'ALERT VERDICT · <id>' card repeating the AGENT and advisor blocks.
+        The agent block always exists first — the hit card carried it before this call was even queued.
+        v2.3.0: with both advisors on the card, the second to answer adds ADVISORS: AGREE / SPLIT."""
         from .alerts import claude_verdict_block
-        blk = claude_verdict_block(v, job.get("agent_side"), error=error)
+        blk = claude_verdict_block(v, job.get("agent_side"), error=error, name=self.TAG)
         agent = job.get("agent"); store = getattr(agent, "alerts", None)
         if store is not None:
             try:
-                store.set_claude(job.get("alert_id"), v, blk["side"], blk["agreed"])
+                getattr(store, f"set_{self.SOURCE}")(job.get("alert_id"), v, blk["side"], blk["agreed"])
             except Exception:
                 pass
-        if self.notify.edit_card(job.get("card_key") or "", {"CLAUDE VERDICT": blk["text"]}):
+        others = advisor_board.record(f"alert:{job.get('alert_id')}", self.SOURCE, v, False) if v is not None else {}
+        others = {k: o for k, o in others.items() if o.get("v")}
+        t = advisor_board.tag(v, others) if v is not None else None
+        updates = {f"{self.TAG} VERDICT": blk["text"]}
+        if t:
+            updates["ADVISORS"] = advisor_board.tag_text(t)
+        if self.notify.edit_card(job.get("card_key") or "", updates):
             return
-        self.notify.send(f"{job['mode_name']}:{job['symbol']}:CLAUDE_ALERT:{job.get('alert_id')}",
+        fields = [field("AGENT VERDICT", job.get("agent_block") or "—", inline=False), field(f"{self.TAG} VERDICT", blk["text"], inline=False)]
+        fields += [field(f"{advisor_board.TAGS.get(k, k.upper())} VERDICT", o["line"], inline=False) for k, o in others.items()]
+        if t:
+            fields.append(field("ADVISORS", advisor_board.tag_text(t), inline=False))
+        self.notify.send(f"{job['mode_name']}:{job['symbol']}:{self.TAG}_ALERT:{job.get('alert_id')}",
                          ctitle(job["symbol"], f"ALERT VERDICT · {job.get('alert_id')}", blk["side"] or job.get("agent_side")),
                          ["second opinion only — you decide; nothing is placed"],
-                         fields=[field("AGENT VERDICT", job.get("agent_block") or "—", inline=False), field("CLAUDE VERDICT", blk["text"], inline=False),
-                                 field("Model", job["model"]), field("Latency", f"{job.get('latency', 0):.0f} s")],
-                         color=EVENT_COLOURS["info"], footer=cfooter(job["display"], "Claude"))
+                         fields=fields + [field("Model", job["model"] or "CLI default"), field("Latency", f"{job.get('latency', 0):.0f} s")],
+                         color=EVENT_COLOURS["info"], footer=cfooter(job["display"], self.LABEL))
 
     def _entry_card(self, job, v, stale):
-        label = f"{'⌛ STALE · ' if stale else ''}{v['decision']} · {v['confidence']} · {v['reason']}"
-        fld = field("Claude", label, inline=False)
+        line = advisor_board.verdict_line(self.SOURCE, v, stale)
+        key = job.get("card_key") or f"{job['mode_name']}:{job['symbol']}:{job['event']}:{job['bar_t']}"
+        others = advisor_board.record(key, self.SOURCE, v, stale)
+        t = advisor_board.tag(v, others)
+        fld = field(self.LABEL, line, inline=False)
         hook = getattr(self.notify, "claude_edit_hook", None)
         if hook and job.get("card_key") and not stale:
             try:
                 if hook(job["card_key"], fld):           # added to the original ask card
+                    if t:
+                        self.notify.edit_card(job["card_key"], {"Advisors": advisor_board.tag_text(t)})
                     return
             except Exception:
                 pass
         title_ev = {"P": "P PRE-CROSS", "CROSS": "CONFIRMED CROSS", "RE": "RE-ENTRY", "ENTER": "ENTER"}.get(job["event"], job["event"])
-        self.notify.send(f"{job['mode_name']}:{job['symbol']}:CLAUDE_{job['event']}:{bar_key(job['bar_t'], job['off'])}",
-                         ctitle(job["symbol"], f"CLAUDE · {title_ev}", job["side"]),
-                         [f"Claude: **{label}**", "second opinion only — you decide; nothing is placed"],
-                         fields=[field("Model", job["model"]), field("Latency", f"{job.get('latency', 0):.0f} s"),
+        lines = [f"**{line}**"] + [o["line"] for o in others.values()] + ([f"Advisors: **{advisor_board.tag_text(t)}**"] if t else [])
+        self.notify.send(f"{job['mode_name']}:{job['symbol']}:{self.TAG}_{job['event']}:{bar_key(job['bar_t'], job['off'])}",
+                         ctitle(job["symbol"], f"{self.TAG} · {title_ev}", job["side"]),
+                         lines + ["second opinion only — you decide; nothing is placed"],
+                         fields=[field("Model", job["model"] or "CLI default"), field("Latency", f"{job.get('latency', 0):.0f} s"),
                                  field("Signal bar", f"{ist_str(job['bar_t'], job['off'])} IST")],
-                         color=EVENT_COLOURS["info"], footer=cfooter(job["display"], "Claude"))
+                         color=EVENT_COLOURS["info"], footer=cfooter(job["display"], self.LABEL))
 
     def _pullback_card(self, agent, job, v, p, st, note, acted, stale):
         dec = v["decision"]
         if acted and dec in ("TIGHTEN", "CLOSE"):
             if dec == "CLOSE":
                 return                                   # the guardian's _close already posted CLAUDE CLOSED after MT5 confirmed
-            title = "CLAUDE TIGHTENED"; colour = EVENT_COLOURS["secured"]
+            title = f"{self.TAG} TIGHTENED"; colour = EVENT_COLOURS["secured"]
         else:
-            title = "CLAUDE PULLBACK VERDICT"; colour = EVENT_COLOURS["flip"] if dec != "HOLD" else EVENT_COLOURS["info"]
-        lines = [f"Claude: **{'⌛ STALE · ' if stale else ''}{dec} · {v['confidence']} · {v['reason']}**", note]
+            title = f"{self.TAG} PULLBACK VERDICT"; colour = EVENT_COLOURS["flip"] if dec != "HOLD" else EVENT_COLOURS["info"]
+        others = advisor_board.record(f"pb:{agent.symbol}:{job['ticket']}:{job['bar_t']}", self.SOURCE, v, stale)
+        t = advisor_board.tag(v, others)
+        lines = [f"**{advisor_board.verdict_line(self.SOURCE, v, stale)}**"] + [o["line"] for o in others.values()]
+        if t:
+            lines.append(f"Advisors: **{advisor_board.tag_text(t)}**")
+        lines.append(note)
         fields = []
         if p is not None:
             fields = position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"],
@@ -633,27 +702,30 @@ class ClaudeAdvisor:
         fields.append(field("Trigger", job.get("trigger") or "—", inline=False))
         self.notify.send(agent.key(title.replace(" ", "_"), f"{job['ticket']}-{bar_key(job['bar_t'], agent.off)}"),
                          ctitle(agent.symbol, title, job["side"]), lines, fields=fields, color=colour,
-                         footer=cfooter(agent.S.display_name, f"Claude · {self.mode}"))
+                         footer=cfooter(agent.S.display_name, f"{self.LABEL} · {self.mode}"))
 
     def _budget_card(self):
         day = ist_day()
         if self._budget_day == day:
             return
         self._budget_day = day
-        self.health.send(f"{STRATEGY}:ALL:CLAUDE_BUDGET:{day}", "AUREON · MT5 · CLAUDE BUDGET USED",
-                         [f"{self.cfg.claude_max_calls} calls used today (IST) — no more Claude calls until 00:00 IST",
-                          "guardian and signals unaffected"], color=EVENT_COLOURS["news"], footer="Aureon MT5 · Claude")
+        self.health.send(f"{STRATEGY}:ALL:{self.TAG}_BUDGET:{day}", f"AUREON · MT5 · {self.TAG} BUDGET USED",
+                         [f"{self.max_calls} calls used today (IST) — no more {self.LABEL} calls until 00:00 IST",
+                          "guardian and signals unaffected"], color=EVENT_COLOURS["news"], footer=f"Aureon MT5 · {self.LABEL}")
 
     def _unavailable(self, event, error):
-        key = f"{STRATEGY}:ALL:CLAUDE_UNAVAILABLE:{'auth'}"
+        key = f"{STRATEGY}:ALL:{self.TAG}_UNAVAILABLE:{'auth'}"
         now = _time.time()
         if now - self._unavail_last.get(key, 0) < UNAVAILABLE_BACKOFF_S:
             return
         self._unavail_last[key] = now
         try:
-            self.health.card("AUREON · MT5 · CLAUDE UNAVAILABLE",
-                             f"{error[:300]}\nRun `claude -p \"Reply only: OK\"` in {self.cfg.claude_workdir} to check the login. "
-                             "Aureon runs exactly as without Claude meanwhile.",
-                             color=EVENT_COLOURS["error"], footer="Aureon MT5 · Claude")
+            self.health.card(f"AUREON · MT5 · {self.TAG} UNAVAILABLE",
+                             f"{error[:300]}\n{self._login_hint()} "
+                             f"Aureon runs exactly as without {self.LABEL} meanwhile.",
+                             color=EVENT_COLOURS["error"], footer=f"Aureon MT5 · {self.LABEL}")
         except Exception:
             pass
+
+    def _login_hint(self) -> str:
+        return f"Run `claude -p \"Reply only: OK\"` in {self.cfg.claude_workdir} to check the login."

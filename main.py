@@ -22,6 +22,7 @@ from aureon_mt5.agent import SymbolAgent
 from aureon_mt5.alerts import AlertStore
 from aureon_mt5.bot import run_bot
 from aureon_mt5.claude_advisor import ClaudeAdvisor
+from aureon_mt5.codex_advisor import CodexAdvisor
 from aureon_mt5 import compare
 from aureon_mt5.notify import post_compare
 from aureon_mt5.config import Config, VERSION
@@ -153,7 +154,8 @@ def supervise(agents: dict, factory, notify, mode: str) -> list[str]:
 
 
 def claude_review_tick(claude, cfg, review_day, now: datetime | None = None):
-    """23:00 IST (cfg.daily_report_ist): queue the day's CLAUDE REVIEW once per IST day. Runs on the Claude worker, never here."""
+    """23:00 IST (cfg.daily_report_ist): queue the day's CLAUDE REVIEW (or, v2.3.0, CODEX REVIEW) once per IST day.
+    Runs on the advisor's worker, never here."""
     if claude is None:
         return review_day
     now = now or datetime.now(IST)
@@ -168,7 +170,7 @@ def claude_review_tick(claude, cfg, review_day, now: datetime | None = None):
 _COMPARE_RETRY_AT: dict[str, float] = {}
 
 
-def compare_saturday_tick(cfg, agents, journal, notify, claude=None, now: datetime | None = None, gather=None) -> str | None:
+def compare_saturday_tick(cfg, agents, journal, notify, claude=None, now: datetime | None = None, gather=None, codex=None) -> str | None:
     """Saturday ≥ cfg.weekly_report_ist (10:00 IST), after the WEEKLY report: post the COMPARE card for Mon–Fri once.
     Restart-safe: a week already in logs/compare_weekly.jsonl is skipped. Both modes (v2.0.0). Measurement only."""
     if cfg.mode not in compare.KINDS_BY_MODE:
@@ -185,19 +187,25 @@ def compare_saturday_tick(cfg, agents, journal, notify, claude=None, now: dateti
         c = compare.card(res, title=f"AUREON · MT5 · COMPARE · {week}")
         post_compare(notify, f"{cfg.mode}:ALL:COMPARE:{week}", c)
         compare.append_history(cfg.log_dir, week, res)
-        if claude is not None:                                   # v2.0.0: CLAUDE RULE PROPOSALS (no call, no edit; /claude-rules-approve <n>)
+        display = next(iter(agents.values())).S.display_name if agents else cfg.mode
+        for adv in (claude, codex):                              # v2.0.0 CLAUDE / v2.3.0 CODEX RULE PROPOSALS (no call, no edit)
+            if adv is None:
+                continue
+            src = getattr(adv, "SOURCE", "claude")
             try:
-                compare.rule_proposals_tick(cfg, journal, notify, res, week, next(iter(agents.values())).S.display_name if agents else cfg.mode)
+                compare.rule_proposals_tick(cfg, journal, notify, res, week, display, source=src)
             except Exception as e:
-                telemetry.info(f"rule proposals failed: {e!r}")
+                telemetry.info(f"{src} rule proposals failed: {e!r}")
     except Exception as e:                                   # back off 30 min instead of re-grading every 30 s
         _COMPARE_RETRY_AT[week] = _time.time() + 1800
         telemetry.failure(notify, journal, title="AUREON COMPARE FAILED", key=f"{cfg.mode}:ALL:COMPARE_ERROR:{week}",
                           mode=cfg.mode, action="weekly compare", exc=e, retry="retry in 30 min")
         return None
+    import threading
     if cfg.compare_claude_review and claude is not None:
-        import threading
         threading.Thread(target=compare.self_review, args=(claude, res, notify, week), daemon=True, name="compare-self-review").start()
+    if codex is not None:                                        # v2.3.0: Saturday CODEX REVIEW (its wrong calls, 5 lines)
+        threading.Thread(target=compare.self_review, args=(codex, res, notify, week), daemon=True, name="compare-codex-review").start()
     return week
 
 
@@ -233,12 +241,11 @@ def claude_report_tick(cfg, agents, journal, notify, now=None):
         _CLAUDE_REPORT_RUNNING.add(token)
         def post(period=period, key=key, token=token):
             try:
-                r = claude_report.report(cfg, agents, journal, period, now=now)
-                notify.card(r["title"], "Graded Claude advisory performance; no strategy changes.",
-                            fields=r["fields"], footer=f"v{VERSION} · {key}")
+                r = claude_report.advisor_report(cfg, agents, journal, period, now=now)      # v2.3.0: Claude + Codex + head-to-head
+                notify.card(r["title"], r["description"], fields=r["fields"][:25], footer=f"v{VERSION} · {key}")
                 claude_report.append_history(cfg.log_dir, period, key)
             except Exception as e:
-                telemetry.failure(notify, journal, title="AUREON CLAUDE REPORT FAILED",
+                telemetry.failure(notify, journal, title="AUREON ADVISOR REPORT FAILED",
                                   key=f"claude-report:{token}", action="scheduled report", exc=e)
             finally:
                 _CLAUDE_REPORT_RUNNING.discard(token)
@@ -304,6 +311,18 @@ def main():
                                "`ANTHROPIC_API_KEY` is set in this environment. Aureon removes it from the `claude -p` call so your "
                                "subscription login is used — remove it from the environment to be sure nothing bills the API.",
                                footer="Aureon MT5 · Claude")
+    codex = CodexAdvisor.create(cfg, notify, journal, health_notify=health_notify)       # None when AUREON_CODEX=off
+    if codex is not None:
+        print(f"Codex add-on: {codex.mode} (shown only, never applied) · bin {cfg.codex_bin} · workdir {cfg.codex_workdir} · "
+              f"{cfg.codex_max_calls} calls/day")
+        if any(os.environ.get(k) for k in ("OPENAI_API_KEY", "CODEX_API_KEY")):
+            health_notify.card("AUREON · MT5 · CODEX · API KEY SET",
+                               "`OPENAI_API_KEY` / `CODEX_API_KEY` is set in this environment. Aureon removes it from the `codex exec` call so "
+                               "your CLI login is used — remove it from the environment to be sure nothing bills the API.",
+                               footer="Aureon MT5 · Codex")
+
+    def make_agent(sym):
+        return SymbolAgent(sym, cfg, S, notify, journal, news, claude=claude, alerts=alerts, codex=codex)
 
     def start_agents():
         from aureon_mt5.crashes import should_restart
@@ -311,7 +330,7 @@ def main():
             if not should_restart(s):
                 continue
             if s not in agents or not agents[s].is_alive():
-                agents[s] = SymbolAgent(s, cfg, S, notify, journal, news, claude=claude, alerts=alerts); agents[s].start()
+                agents[s] = make_agent(s); agents[s].start()
 
     why = "online"
     try:
@@ -347,11 +366,11 @@ def main():
                         fields=[{"name": "Enable explicitly", "value": "`--enable-silver`", "inline": True}],
                         footer="Aureon MT5")
     start_agents()
-    if cfg.bot_token: run_bot(cfg, agents, journal, notify, started, health_notify=health_notify, claude=claude, alerts=alerts)
+    if cfg.bot_token: run_bot(cfg, agents, journal, notify, started, health_notify=health_notify, claude=claude, alerts=alerts, codex=codex)
     else: print("no DISCORD_TOKEN — slash commands off, alerts via webhook only")
 
     was_open = broker.market_open(cfg.symbols[0], cfg.server_utc_offset, cfg.dry); report_day = None; last_update_check = 0
-    review_day = None
+    review_day = None; codex_review_day = None
     while True:
         try:
             now = _time.time()
@@ -367,9 +386,10 @@ def main():
                 greet(notify, cfg, S, "market open — Aureon resumed", news_line); start_agents()
             was_open = is_open
             review_day = claude_review_tick(claude, cfg, review_day)
-            compare_saturday_tick(cfg, agents, journal, notify, claude)
+            codex_review_day = claude_review_tick(codex, cfg, codex_review_day)        # v2.3.0: CODEX REVIEW, same 23:00 IST
+            compare_saturday_tick(cfg, agents, journal, notify, claude, codex=codex)
             claude_report_tick(cfg, agents, journal, notify)
-            supervise(agents, lambda sym: SymbolAgent(sym, cfg, S, notify, journal, news, claude=claude, alerts=alerts), notify, cfg.mode)
+            supervise(agents, make_agent, notify, cfg.mode)
         except KeyboardInterrupt:
             notify.card("AUREON · MT5 · PROCESS EXITING", "KeyboardInterrupt")
             broker.close_connection(); print("bye"); return

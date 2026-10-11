@@ -130,6 +130,11 @@ class AlertStore:
         return self._set(alert_id, claude_verdict=(verdict or {}).get("decision"), claude_side=side, claude_agreed=agreed,
                          claude_reason=(verdict or {}).get("reason"), claude_p_win=(verdict or {}).get("p_win"))
 
+    def set_codex(self, alert_id: str, verdict: dict | None, side: str | None, agreed: bool | None) -> dict | None:
+        """v2.3.0: the Codex verdict on the alert (display / stats only)."""
+        return self._set(alert_id, codex_verdict=(verdict or {}).get("decision"), codex_side=side, codex_agreed=agreed,
+                         codex_reason=(verdict or {}).get("reason"))
+
     # ---- firing
     @staticmethod
     def crossed(a: dict, bid: float, ask: float) -> bool:
@@ -366,20 +371,25 @@ def suggestion(agent, df, res: dict, bar_t: int, gctx: dict, current: float) -> 
     return {"decision": dec, "side": side, "reason": reason, "line": line, "sl": sl, "sl_line": sl_line, "text": text, "verdict": v}
 
 
-def claude_placeholder(agent) -> tuple[str, str]:
-    """(state, text) for the CLAUDE VERDICT block before any call: asking | off | budget | unavailable."""
-    cl = getattr(agent, "claude_any", None)
+def claude_placeholder(agent, attr: str = "claude") -> tuple[str, str]:
+    """(state, text) for the CLAUDE (v2.3.0: CODEX) VERDICT block before any call: asking | off | budget | unavailable."""
+    cl = getattr(agent, f"{attr}_any", None)
     if cl is None or getattr(cl, "mode", "off") == "off":
         return "off", "— not attached (mode=off)"
+    label = getattr(cl, "LABEL", "Claude")
     st = cl.stats if hasattr(cl, "stats") else {}
     if st.get("login") in ("NOT FOUND", "FAILED"):
-        return "unavailable", f"— unavailable ({'Claude Code not found' if st.get('login') == 'NOT FOUND' else 'not logged in'})"
+        missing = "Claude Code not found" if attr == "claude" else f"{label} CLI not found"
+        return "unavailable", f"— unavailable ({missing if st.get('login') == 'NOT FOUND' else 'not logged in'})"
     try:
-        if cl.budget.used() >= cl.cfg.claude_max_calls:
+        limit = getattr(cl, "max_calls", None) or cl.cfg.claude_max_calls
+        if cl.budget.used() >= limit:
             return "budget", "— budget used"
     except Exception:
         pass
-    return "asking", f"⏳ asking Claude ({cl.cfg.claude_entry_model}) …"
+    model = getattr(cl, "entry_model", None)
+    model = (model if model is not None else cl.cfg.claude_entry_model) or "CLI default"
+    return "asking", f"⏳ asking {label} ({model}) …"
 
 
 def claude_side(v: dict | None) -> str | None:
@@ -388,17 +398,17 @@ def claude_side(v: dict | None) -> str | None:
     return {"BUY": "LONG", "SELL": "SHORT"}.get(str(v.get("side") or "").upper())
 
 
-def claude_verdict_block(v: dict | None, agent_side: str | None, error: str = "") -> dict:
-    """The CLAUDE VERDICT block after the call: text, side, agreed (None when no verdict)."""
+def claude_verdict_block(v: dict | None, agent_side: str | None, error: str = "", name: str = "CLAUDE") -> dict:
+    """The CLAUDE (v2.3.0: or CODEX) VERDICT block after the call: text, side, agreed (None when no verdict)."""
     if v is None:
         return {"text": f"— {error or 'unavailable'}", "side": None, "agreed": None, "decision": None}
     cs = claude_side(v)
-    head = f"CLAUDE: {cs or '—'} · {v['decision']}" + (f" · p_win {v['p_win']:.2f}" if v.get("p_win") is not None else "") + f" · confidence {v.get('confidence', '—')}"
+    head = f"{name}: {cs or '—'} · {v['decision']}" + (f" · p_win {v['p_win']:.2f}" if v.get("p_win") is not None else "") + f" · confidence {v.get('confidence', '—')}"
     lines = [f"**{head}**", f"\"{v.get('reason', '')}\""]
     if v.get("evidence"):
         lines.append("evidence: " + ", ".join(v["evidence"]))
     agreed = (cs == agent_side)
-    lines.append("AGREES with agent ✅" if agreed else f"DISAGREES with agent ⚠️ (agent {agent_side or 'no trade'}, Claude {cs or v['decision']})")
+    lines.append("AGREES with agent ✅" if agreed else f"DISAGREES with agent ⚠️ (agent {agent_side or 'no trade'}, {name.title()} {cs or v['decision']})")
     return {"text": "\n".join(lines), "side": cs, "agreed": agreed, "decision": v["decision"]}
 
 
@@ -429,16 +439,19 @@ def reached_card(agent, a: dict, hit_price: float, tick_time: int, bar_t: int, d
     price_text = (f"hit **{hit_price:.2f}** · {server_str(tick_time, '%H:%M:%S')} server · {ist_str(tick_time, off, '%H:%M:%S')} IST · approach {a['side_hint']}"
                   + (f" · set {bars_since} bars ago" if bars_since is not None else "") + f"\n{b['dist']}")
     state, ph = claude_placeholder(agent)
+    cx_state, cx_ph = claude_placeholder(agent, "codex")
     fields = [field("PRICE", price_text, inline=False), field("EMA", b["ema_text"], inline=False), field("TREND", b["trend_text"], inline=False),
               field("AGENT VERDICT", sug["text"], inline=False), field("CLAUDE VERDICT", ph, inline=False)]
+    if cx_state != "off":                                   # v2.3.0: the Codex block only when Codex is configured
+        fields.append(field("CODEX VERDICT", cx_ph, inline=False))
     meta = {"kind": "alert", "alert_id": a["id"], "symbol": a["symbol"], "price": hit_price, "bar": bar_t, "mode": S.name,
             "suggested_side": sug["side"], "suggestion": sug["decision"], "reason": sug["reason"], "sl": sug["sl"],
             "stop_pts": agent.g.pre_stop if agent.g else None, "note": a.get("note", ""), "agent_verdict": sug["line"],
-            "agent_block": sug["text"], "claude_state": state}
+            "agent_block": sug["text"], "claude_state": state, "codex_state": cx_state}
     colour = EVENT_COLOURS["signal_long" if sug["side"] == "LONG" else "signal_short" if sug["side"] == "SHORT" else "news"]
     return {"key": key_for(a["symbol"], a["id"]), "title": title, "lines": [f"**{sug['line']}**"], "fields": fields, "meta": meta, "color": colour,
             "footer": cfooter(S.display_name, f"alert {a['id']}"), "ema": b["ema"], "trend": b["trend"], "guardian": b["gctx"], "suggestion": sug,
-            "claude_state": state}
+            "claude_state": state, "codex_state": cx_state}
 
 
 def preview_card(agent, a: dict, df, res: dict, bar_t: int, current: float) -> dict:
@@ -449,6 +462,8 @@ def preview_card(agent, a: dict, df, res: dict, bar_t: int, current: float) -> d
               field("EMA", b["ema_text"], inline=False), field("TREND", b["trend_text"], inline=False),
               field("AGENT VERDICT · PREVIEW (this bar, not the hit)", sug["text"], inline=False),
               field("CLAUDE VERDICT", "— asked only when the alert is reached", inline=False)]
+    if getattr(getattr(agent, "codex_any", None), "mode", "off") != "off":
+        fields.append(field("CODEX VERDICT", "— asked only when the alert is reached", inline=False))
     return {"title": f"🔔 ALERT ARMED · {a['symbol']} {a['price']:.2f} · PREVIEW" + (f" · {a['note']}" if a.get("note") else ""),
             "description": armed_reply(a, current), "fields": fields, "footer": cfooter(S.display_name, f"alert {a['id']} · preview"),
             "agent": sug}

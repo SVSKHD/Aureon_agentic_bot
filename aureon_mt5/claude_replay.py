@@ -6,7 +6,11 @@ a second scored column "Claude-filtered" removes Claude's SKIPs (and, in the pul
 
 Cache: out/claude_replay_<mode>_<symbol>.jsonl keyed by (bar_t, event, model, rules hash) → a re-run with the same inputs makes
 zero calls; --claude-refresh forces new calls. --claude-max caps the calls per run; unscored bars are counted and continue
-from the cache on the next run. Strategy rules changed: NO — this measures, it never decides."""
+from the cache on the next run. Strategy rules changed: NO — this measures, it never decides.
+
+v2.3.0 — run.py --codex entry|entry+pullback: the same shadow run through CodexAdvisor (`codex exec`, CLI login only), own cache
+out/codex_replay_<mode>_<symbol>.jsonl, own --codex-max / --codex-sleep. With both flags, combined_text() prints Detector-all ·
+filtered-by-Claude · filtered-by-Codex · filtered-by-BOTH-agree, SKIP precision and calibration each, and the SPLIT list."""
 from __future__ import annotations
 
 import json
@@ -82,8 +86,8 @@ def snapshot_for_bar(shadow: ShadowAgent, df, bar_t: int, event: str, side: str,
 
 
 # ============================================================================= cache
-def cache_path(out_dir: str, mode: str, symbol: str) -> str:
-    return os.path.join(out_dir, f"claude_replay_{mode}_{symbol}.jsonl")
+def cache_path(out_dir: str, mode: str, symbol: str, advisor: str = "claude") -> str:
+    return os.path.join(out_dir, f"{advisor}_replay_{mode}_{symbol}.jsonl")
 
 
 def cache_key(bar_t: int, event: str, model: str, rules_h: str) -> str:
@@ -137,25 +141,37 @@ def _event_for(S, jn) -> str:
 
 
 class ShadowReplay:
-    """One run: ask (or read from the cache), record, score. `caller` defaults to claude_cli.call (mockable in tests)."""
+    """One run: ask (or read from the cache), record, score. `caller` defaults to the advisor's CLI (mockable in tests).
+    advisor = "claude" (claude -p) | "codex" (codex exec) — same snapshot, prompt, contract and scoring."""
 
     def __init__(self, cfg, S, symbol: str, off: float, news: tuple, *, out_dir: str = "out", model: str | None = None,
                  max_calls: int = 60, sleep_s: float = 2.0, refresh: bool = False, variant: str = "entry", caller=None,
-                 sleep=_time.sleep, rules_path: str | None = None):
+                 sleep=_time.sleep, rules_path: str | None = None, advisor: str = "claude"):
         from .claude_advisor import ClaudeAdvisor, RULES_PATH
+        self.advisor = advisor
         self.cfg, self.S, self.symbol, self.off, self.news = cfg, S, symbol, off, news
-        self.out_dir = out_dir; self.model = model or cfg.claude_entry_model
         self.max_calls, self.sleep_s, self.refresh, self.variant = int(max_calls), float(sleep_s), bool(refresh), variant
-        self.caller = caller or claude_cli.call; self.sleep = sleep
+        self.sleep = sleep
+        self.out_dir = out_dir
+        if advisor == "codex":
+            from .codex_advisor import CodexAdvisor
+            from .common import codex_cli
+            self.caller = caller or codex_cli.call
+            self.adv = CodexAdvisor(cfg, _Quiet(), _NoJournal(), caller=self.caller, start=False)
+            self.model = model or self.adv.entry_model                    # "" = the Codex CLI default
+        else:
+            self.caller = caller or claude_cli.call
+            self.adv = ClaudeAdvisor(cfg, _Quiet(), _NoJournal(), caller=self.caller, start=False)   # prompt_for only; no worker, no budget
+            self.model = model or cfg.claude_entry_model
+        self.label = self.adv.LABEL
         self.rules_path = rules_path or RULES_PATH
         self.rules_h = rules_hash(self.rules_path)
-        self.adv = ClaudeAdvisor(cfg, _Quiet(), _NoJournal(), caller=self.caller, start=False)     # prompt_for only; no worker, no budget
         try:
             with open(self.rules_path, encoding="utf-8") as f:
                 self.adv.rules = f.read()
         except Exception:
             pass
-        self.path = cache_path(out_dir, S.name, symbol)
+        self.path = cache_path(out_dir, S.name, symbol, advisor)
         self.cache = load_cache(self.path)
         self.res = ShadowResult(model=self.model, rules_hash=self.rules_h, variant=variant)
 
@@ -168,13 +184,12 @@ class ShadowReplay:
             return hit
         if self.res.calls >= self.max_calls:
             self.res.unscored += 1
-            return {"key": key, "verdict": None, "error": "budget (--claude-max) reached", "unscored": True}
+            return {"key": key, "verdict": None, "error": f"budget (--{self.advisor}-max) reached", "unscored": True}
         if self.res.calls > 0 and self.sleep_s > 0:
             self.sleep(self.sleep_s)
         self.res.calls += 1
-        r = self.caller(self.adv.prompt_for(snapshot), self.model, event=event, bin=self.cfg.claude_bin, workdir=self.cfg.claude_workdir,
-                        timeout=self.cfg.claude_timeout)
-        row = {"key": key, "bar_t": int(bar_t), "event": event, "model": self.model, "rules_hash": self.rules_h,
+        r = self.adv._invoke(self.adv.prompt_for(snapshot), self.model, event)
+        row = {"key": key, "bar_t": int(bar_t), "event": event, "model": self.model, "rules_hash": self.rules_h, "advisor": self.advisor,
                "verdict": r.verdict if r.ok else None, "error": "" if r.ok else r.error, "latency_s": round(r.latency_s, 1),
                "reported_model": getattr(r, "model", ""), "asked_at": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")}
         if not r.ok:
@@ -197,6 +212,7 @@ class ShadowReplay:
                    "side": side, "kind": event, "points": float(jn.result if jn.exit_reason != "open" else 0.0), "exit_reason": jn.exit_reason,
                    "open": jn.exit_reason == "open", "stop": jn.exit_reason in ("stop", "pre_stop", "stop_ema80"),
                    "claude": (verdict or {}).get("decision"), "p_win": (verdict or {}).get("p_win"), "reason": (verdict or {}).get("reason"),
+                   "confidence": (verdict or {}).get("confidence"),          # (the "claude" key = this advisor's decision, either CLI)
                    "evidence": (verdict or {}).get("evidence") or [], "error": v.get("error") or "", "unscored": bool(v.get("unscored")),
                    "month": datetime.fromtimestamp(jn.entry_time, tz=timezone.utc).strftime("%b %Y"), "filtered_points": None}
             if self.variant == "entry+pullback" and jn.exit_reason != "open" and row["claude"] != "SKIP":
@@ -273,6 +289,7 @@ class ShadowReplay:
         skips = [r for r in det if r["claude"] == "SKIP"]
         skip_precision = (sum(1 for r in skips if r["points"] < 0) / len(skips)) if skips else None
         calib = calibration(det)
+        conf_calib = confidence_calibration(det)
         dis = [{"date": r["ist"], "side": r["side"], "points": r["points"], "claude": r["claude"], "p_win": r["p_win"], "reason": r["reason"],
                 "evidence": r["evidence"]} for r in det if r["claude"] == "SKIP" or (r["claude"] == "TAKE" and r["points"] < 0)]
         months: dict = {}
@@ -282,9 +299,21 @@ class ShadowReplay:
             if r["claude"] != "SKIP":
                 mo["filt_n"] += 1; mo["filt_pts"] += r["points"] if r.get("filtered_points") is None else r["filtered_points"]
         self.res.months = months
-        return {"metrics": m, "skip_precision": skip_precision, "skips": len(skips), "calibration": calib, "disagreements": dis, "months": months,
+        return {"metrics": m, "skip_precision": skip_precision, "skips": len(skips), "calibration": calib, "confidence_calibration": conf_calib,
+                "disagreements": dis, "months": months,
                 "no_verdict": sum(1 for r in det if r["claude"] is None), "unscored": self.res.unscored, "calls": self.res.calls,
                 "cache_hits": self.res.cache_hits, "errors": self.res.errors, "pullbacks": self.res.pullbacks}
+
+
+def confidence_calibration(rows: list[dict]) -> dict:
+    """v2.3.0: stated confidence → n, directional correctness (TAKE won / SKIP lost). Works without p_win."""
+    out = {}
+    for r in rows:
+        if r.get("claude") not in ("TAKE", "SKIP") or r.get("confidence") not in ("low", "medium", "high"):
+            continue
+        b = out.setdefault(r["confidence"], {"n": 0, "correct": 0})
+        b["n"] += 1; b["correct"] += int((r["claude"] == "TAKE" and r["points"] > 0) or (r["claude"] == "SKIP" and r["points"] < 0))
+    return out
 
 
 def calibration(rows: list[dict]) -> list[dict]:
@@ -305,31 +334,34 @@ def _f(x, fmt="{:+.1f}"):
 
 
 def report_text(sr: ShadowReplay, sc: dict, title: str) -> str:
-    m = sc["metrics"]
-    rows = [("Detector · all", m["detector"]), ("Claude TAKE", m["claude_take"]), ("Claude SKIP", m["claude_skip"]),
-            ("Detector-filtered-by-Claude", m["filtered"])]
+    m = sc["metrics"]; lb = getattr(sr, "label", "Claude")
+    rows = [("Detector · all", m["detector"]), (f"{lb} TAKE", m["claude_take"]), (f"{lb} SKIP", m["claude_skip"]),
+            (f"Detector-filtered-by-{lb}", m["filtered"])]
     head = f"{'group':<30}{'n':>5}{'win%':>7}{'exp':>8}{'total':>9}{'stops':>7}{'streak':>8}{'maxDD':>8}"
-    L = [f"# CLAUDE SHADOW REPLAY · {title}",
-         f"model `{sr.model}` · rules `{sr.rules_h}` · variant {sr.variant} · calls this run {sc['calls']} · cache hits {sc['cache_hits']} · "
+    L = [f"# {lb.upper()} SHADOW REPLAY · {title}",
+         f"model `{sr.model or 'CLI default'}` · rules `{sr.rules_h}` · variant {sr.variant} · calls this run {sc['calls']} · cache hits {sc['cache_hits']} · "
          f"errors {sc['errors']} · no verdict {sc['no_verdict']} · **unscored ENTER bars {sc['unscored']}** (next run continues from the cache)",
          "", "```", head, "-" * len(head)]
     for name, mm in rows:
         L.append(f"{name:<30}{mm.n:>5}{_f(mm.win_rate, '{:.0%}'):>7}{_f(mm.expectancy):>8}{_f(mm.total):>9}{mm.stops:>7}{mm.worst_streak:>8}{_f(mm.biggest_loss):>8}")
     L.append("```")
     sp = sc["skip_precision"]
-    L.append(f"SKIP precision (share of Claude SKIPs that lost): {_f(sp, '{:.0%}')} over {sc['skips']} SKIPs")
+    L.append(f"SKIP precision (share of {lb} SKIPs that lost): {_f(sp, '{:.0%}')} over {sc['skips']} SKIPs")
     L += ["", "## Calibration — p_win bucket vs actual win%", "```", f"{'p_win':<10}{'n':>5}{'actual win%':>13}{'mean p_win':>12}", "-" * 40]
     for c in sc["calibration"]:
         L.append(f"{c['bucket']:<10}{c['n']:>5}{_f(c['win_rate'], '{:.0%}'):>13}{_f(c['mean_p'], '{:.2f}'):>12}")
     L.append("```")
-    L += ["", "## Per month — Detector vs Claude-filtered", "```", f"{'month':<10}{'det n':>7}{'det pts':>9}{'filt n':>8}{'filt pts':>10}{'diff':>8}", "-" * 52]
+    cc = sc.get("confidence_calibration") or {}
+    if cc:
+        L.append("by confidence (TAKE won / SKIP lost): " + " · ".join(f"{k} {v['correct']}/{v['n']}" for k, v in sorted(cc.items())))
+    L += ["", f"## Per month — Detector vs {lb}-filtered", "```", f"{'month':<10}{'det n':>7}{'det pts':>9}{'filt n':>8}{'filt pts':>10}{'diff':>8}", "-" * 52]
     for mo, v in sc["months"].items():
         L.append(f"{mo:<10}{v['det_n']:>7}{v['det_pts']:>+9.1f}{v['filt_n']:>8}{v['filt_pts']:>+10.1f}{v['filt_pts'] - v['det_pts']:>+8.1f}")
     L.append("```")
     if sc["pullbacks"]:
         pb = sc["pullbacks"]
         L += ["", f"## Pullback verdicts ({len(pb)}): " + " · ".join(f"{d} {sum(1 for p in pb if p['claude'] == d)}" for d in ("HOLD", "TIGHTEN", "CLOSE"))]
-    L += ["", f"## Disagreements ({len(sc['disagreements'])}) — SKIPs and losing TAKEs: date · side · detector pts · Claude · reason · evidence"]
+    L += ["", f"## Disagreements ({len(sc['disagreements'])}) — SKIPs and losing TAKEs: date · side · detector pts · {lb} · reason · evidence"]
     for d in sc["disagreements"][:60]:
         L.append(f"- {d['date']} · {d['side']} · {d['points']:+.1f} · {d['claude']}" + (f" p_win {d['p_win']:.2f}" if d.get("p_win") is not None else "")
                  + f" · {d['reason'] or '—'} · {', '.join(d['evidence']) or '—'}")
@@ -340,11 +372,74 @@ def report_text(sr: ShadowReplay, sc: dict, title: str) -> str:
 
 def write_report(sr: ShadowReplay, sc: dict, title: str) -> tuple[str, str]:
     text = report_text(sr, sc, title)
-    path = os.path.join(sr.out_dir, f"claude_replay_{sr.S.name}_{sr.symbol}.md")
+    path = os.path.join(sr.out_dir, f"{getattr(sr, 'advisor', 'claude')}_replay_{sr.S.name}_{sr.symbol}.md")
     os.makedirs(sr.out_dir, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write(text + "\n")
     return text, path
+
+
+# ============================================================================= v2.3.0 both advisors on the same replayed bars
+def combined(sr_claude: ShadowReplay, sr_codex: ShadowReplay) -> dict:
+    """Detector-all · filtered-by-Claude · filtered-by-Codex · filtered-by-BOTH-agree, SKIP precision / calibration each, SPLIT list.
+    filtered-by-X drops X's SKIPs (pullback TIGHTEN / CLOSE applied for X as in its own run). filtered-by-BOTH-agree keeps a trade
+    only when the two advisors agree it is not a SKIP (neither said SKIP); its points are the detector's (no pullback edits)."""
+    cx = {r["bar_t"]: r for r in sr_codex.res.rows}
+    det, f_cl, f_cx, f_both, splits = [], [], [], [], []
+    for r in sr_claude.res.rows:
+        if r["open"]:
+            continue
+        x = cx.get(r["bar_t"]) or {}
+        base = dict(r, filtered_points=None)
+        det.append(base)
+        if r["claude"] != "SKIP":
+            f_cl.append(r)
+        if x.get("claude") != "SKIP":
+            f_cx.append(dict(r, filtered_points=x.get("filtered_points")) if x else base)
+        if r["claude"] != "SKIP" and x.get("claude") != "SKIP":
+            f_both.append(base)
+        if r["claude"] and x.get("claude") and r["claude"] != x["claude"]:
+            splits.append({"date": r["ist"], "bar_t": r["bar_t"], "side": r["side"], "points": r["points"],
+                           "claude": r["claude"], "claude_reason": r.get("reason"), "codex": x["claude"], "codex_reason": x.get("reason")})
+    rc = sr_claude.rows_as_compare
+    sc_cl, sc_cx = sr_claude.score(), sr_codex.score()
+    return {"metrics": {"detector": compare_metrics(rc(det)), "claude": compare_metrics(rc(f_cl)), "codex": compare_metrics(rc(f_cx)),
+                        "both": compare_metrics(rc(f_both))},
+            "skip_precision": {"claude": sc_cl["skip_precision"], "codex": sc_cx["skip_precision"]},
+            "skips": {"claude": sc_cl["skips"], "codex": sc_cx["skips"]},
+            "calibration": {"claude": sc_cl["calibration"], "codex": sc_cx["calibration"]},
+            "confidence_calibration": {"claude": sc_cl["confidence_calibration"], "codex": sc_cx["confidence_calibration"]},
+            "splits": splits, "both_judged": sum(1 for r in det if r["claude"] and (cx.get(r["bar_t"]) or {}).get("claude"))}
+
+
+def combined_text(c: dict, title: str) -> str:
+    head = f"{'group':<34}{'n':>5}{'win%':>7}{'exp':>8}{'total':>9}{'stops':>7}{'streak':>8}{'maxDD':>8}"
+    L = [f"# CLAUDE + CODEX SHADOW REPLAY · {title}", "", "```", head, "-" * len(head)]
+    for name, k in (("Detector · all", "detector"), ("Detector-filtered-by-Claude", "claude"), ("Detector-filtered-by-Codex", "codex"),
+                    ("Detector-filtered-by-BOTH-agree", "both")):
+        mm = c["metrics"][k]
+        L.append(f"{name:<34}{mm.n:>5}{_f(mm.win_rate, '{:.0%}'):>7}{_f(mm.expectancy):>8}{_f(mm.total):>9}{mm.stops:>7}{mm.worst_streak:>8}{_f(mm.biggest_loss):>8}")
+    L.append("```")
+    for src, lb in (("claude", "Claude"), ("codex", "Codex")):
+        L.append(f"SKIP precision {lb}: {_f(c['skip_precision'][src], '{:.0%}')} over {c['skips'][src]} SKIPs · calibration "
+                 + (" · ".join(f"p {b['bucket']} n{b['n']} win {_f(b['win_rate'], '{:.0%}')}" for b in c["calibration"][src] if b["n"]) or "no p_win")
+                 + " · by confidence " + (" · ".join(f"{k} {v['correct']}/{v['n']}" for k, v in sorted(c["confidence_calibration"][src].items())) or "—"))
+    sp = c["splits"]
+    L += ["", f"## SPLIT ({len(sp)} of {c['both_judged']} bars both judged) — bar · side · detector pts · Claude · Codex"]
+    for d in sp[:80]:
+        L.append(f"- {d['date']} · {d['side']} · {d['points']:+.1f} · Claude {d['claude']} ({d['claude_reason'] or '—'}) · "
+                 f"Codex {d['codex']} ({d['codex_reason'] or '—'})")
+    if len(sp) > 80:
+        L.append(f"- … {len(sp) - 80} more")
+    return "\n".join(L)
+
+
+def write_combined(out_dir: str, mode: str, symbol: str, text: str) -> str:
+    path = os.path.join(out_dir, f"advisors_replay_{mode}_{symbol}.md")
+    os.makedirs(out_dir, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text + "\n")
+    return path
 
 
 class _Quiet:

@@ -62,7 +62,7 @@ def _bot_line(monitor) -> str:
     return monitor.summary() if monitor is not None else "—"
 
 
-def status_card(sym: str, ag, cfg, journal=None, monitor=None, claude=None) -> dict:
+def status_card(sym: str, ag, cfg, journal=None, monitor=None, claude=None, codex=None) -> dict:
     h = ag.health; S = ag.S; snap = _snap(ag)
     mk = "OPEN" if snap.get("market_open") else ("CLOSED" if snap.get("at") else "—")
     age = snap.get("tick_age"); age_s = f"{age}s" if age is not None else "—"
@@ -107,6 +107,7 @@ def status_card(sym: str, ag, cfg, journal=None, monitor=None, claude=None) -> d
         _field("Last signal", h.get("last_signal") or "—"),
         _field("Last broker action", h.get("last_broker_action") or "—"),
         _field("Claude", claude_status_word(ag, claude)),                          # v2.0.1
+        _field("Codex", claude_status_word(ag, codex)),                            # v2.3.0 (shown only, never applied)
         _field("Bot", _bot_line(monitor), False),
     ]
     return _embed(f"{sym} · MT5 · STATUS", f"AUREON MT5 v{VERSION} · {S.display_name} · {age_text(ag)}", color=color, fields=fields,
@@ -327,34 +328,78 @@ def claude_status_word(ag, claude) -> str:
     return {"ATTACHED": f"ATTACHED ({claude.mode})", "REVIEW": "REVIEW (cards only)", "NOT_ATTACHED": "NOT ATTACHED", "DETACHED": "DETACHED"}.get(st, st)
 
 
-def claude_card(claude, cfg, agents: dict | None = None) -> dict:
-    """v2.0.1: 'is Claude Code attached to this agent?' — header (mode, bin, version, login), models, budget, one line per agent."""
+ADVISOR_INFO = {
+    "claude": {"label": "Claude", "env": "AUREON_CLAUDE", "bin_env": "AUREON_CLAUDE_BIN", "cli": "Claude Code",
+               "login": "run `claude` in the work folder and log in, then `/claude-test`",
+               "desc": "second opinion only — Claude never places a trade · TIGHTEN / CLOSE-in-profit applied only in manage · "
+                       "`/claude-attach <symbol>` · `/claude-detach <symbol>`"},
+    "codex": {"label": "Codex", "env": "AUREON_CODEX", "bin_env": "AUREON_CODEX_BIN", "cli": "Codex CLI",
+              "login": "run `codex login` (CLI sign-in, no API key), then `/codex-test`",
+              "desc": "second opinion only — Codex verdicts are journaled and shown, **never applied** (review and advisory) · "
+                      "`/codex-attach <symbol>` · `/codex-detach <symbol>`"},
+}
+
+
+def advisor_card(adv, cfg, agents: dict | None = None, source: str = "claude", login_line: str | None = None) -> dict:
+    """v2.0.1 /claude, v2.3.0 /codex: header (mode, bin, version, login), models, budget, one ATTACHED/REVIEW/OFF line per agent."""
     agents = agents or {}
-    if claude is None:
+    info = ADVISOR_INFO[source]; tag = info["label"].upper()
+    if adv is None:
         fields = [_field("Mode", "OFF"), _field("Attachment", "\n".join(claude_attachment_line(s, ag, None) for s, ag in agents.items()) or "no agents", False)]
-        return _embed("AUREON · MT5 · CLAUDE", "Claude add-on is **off** (`AUREON_CLAUDE=off`) — zero Claude calls.", color=GREY, fields=fields)
-    st = claude.status()
+        return _embed(f"AUREON · MT5 · {tag}", f"{info['label']} add-on is **off** (`{info['env']}=off`) — zero {info['label']} calls.", color=GREY, fields=fields)
+    st = adv.status()
     login = st["login"]
     bad_bin = login == "NOT FOUND" or (st.get("version") is None and "not found" in (st.get("version_error") or ""))
     bad_auth = login == "FAILED"
     icon = "🔴 " if (bad_bin or bad_auth) else "🟢 " if login == "OK" else "⚪ "
-    ver = st.get("version") or (f"unavailable — {st.get('version_error')}" if st.get("version_error") else "not checked yet (/claude-test)")
-    header = f"mode **{st['mode'].upper()}** · bin `{st['bin_path']}` · {ver} · login {login}"
+    ver = st.get("version") or (f"unavailable — {st.get('version_error')}" if st.get("version_error") else f"not checked yet (/{source}-test)")
+    header = f"mode **{st['mode'].upper()}** · bin `{st['bin_path']}` · {ver} · login {login}" + (f" · {login_line}" if login_line else "")
     if bad_bin:
-        header += "\n🔴 **Claude Code not found** — install it or set `AUREON_CLAUDE_BIN` to the full path of `claude`, then `/claude-test`"
+        header += f"\n🔴 **{info['cli']} not found** — install it or set `{info['bin_env']}` to the full path, then `/{source}-test`"
     elif bad_auth:
-        header += "\n🔴 **not logged in** — run `claude` in the work folder and log in, then `/claude-test`"
-    ids = st.get("model_ids", {}); rep = st.get("reported_models", {})
-    models = " · ".join(f"{k} `{ids.get(k, '?')}`" + (f" → reported `{rep[k]}`" if rep.get(k) else "") for k in ("entry", "pullback", "review"))
+        header += f"\n🔴 **not logged in** — {info['login']}"
+    ids = st.get("model_ids", {}); rep_ = st.get("reported_models", {})
+    models = " · ".join(f"{k} `{ids.get(k) or 'CLI default'}`" + (f" → reported `{rep_[k]}`" if rep_.get(k) else "") for k in ("entry", "pullback", "review"))
     ce = st.get("calls_by_event", {})
     lat_last = f"{st['last_latency']:.0f} s" if st.get("last_latency") is not None else "—"
     budget = (f"calls **{st['calls']} / {st['limit']}** today · entry {ce.get('entry', 0)} · pullback {ce.get('pullback', 0)} · alert {ce.get('alert', 0)} · "
               f"fast-exit cancellations {st.get('fast_exit_cancels', 0)} · last latency {lat_last} · last error {st['last_error'][:200]}")
-    per_agent = "\n".join(claude_attachment_line(s, ag, claude) for s, ag in agents.items()) or "no agents running"
+    per_agent = "\n".join(claude_attachment_line(s, ag, adv) for s, ag in agents.items()) or "no agents running"
     fields = [_field("Header", (icon + header)[:1024], False), _field("Models", models[:1024], False), _field("Budget", budget[:1024], False),
               _field("Per agent", per_agent[:1024], False), _field("Last verdict", st["last_verdict"], False), _field("Queue", st["queue"])]
-    return _embed("AUREON · MT5 · CLAUDE", "second opinion only — Claude never places a trade · `/claude-attach <symbol>` · `/claude-detach <symbol>`",
-                  color=RED if (bad_bin or bad_auth) else BLURPLE, fields=fields)
+    return _embed(f"AUREON · MT5 · {tag}", info["desc"], color=RED if (bad_bin or bad_auth) else BLURPLE, fields=fields)
+
+
+def claude_card(claude, cfg, agents: dict | None = None) -> dict:
+    return advisor_card(claude, cfg, agents, "claude")
+
+
+def usage_fields(log_dir: str, journal, source: str = "claude") -> list[dict]:
+    """/claude-status and (v2.3.0) /codex-status: today / week / month from logs/<source>_usage.jsonl + the journal."""
+    from .claude_usage import summarize
+    fields = []
+    now = datetime.now(IST)
+    for span in ("today", "week", "month"):
+        x = summarize(log_dir, span, source=source)
+        start = {
+            "today": now.replace(hour=0, minute=0, second=0, microsecond=0),
+            "week": (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0),
+            "month": now.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+        }[span]
+        records = journal.read(int(start.timestamp()))
+        stale = sum(r.get("event") == f"{source}_verdict" and bool(r.get("stale")) for r in records)
+        fast_cancel = sum(r.get("event") == f"{source}_fast_exit_cancel" for r in records)
+        by_kind = ", ".join(f"{k}:{v}" for k, v in sorted(x["by_kind"].items())) or "none"
+        verdicts = ", ".join(f"{k}:{v}" for k, v in sorted(x["verdicts"].items())) or "none"
+        val = (f"Calls {x['calls']} · ok {x['ok']} · errors {x['errors']} · timeout {x['timeouts']}\n"
+               f"Kinds {by_kind}\nVerdicts {verdicts}\n"
+               f"Tokens in/out {x['input_tokens']}/{x['output_tokens']} · "
+               f"cache read/write {x['cache_read_input_tokens']}/{x['cache_creation_input_tokens']}\n"
+               f"CLI reported cost ${x['cost_usd']:.4f} · "
+               f"avg/max {x['avg_latency']:.1f}/{x['max_latency']:.1f}s · "
+               f"STALE {stale} · fast-exit cancels {fast_cancel}")
+        fields.append(_field(span.title(), val[:1024], False))
+    return fields
 
 
 # ----------------------------------------------------------------------------- v1.9.8 command wrapper
@@ -603,7 +648,7 @@ def alert_preview(ag, a: dict, current: float | None) -> dict | None:
         return None
 
 
-def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_notify=None, claude=None, alerts=None):
+def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_notify=None, claude=None, alerts=None, codex=None):
     try:
         import discord  # type: ignore
         from discord import app_commands  # type: ignore
@@ -829,7 +874,7 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
     @tree.command(name="status", description="Read primary symbol health and trade status")
     async def status(inter: discord.Interaction):
         sym = cfg.symbols[0]
-        await run(inter, "status", lambda: Reply(card=status_card(sym, agents[sym], cfg, journal, monitor, claude)))
+        await run(inter, "status", lambda: Reply(card=status_card(sym, agents[sym], cfg, journal, monitor, claude, codex)))
 
     @tree.command(name="parallel-status", description="Show all monitored symbols and positions")
     async def pstatus(inter: discord.Interaction):
@@ -962,68 +1007,94 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             return Reply(content=f"cleared {n} alert(s) for {sym}")
         await run(inter, "alert-clear", work)
 
-    # ------------------------------------------------------------------ Read-only Codex commands (off Discord event loop)
-    # Codex never blocks the market poll, changes a position or gates immediate alerts.
-    from .common import codex_cli
-    from .common.claude_cli import Budget
-    from .claude_advisor import build_snapshot, RULES_PATH
-    codex_budget = Budget(os.path.join(cfg.log_dir, "codex_budget.json"), cfg.codex_max_calls)
-    codex_lock = threading.Lock()   # one child process at a time, no queue of stale alerts
+    # ------------------------------------------------------------------ v2.3.0 Codex add-on (all off the loop via run()) — shown, never applied
+    # Every call goes through the advisor: same budget (AUREON_CODEX_MAX_CALLS), one call at a time, logs/codex_usage.jsonl.
+    from .claude_advisor import build_snapshot
+    codex_wait = float(getattr(cfg, "codex_timeout", 30)) * 2 + 15
+    codex_off = "Codex add-on is off (`AUREON_CODEX=off`) — set review|advisory and restart. Signals and guardian unaffected."
 
-    @tree.command(name="codex", description="Codex CLI status and read-only advisory configuration")
+    @tree.command(name="codex", description="Codex CLI health, login and per-agent attachment (shown only, never applied)")
     async def codex_cmd(inter: discord.Interaction):
         def work():
-            mode = cfg.codex_mode
-            if mode == "off":
-                return Reply(content="CODEX · OFF · set AUREON_CODEX=advisory and restart. Signals and guardian unaffected.")
-            status = codex_cli.version(cfg.codex_bin)
-            auth = codex_cli.login_status(cfg.codex_bin)
-            return Reply(content=(f"CODEX · {mode.upper()} · {status} · {auth}\n"
-                                  f"Local calls today: {codex_budget.used()}/{cfg.codex_max_calls} "
-                                  f"(not your ChatGPT plan quota)\n"
-                                  "Read-only commands: /codex-test and /codex-alert. "
-                                  "Claude and MT5 guardian remain independent."))
+            login = codex.login_status() if codex is not None else None
+            return Reply(card=advisor_card(codex, cfg, agents, "codex", login_line=f"`codex login status`: {login}" if login else None))
         await run(inter, "codex", work, timeout=30)
 
-    @tree.command(name="codex-status", description="Codex CLI login, version and local daily call count")
+    @tree.command(name="codex-status", description="Codex usage today/week/month: calls, tokens, cost, latency, errors")
     async def codex_status_cmd(inter: discord.Interaction):
         def work():
-            if cfg.codex_mode == "off":
-                return Reply(content="CODEX · OFF · set AUREON_CODEX=advisory and restart")
-            return Reply(content=(f"CODEX · {cfg.codex_mode.upper()} · {codex_cli.version(cfg.codex_bin)} · "
-                                  f"{codex_cli.login_status(cfg.codex_bin)}\n"
-                                  f"Local calls: {codex_budget.used()}/{cfg.codex_max_calls} today"))
+            head = (f"mode **{codex.mode.upper()}** · {codex.status().get('version') or 'version not checked (/codex-test)'} · "
+                    f"`codex login status`: {codex.login_status()}") if codex is not None else codex_off
+            return Reply(card=_embed("AUREON · CODEX USAGE", head + "\nCLI reported usage (tokens when `codex exec --json` exposes them; "
+                                     "cost is null unless the CLI reports it).", fields=usage_fields(cfg.log_dir, journal, "codex")))
         await run(inter, "codex-status", work, timeout=30)
 
-    @tree.command(name="codex-test", description="Test Codex CLI using a read-only schema-constrained verdict")
+    @tree.command(name="codex-attach", description="Re-bind the Codex add-on to a symbol's agent at runtime (advisory only)")
+    @app_commands.describe(symbol="e.g. XAUUSD")
+    async def codex_attach_cmd(inter: discord.Interaction, symbol: str):
+        user = inter.user
+        def work():
+            sym = symbol.upper(); ag = agents.get(sym)
+            if ag is None:
+                return Reply(content=f"{sym}: not running (configured: {', '.join(cfg.symbols)})")
+            if codex is None:
+                return Reply(content=codex_off)
+            ok, why = codex.attach(ag, str(user))
+            return Reply(content=(f"🟢 {sym} · {ag.S.display_name} · Codex {why}" if ok else f"⚪ {sym}: cannot attach — {why}"))
+        await run(inter, "codex-attach", work)
+
+    @tree.command(name="codex-detach", description="Detach the Codex add-on from a symbol's agent (cancels its queued jobs)")
+    @app_commands.describe(symbol="e.g. XAUUSD")
+    async def codex_detach_cmd(inter: discord.Interaction, symbol: str):
+        user = inter.user
+        def work():
+            sym = symbol.upper(); ag = agents.get(sym)
+            if ag is None:
+                return Reply(content=f"{sym}: not running (configured: {', '.join(cfg.symbols)})")
+            if codex is None or getattr(ag, "codex", None) is None:
+                return Reply(content=f"{sym}: Codex already detached ({'mode=off' if codex is None else 'not attached'})")
+            n = codex.detach(ag, str(user))
+            return Reply(content=f"⚪ {sym} · {ag.S.display_name} · Codex DETACHED · {n} queued job(s) cancelled · guardian and signals unaffected")
+        await run(inter, "codex-detach", work)
+
+    @tree.command(name="codex-test", description="Verify the Codex CLI login with one schema-constrained verdict (consumes one call)")
     async def codex_test_cmd(inter: discord.Interaction):
         def work():
-            if cfg.codex_mode != "advisory":
-                return Reply(content="Codex disabled: set AUREON_CODEX=advisory and restart")
-            if not codex_lock.acquire(blocking=False):
+            if codex is None:
+                return Reply(content=codex_off)
+            if codex._call_lock.locked():
                 return Reply(content="Codex already busy. No additional job queued.")
-            try:
-                if not codex_budget.take():
-                    return Reply(content="Codex daily local call limit reached.")
-                prompt = ('Return a JSON verdict for event ALERT. No market data is provided, '
-                          'so decision must be SKIP, side null, confidence low, tighten_to null, '
-                          'reason "No market data", evidence empty. JSON only.')
-                r = codex_cli.call(prompt, event="ALERT", binary=cfg.codex_bin,
-                                   model=cfg.codex_model or None, workdir=cfg.codex_workdir,
-                                   timeout=cfg.codex_timeout)
-                journal.log("codex_test", ok=r.ok, latency_s=round(r.latency_s, 2), error=r.error[:120])
-                return Reply(content=(f"Codex test OK · {r.latency_s:.1f}s · {r.verdict['decision']}"
-                                     if r.ok else f"Codex test failed · {r.error}"))
-            finally:
-                codex_lock.release()
-        await run(inter, "codex-test", work, timeout=cfg.codex_timeout + 15)
+            codex.refresh_version()
+            prompt = ('Return a JSON verdict for event ALERT. No market data is provided, '
+                      'so decision must be SKIP, side null, confidence low, tighten_to null, '
+                      'reason "No market data", evidence empty. JSON only.')
+            r = codex._call(prompt, codex.entry_model, "ALERT", kind_override="test")
+            if r is None:
+                return Reply(content="⛔ daily Codex budget used — no call made")
+            journal.log("codex_test", ok=r.ok, latency_s=round(r.latency_s, 2), error=(r.error or "")[:120])
+            return Reply(content=(f"🟢 Codex test OK · {r.latency_s:.1f}s · {r.verdict['decision']}" if r.ok
+                                  else f"🔴 Codex test failed · {r.error}"), source="live")
+        await run(inter, "codex-test", work, timeout=codex_wait)
+
+    @tree.command(name="codex-review", description="Request the Codex day review; uses Codex CLI quota")
+    @app_commands.describe(date="YYYY-MM-DD (IST), default today")
+    async def codex_review_cmd(inter: discord.Interaction, date: str = ""):
+        def work():
+            if codex is None:
+                return Reply(content=codex_off)
+            day = date.strip() or None
+            if day:
+                datetime.strptime(day, "%Y-%m-%d")
+            text = codex.daily_review(day)
+            return Reply(content=f"CODEX REVIEW {day or 'today'}:\n{text}"[:1900], source="live")
+        await run(inter, "codex-review", work, timeout=max(codex_wait, 150))
 
     @tree.command(name="codex-alert", description="Read-only Codex evaluation of a frozen closed-bar snapshot")
     @app_commands.describe(symbol="XAUUSD or XAGUSD (default: primary)", side="BUY or SELL")
     async def codex_alert_cmd(inter: discord.Interaction, symbol: str = "", side: str = "BUY"):
         def work():
-            if cfg.codex_mode != "advisory":
-                return Reply(content="Codex disabled: set AUREON_CODEX=advisory and restart")
+            if codex is None:
+                return Reply(content=codex_off)
             sym = (symbol or cfg.symbols[0]).upper()
             direction = side.upper()
             if direction not in ("BUY", "SELL"):
@@ -1040,36 +1111,52 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             age = _time.time() - (bar_t - float(ag.off) * 3600)
             if age < -60 or age > 600:
                 return Reply(content=f"{sym}: cached bar stale or clock offset invalid; no Codex call")
-            if not codex_lock.acquire(blocking=False):
+            if codex._call_lock.locked():
                 return Reply(content="Codex busy; no new snapshot queued. Aureon alerts unaffected.")
-            try:
-                if not codex_budget.take():
-                    return Reply(content="Codex local daily call limit reached.")
-                snap = build_snapshot(ag, "ALERT", direction, bar_t, frame)
-                with open(RULES_PATH, encoding="utf-8") as source:
-                    rules = source.read()
-                prompt = (rules + "\n\nRead-only second opinion. Never propose executing orders. "
-                          "Event ALERT. Return exactly one JSON object following the decision contract.\n"
-                          + json.dumps(snap, default=str))
-                r = codex_cli.call(prompt, event="ALERT", binary=cfg.codex_bin,
-                                   model=cfg.codex_model or None, workdir=cfg.codex_workdir,
-                                   timeout=cfg.codex_timeout)
-                elapsed = _time.time() - (bar_t - float(ag.off) * 3600)
-                # Research verdict only. Never attach it to a live trade or alert's action buttons.
-                v = r.verdict or {}
-                journal.log("codex_alert", symbol=sym, side=direction, bar_t=bar_t,
-                            verdict=v if r.ok else None, error=r.error[:120],
-                            latency_s=round(r.latency_s, 2), stale=elapsed > 300)
-                if not r.ok:
-                    return Reply(content=f"Codex unavailable · {r.error} · original Aureon signals unaffected")
-                stale = " · STALE (journal only)" if elapsed > 300 else " · ADVISORY ONLY"
-                return Reply(content=(f"CODEX · {sym} · {direction} · {v['decision']} "
-                                      f"({v['confidence']}){stale}\n"
-                                      f"{v['reason']}\nbar timestamp: {snap.get('bar_time_ist')} IST · "
-                                      f"CLI {r.latency_s:.1f}s · no orders or SL changes"))
-            finally:
-                codex_lock.release()
-        await run(inter, "codex-alert", work, timeout=cfg.codex_timeout + 15)
+            snap = build_snapshot(ag, "ALERT", direction, bar_t, frame)
+            r = codex._call(codex.prompt_for(snap), codex.entry_model, "ALERT", kind_override="alert")
+            if r is None:
+                return Reply(content="Codex local daily call limit reached.")
+            elapsed = _time.time() - (bar_t - float(ag.off) * 3600)
+            # Research verdict only. Never attached to a live trade or an alert's action buttons.
+            v = r.verdict or {}
+            journal.log("codex_alert", symbol=sym, side=direction, bar_t=bar_t,
+                        verdict=v if r.ok else None, error=(r.error or "")[:120],
+                        latency_s=round(r.latency_s, 2), stale=elapsed > 300)
+            if not r.ok:
+                return Reply(content=f"Codex unavailable · {r.error} · original Aureon signals unaffected")
+            stale = " · STALE (journal only)" if elapsed > 300 else " · SHOWN ONLY"
+            from . import advisor_board
+            return Reply(content=(f"{advisor_board.verdict_line('codex', v)}{stale}\n{sym} · {direction} · bar {snap.get('bar_time_ist')} IST · "
+                                  f"CLI {r.latency_s:.1f}s · no orders or SL changes"))
+        await run(inter, "codex-alert", work, timeout=codex_wait)
+
+    @tree.command(name="codex-rules", description="Show current Codex rule proposals")
+    async def codex_rules_cmd(inter: discord.Interaction):
+        await run(inter, "codex-rules", lambda: _rules_reply("codex"))
+
+    @tree.command(name="codex-rules-approve", description="Approve one Codex rule proposal into advisor_rules.md; operator action")
+    @app_commands.describe(n="proposal number from the CODEX RULE PROPOSALS card")
+    async def codex_rules_approve_cmd(inter: discord.Interaction, n: int):
+        user = inter.user
+        await run(inter, "codex-rules-approve", lambda: _approve_reply("codex", n, user))
+
+    def _rules_reply(source: str) -> Reply:
+        from . import compare
+        d = compare.load_proposals(cfg.log_dir, source); props = d.get("proposals") or []
+        if not props:
+            return Reply(content=f"no {source} rule proposals yet (made on Saturday with the COMPARE card)")
+        lines = [f"{source} proposals · {d.get('week')} · made {d.get('made')} · rules {compare.rules_hash()}"]
+        for p in props:
+            lines.append(f"`{p['n']}` {p['line']} — {p['support']}" + (f" · ✅ approved {p['approved']}" if p.get("approved") else ""))
+        return Reply(content="\n".join(lines)[:1900])
+
+    def _approve_reply(source: str, n: int, user) -> Reply:
+        from . import compare
+        line = compare.approve_proposal(n, cfg.log_dir, source=source)
+        journal.log(f"{source}_rule_approved", n=n, line=line, by=str(user), rules_hash=compare.rules_hash())
+        return Reply(content=f"appended to advisor_rules.md (shared by both advisors):\n{line}\nrules hash now {compare.rules_hash()} · "
+                             "takes effect on the next advisor call")
 
     # ------------------------------------------------------------------ v2.2.0 command directory, taken from actual tree registrations
     _help = {
@@ -1097,11 +1184,23 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             "claude-review": "Review day — consumes usage",
             "claude-rules": "Pending rule proposals — read-only",
             "claude-rules-approve": "Approve rule proposal — manual operator",
-            "claude-report": "Performance report — historical, read-only",
+            "claude-report": "Alias of /advisor-report — historical, read-only",
+        },
+        "Codex": {
+            "codex": "Health, login and attachment — read-only; verdicts shown, never applied",
+            "codex-status": "Usage and spend — automatic ledger",
+            "codex-test": "One CLI test — consumes usage",
+            "codex-review": "Review day — consumes usage",
+            "codex-alert": "Frozen-snapshot verdict on demand — consumes usage",
+            "codex-attach": "Re-bind to a symbol — operator",
+            "codex-detach": "Detach from a symbol — operator",
+            "codex-rules": "Pending Codex rule proposals — read-only",
+            "codex-rules-approve": "Approve Codex rule proposal — manual operator",
         },
         "Reports": {
             "report": "Weekly trade summary — automatic",
-            "compare": "Detector, Claude, trader outcomes — automatic",
+            "compare": "Detector, Claude, Codex, trader outcomes — automatic",
+            "advisor-report": "Claude and Codex performance, head-to-head — historical, read-only",
             "compare-breakdown": "Compare by signal/session — automatic",
             "git-history": "Commit history — automatic",
             "pull-history": "MT5 history — automatic",
@@ -1125,44 +1224,26 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
     @tree.command(name="claude-status", description="Claude usage today/week/month: calls, tokens, cost, latency, errors")
     async def claude_status_cmd(inter: discord.Interaction):
         def work():
-            from .claude_usage import summarize
-            fields = []
-            for span in ("today", "week", "month"):
-                x = summarize(cfg.log_dir, span)
-                now = datetime.now(IST)
-                start = {
-                    "today": now.replace(hour=0, minute=0, second=0, microsecond=0),
-                    "week": (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0),
-                    "month": now.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
-                }[span]
-                records = journal.read(int(start.timestamp()))
-                stale = sum(r.get("event") == "claude_verdict" and r.get("stale") for r in records)
-                fast_cancel = sum(r.get("event") == "claude_fast_exit_cancel" for r in records)
-                by_kind = ", ".join(f"{k}:{v}" for k, v in sorted(x["by_kind"].items())) or "none"
-                verdicts = ", ".join(f"{k}:{v}" for k, v in sorted(x["verdicts"].items())) or "none"
-                val = (f"Calls {x['calls']} · ok {x['ok']} · errors {x['errors']} · timeout {x['timeouts']}\n"
-                       f"Kinds {by_kind}\nVerdicts {verdicts}\n"
-                       f"Tokens in/out {x['input_tokens']}/{x['output_tokens']} · "
-                       f"cache read/write {x['cache_read_input_tokens']}/{x['cache_creation_input_tokens']}\n"
-                       f"CLI reported cost ${x['cost_usd']:.4f} · "
-                       f"avg/max {x['avg_latency']:.1f}/{x['max_latency']:.1f}s · "
-                       f"STALE {stale} · fast-exit cancels {fast_cancel}")
-                fields.append(_field(span.title(), val[:1024], False))
-            return Reply(card=_embed("AUREON · CLAUDE USAGE", "CLI reported usage; not independently priced at model list rates.", fields=fields))
+            return Reply(card=_embed("AUREON · CLAUDE USAGE", "CLI reported usage; not independently priced at model list rates.",
+                                     fields=usage_fields(cfg.log_dir, journal, "claude")))
         await run(inter, "claude-status", work)
 
-    @tree.command(name="claude-report", description="Claude graded performance and usage for this week or month")
+    def _advisor_report_reply(period: str) -> Reply:
+        from .claude_report import advisor_report
+        if period not in ("week", "month"):
+            return Reply(content="Choose period: week or month")
+        r = advisor_report(cfg, agents, journal, period)
+        return Reply(card=_embed(r["title"], r["description"], fields=r["fields"][:25], footer=f"v{VERSION} · as of now · partial grading possible"))
+
+    @tree.command(name="advisor-report", description="Claude and Codex graded performance, head-to-head and usage (week or month)")
+    @app_commands.describe(period="week or month")
+    async def advisor_report_cmd(inter: discord.Interaction, period: str = "week"):
+        await run(inter, "advisor-report", lambda: _advisor_report_reply(period), timeout=40)
+
+    @tree.command(name="claude-report", description="Alias of /advisor-report (Claude and Codex, week or month)")
     @app_commands.describe(period="week or month")
     async def claude_report_cmd(inter: discord.Interaction, period: str = "week"):
-        def work():
-            from .claude_report import report
-            if period not in ("week", "month"):
-                return Reply(content="Choose period: week or month")
-            r = report(cfg, agents, journal, period)
-            em = _embed(r["title"], "Advisory scorecard; ungraded signals excluded. No rules changed.",
-                        fields=r["fields"][:25], footer=f"v{VERSION} · as of now · partial grading possible")
-            return Reply(card=em)
-        await run(inter, "claude-report", work, timeout=40)
+        await run(inter, "claude-report", lambda: _advisor_report_reply(period), timeout=40)
 
     # ------------------------------------------------------------------ v2.2.0 admin controls
     from . import ops
@@ -1264,27 +1345,13 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
 
     @tree.command(name="claude-rules", description="Show current Claude rule proposals")
     async def claude_rules_cmd(inter: discord.Interaction):
-        def work():
-            from . import compare
-            d = compare.load_proposals(cfg.log_dir); props = d.get("proposals") or []
-            if not props:
-                return Reply(content="no rule proposals yet (made on Saturday with the COMPARE card)")
-            lines = [f"proposals · {d.get('week')} · made {d.get('made')} · rules {compare.rules_hash()}"]
-            for p in props:
-                lines.append(f"`{p['n']}` {p['line']} — {p['support']}" + (f" · ✅ approved {p['approved']}" if p.get("approved") else ""))
-            return Reply(content="\n".join(lines)[:1900])
-        await run(inter, "claude-rules", work)
+        await run(inter, "claude-rules", lambda: _rules_reply("claude"))
 
-    @tree.command(name="claude-rules-approve", description="Approve one Claude rule proposal; operator action")
+    @tree.command(name="claude-rules-approve", description="Approve one Claude rule proposal into advisor_rules.md; operator action")
     @app_commands.describe(n="proposal number from the CLAUDE RULE PROPOSALS card")
     async def claude_rules_approve_cmd(inter: discord.Interaction, n: int):
         user = inter.user
-        def work():
-            from . import compare
-            line = compare.approve_proposal(n, cfg.log_dir)
-            journal.log("claude_rule_approved", n=n, line=line, by=str(user), rules_hash=compare.rules_hash())
-            return Reply(content=f"appended to claude_rules.md:\n{line}\nrules hash now {compare.rules_hash()} · takes effect on the next Claude call")
-        await run(inter, "claude-rules-approve", work)
+        await run(inter, "claude-rules-approve", lambda: _approve_reply("claude", n, user))
 
     # ------------------------------------------------------------------ v1.11.0 weekly compare (measurement only)
     def _compare_reply(days: int, breakdown: bool) -> Reply:
