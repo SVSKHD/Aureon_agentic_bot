@@ -376,6 +376,11 @@ class ClaudeAdvisor:
         with self._call_lock:
             res = self.caller(prompt, model, event=event, bin=self.cfg.claude_bin, workdir=self.cfg.claude_workdir,
                               timeout=self.cfg.claude_timeout)
+        from .claude_usage import append as append_usage
+        try:
+            append_usage(self.cfg.log_dir, {"pullback": "pullback", "ALERT": "alert", "review": "review", "test": "test"}.get(event, "entry"), res)
+        except OSError as exc:
+            telemetry.info(f"Claude usage ledger unavailable: {exc!r}")
         self.stats["latencies"].append(res.latency_s); self.stats["last_latency"] = res.latency_s
         kind = {"pullback": "pullback", "ALERT": "alert", "review": "review", "test": "test"}.get(event, "entry")
         self.stats["calls_by_event"][kind] = self.stats["calls_by_event"].get(kind, 0) + 1
