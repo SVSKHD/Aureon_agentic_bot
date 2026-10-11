@@ -2,6 +2,24 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.1.0 — 2026-10-11  (run.py --claude shadow replay)
+- `run.py --claude entry|entry+pullback [--claude-max N=60] [--claude-sleep S=2] [--claude-model id] [--claude-refresh]` for both modes.
+  Without `--claude` nothing changes. For every ENTER bar the replay produced (ema2050 ENTER; ema5080 P / CROSS / RE) — and, with
+  `entry+pullback`, every pullback event inside a replayed trade (the live trigger, once per pullback, re-armed after a new peak) — the
+  snapshot is built with `claude_advisor.build_snapshot` on `df.iloc[:bar+1]` only (asserted: the cut frame ends at the signal bar; for
+  ema2050 the per-bar analysis is rebuilt on the cut frame), with crosses_today / day_pnl_pts / trades_today recomputed for the bar's own
+  server day. The CLI is called exactly as live (`claude_cli.call`, same rules prompt, same reply contract with p_win / evidence,
+  `AUREON_CLAUDE_BIN`, `ANTHROPIC_API_KEY` stripped). Verdicts are recorded, never applied; the "Detector-filtered-by-Claude" column drops
+  Claude's SKIPs and, in the pullback variant, applies TIGHTEN (tighter, sane SL hit on the M5 bars) / CLOSE (in profit only).
+- Cache `out/claude_replay_<mode>_<symbol>.jsonl` keyed by (bar_t, event, model, rules hash); re-runs make zero calls; `--claude-refresh`
+  forces calls; `--claude-max` never exceeded, unscored bars counted and continued from the cache on the next run. The live daily budget
+  file is not touched (the replay has its own cap).
+- Report `out/claude_replay_<mode>_<symbol>.md` + console: groups in the compare.card() shape (Detector · all | Claude TAKE | Claude SKIP |
+  Detector-filtered-by-Claude: n, win %, expectancy, total, stops, worst streak, max DD), SKIP precision, p_win calibration table, per-month
+  Detector vs Claude-filtered, disagreement list (date, side, detector pts, verdict, reason, evidence), pullback verdict counts.
+- `aureon_mt5/claude_replay.py` (ShadowAgent, cut_frame, snapshot_for_bar, ShadowReplay, calibration, report). 8 new tests (219).
+- Strategy rules changed: NO.
+
 ## v2.0.2 — 2026-10-11  (/alert: two verdicts · placement feedback · /pull-history · /git-history · command sync)
 - `/alert` card (`alerts.reached_card`) rebuilt as five blocks: PRICE · EMA · TREND · **AGENT VERDICT** (deterministic, the mode's own rules on
   the last closed bar, with the SL the guardian would set / early lock / secure) · **CLAUDE VERDICT** (placeholder `⏳ asking Claude (<model>) …`,
