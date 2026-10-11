@@ -918,7 +918,13 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
 
     @tree.command(name="codex-status", description="Codex CLI login, version and local daily call count")
     async def codex_status_cmd(inter: discord.Interaction):
-        await codex_cmd(inter)
+        def work():
+            if cfg.codex_mode == "off":
+                return Reply(content="CODEX · OFF · set AUREON_CODEX=advisory and restart")
+            return Reply(content=(f"CODEX · {cfg.codex_mode.upper()} · {codex_cli.version(cfg.codex_bin)} · "
+                                  f"{codex_cli.login_status(cfg.codex_bin)}\\n"
+                                  f"Local calls: {codex_budget.used()}/{cfg.codex_max_calls} today"))
+        await run(inter, "codex-status", work, timeout=30)
 
     @tree.command(name="codex-test", description="Test Codex CLI using a read-only schema-constrained verdict")
     async def codex_test_cmd(inter: discord.Interaction):
