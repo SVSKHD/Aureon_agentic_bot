@@ -1,4 +1,5 @@
-"""Append-only Claude CLI usage ledger (IST windows, restart-safe)."""
+"""Append-only advisor CLI usage ledger (IST windows, restart-safe): logs/claude_usage.jsonl, v2.3.0 logs/codex_usage.jsonl.
+Token / cost fields are whatever the CLI JSON exposed; missing → 0 tokens, cost null."""
 from __future__ import annotations
 import json
 import os
@@ -10,20 +11,25 @@ IST = timezone(timedelta(hours=5, minutes=30))
 _lock = threading.Lock()
 KEYS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
 
-def append(log_dir, kind, result):
+def ledger_path(log_dir, source="claude"):
+    return os.path.join(log_dir, f"{source}_usage.jsonl")
+
+def append(log_dir, kind, result, source="claude"):
     os.makedirs(log_dir, exist_ok=True)
-    usage = getattr(result, "usage", None) or {}
+    usage = getattr(result, "usage", None)          # None = the CLI exposed no token counts → null in the row
     row = {"ts": time.time(), "kind": kind, "model": getattr(result, "model", "") or "",
            "latency": float(result.latency_s), "ok": bool(result.ok),
            "error": (result.error or "")[:160], "timed_out": bool(result.timed_out),
            "decision": (result.verdict or {}).get("decision"),
            "total_cost_usd": getattr(result, "total_cost_usd", None),
-           **{k: int(usage.get(k, 0) or 0) for k in KEYS}}
-    with _lock, open(os.path.join(log_dir, "claude_usage.jsonl"), "a", encoding="utf-8") as f:
+           **{k: (int(usage.get(k, 0) or 0) if isinstance(usage, dict) else None) for k in KEYS}}
+    if source != "claude":
+        row["source"] = source
+    with _lock, open(ledger_path(log_dir, source), "a", encoding="utf-8") as f:
         f.write(json.dumps(row, default=str) + "\n")
     return row
 
-def summarize(log_dir, period="today", now=None):
+def summarize(log_dir, period="today", now=None, source="claude"):
     now = now or datetime.now(IST)
     since = {
         "today": now.replace(hour=0, minute=0, second=0, microsecond=0),
@@ -35,7 +41,7 @@ def summarize(log_dir, period="today", now=None):
               **{k: 0 for k in KEYS}}
     latency_sum = 0.
     try:
-        with open(os.path.join(log_dir, "claude_usage.jsonl"), encoding="utf-8") as f:
+        with open(ledger_path(log_dir, source), encoding="utf-8") as f:
             for line in f:
                 try: r = json.loads(line)
                 except (ValueError, TypeError): continue

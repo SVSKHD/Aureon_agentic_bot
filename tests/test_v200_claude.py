@@ -189,7 +189,7 @@ def test_rule_proposals_from_wrong_calls_and_approval(tmp_path):
     assert rules.read_text(encoding="utf-8") == "rules\n"                      # nothing changes without approval
     line = compare.approve_proposal(1, str(tmp_path), rules_path=str(rules))
     text = rules.read_text(encoding="utf-8")
-    assert text.endswith(line + "\n") and line.startswith("- [approved 20") and "prefer SKIP when crosses_today >= 6" in line
+    assert text.endswith(line + "\n") and line.startswith("- [claude] [approved 20") and "prefer SKIP when crosses_today >= 6" in line
     with pytest.raises(ValueError):
         compare.approve_proposal(1, str(tmp_path), rules_path=str(rules))      # not twice
     with pytest.raises(ValueError):

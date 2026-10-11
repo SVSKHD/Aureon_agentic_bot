@@ -4,6 +4,7 @@
   python run.py --mode ema2050 --from 2026-07-01 --to 2026-10-09 --lot 1  # day-by-day replay + research summary + month table
   python run.py --mode ema2050 --from 2026-07-01 --to 2026-10-09 --claude entry --claude-max 60   # v2.1.0 shadow replay: Claude asked
                                                                                 # at every ENTER bar exactly as live, recorded never applied
+  python run.py --mode ema2050 --from 2026-07-01 --to 2026-07-31 --claude entry --codex entry   # v2.3.0: both advisors + SPLIT list
 """
 from __future__ import annotations
 
@@ -74,19 +75,31 @@ def research_summary(days: list[dict], S, symbol: str, lot: float, point_value: 
 
 
 def shadow_replay(a, S, off, news, days: list[dict], title: str):
-    """v2.1.0 --claude: the shadow run over the replayed days. Prints and writes out/claude_replay_<mode>_<symbol>.md."""
-    from aureon_mt5.claude_replay import ShadowReplay, write_report
+    """v2.1.0 --claude / v2.3.0 --codex: the shadow run(s) over the replayed days. Prints and writes out/<advisor>_replay_<mode>_<symbol>.md;
+    with both flags also out/advisors_replay_<mode>_<symbol>.md (filtered-by-BOTH-agree + SPLIT list)."""
+    from aureon_mt5.claude_replay import ShadowReplay, combined, combined_text, write_combined, write_report
     from aureon_mt5.config import Config
     cfg = Config()
-    sr = ShadowReplay(cfg, S, a.symbol, off, news, out_dir=a.out, model=a.claude_model, max_calls=a.claude_max, sleep_s=a.claude_sleep,
-                      refresh=a.claude_refresh, variant=a.claude)
-    print(f"\nCLAUDE SHADOW REPLAY · model {sr.model} · bin {cfg.claude_bin} · cache {sr.path} ({len(sr.cache)} cached verdicts) · max {a.claude_max} calls")
-    for d in days:
-        sr.score_day(d["day"], d["df"], d["journeys"])
-    sc = sr.score()
-    text, path = write_report(sr, sc, title)
-    print("\n" + text); print(path)
-    return sc
+    runs, scores = {}, {}
+    for adv in ("claude", "codex"):
+        variant = getattr(a, adv, None)
+        if not variant:
+            continue
+        sr = ShadowReplay(cfg, S, a.symbol, off, news, out_dir=a.out, model=getattr(a, f"{adv}_model"), max_calls=getattr(a, f"{adv}_max"),
+                          sleep_s=getattr(a, f"{adv}_sleep"), refresh=getattr(a, f"{adv}_refresh"), variant=variant, advisor=adv)
+        binary = cfg.claude_bin if adv == "claude" else cfg.codex_bin
+        print(f"\n{adv.upper()} SHADOW REPLAY · model {sr.model or 'CLI default'} · bin {binary} · cache {sr.path} "
+              f"({len(sr.cache)} cached verdicts) · max {getattr(a, f'{adv}_max')} calls")
+        for d in days:
+            sr.score_day(d["day"], d["df"], d["journeys"])
+        sc = sr.score()
+        text, path = write_report(sr, sc, title)
+        print("\n" + text); print(path)
+        runs[adv], scores[adv] = sr, sc
+    if len(runs) == 2:
+        text = combined_text(combined(runs["claude"], runs["codex"]), title)
+        print("\n" + text); print(write_combined(a.out, S.name, a.symbol, text))
+    return scores
 
 
 def trade_line(j, off):
@@ -110,6 +123,12 @@ def main():
     ap.add_argument("--claude-sleep", type=float, default=2.0, help="seconds between calls (default 2)")
     ap.add_argument("--claude-model", help="model id (default AUREON_CLAUDE_ENTRY_MODEL)")
     ap.add_argument("--claude-refresh", action="store_true", help="ignore the verdict cache and call again")
+    # v2.3.0 the same shadow replay through the Codex CLI (`codex exec`, CLI login only); own cache, cap and pacing
+    ap.add_argument("--codex", choices=["entry", "entry+pullback"], help="ask Codex at every ENTER bar (and pullbacks) exactly as live; recorded, never applied")
+    ap.add_argument("--codex-max", type=int, default=60, help="max Codex calls per run (default 60)")
+    ap.add_argument("--codex-sleep", type=float, default=2.0, help="seconds between Codex calls (default 2)")
+    ap.add_argument("--codex-model", help="model id (default AUREON_CODEX_MODEL, else the CLI default)")
+    ap.add_argument("--codex-refresh", action="store_true", help="ignore the Codex verdict cache and call again")
     a = ap.parse_args()
     try:
         S = get_strategy(resolve_mode(a.mode))
@@ -140,7 +159,7 @@ def main():
             print("no bars in that range"); sys.exit(1)
         block = research_summary(days, S, a.symbol, a.lot, pv, off)
         print("\n" + block)
-        if a.claude:
+        if a.claude or a.codex:
             shadow_replay(a, S, off, news, days, f"{a.symbol} · {d0} → {d1}")
         tag = f"_{d0:%Y%m%d}_{d1:%Y%m%d}_{S.name}"
         with open(os.path.join(a.out, f"{a.symbol}{tag}.json"), "w") as f:
@@ -170,7 +189,7 @@ def main():
                 print(f"    {datetime.fromtimestamp(e.time - off * 3600, tz=IST):%H:%M} IST  {e.label:<9} {e.direction:<4} {e.reason}")
         if rng:
             print("\n" + research_summary([{"day": rng["day"], "journeys": m5["journeys"], "summary": sm}], S, a.symbol, a.lot, pv, off))
-    if a.claude:
+    if a.claude or a.codex:
         shadow_replay(a, S, off, news, [{"day": rng["day"] if rng else date.today(), "journeys": m5["journeys"], "summary": sm, "df": m5["df"]}],
                       f"{a.symbol} · {rng['day'] if rng else 'latest bars'}")
     with open(os.path.join(a.out, f"{a.symbol}{tag}.json"), "w") as f:

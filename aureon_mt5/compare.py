@@ -1,4 +1,5 @@
 """v1.11.0 — weekly compare: Detector vs Claude vs Me on the SAME signals, plus Claude's pullback calls vs the guardian.
+v2.3.0 — fourth column: Codex (same metrics), Claude-vs-Codex agreement and "when they SPLIT, who was right".
 
 Measurement only: nothing here changes detection, the guardian, Claude calls or trades.
 Grading is the scorecard's (reports.graded_signals → reports.scorecard); this module never grades a signal itself.
@@ -25,11 +26,14 @@ ENTRY_EVENTS = ("P", "CROSS", "RE", "ENTER")
 WINS = ("WIN20", "WIN10")
 SESSIONS = {"asia": "Asia", "london": "London", "ny": "New York", "off": "Off-hours"}
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RULES_PATH = os.path.join(ROOT, "prompts", "claude_rules.md")
+from .common.rules import RULES_PATH              # v2.3.0: shared advisor_rules.md (claude_rules.md = alias)
 
 ROWS = [("detector", "Detector · all"), ("claude_take", "Claude · TAKE"), ("claude_skip", "Claude · SKIP (avoided)"),
+        ("codex_take", "Codex · TAKE"), ("codex_skip", "Codex · SKIP (avoided)"),
         ("me_taken", "Me · TAKEN"), ("me_skipped", "Me · SKIPPED"),
         ("dis_ct_ms", "Claude TAKE · me SKIP"), ("dis_cs_mt", "Claude SKIP · me TAKE")]
+SOURCES = ("claude", "codex")                         # v2.3.0: the two advisors (journal event <source>_verdict, key <source>_event)
+LABELS = {"claude": "Claude", "codex": "Codex"}
 
 
 # ============================================================================= rows (one per detector signal)
@@ -47,10 +51,16 @@ class Row:
     claude: str | None = None     # TAKE | SKIP | None (= no verdict)
     me: str = "SKIPPED"           # TAKEN | SKIPPED
     me_via: str = ""              # button | mt5
+    codex: str | None = None      # v2.3.0: TAKE | SKIP | None (last: Row(...) is built positionally)
 
 
-def _valid_entry_verdict(v: dict) -> bool:
-    return v.get("decision") in ("TAKE", "SKIP") and not v.get("stale") and v.get("claude_event") in ENTRY_EVENTS
+def _ev(v: dict, source: str = "claude"):
+    """The advisor event of a verdict row (claude_event / codex_event)."""
+    return v.get(f"{source}_event")
+
+
+def _valid_entry_verdict(v: dict, source: str = "claude") -> bool:
+    return v.get("decision") in ("TAKE", "SKIP") and not v.get("stale") and _ev(v, source) in ENTRY_EVENTS
 
 
 def build_rows(records: list[dict], graded: list, since: int, until: int, off: float) -> list[Row]:
@@ -59,10 +69,11 @@ def build_rows(records: list[dict], graded: list, since: int, until: int, off: f
     sigs = [r for r in records if r.get("event") == "signal" and r.get("mode", STRATEGY) in KINDS_BY_MODE
             and r.get("signal_kind") in KINDS_BY_MODE[r.get("mode", STRATEGY)] and since <= r["t"] < until and r.get("bar") is not None]
     grades = {(g.symbol, g.kind, g.side, int(g.bar)): g for g in graded}
-    verdicts = {}
+    verdicts = {src: {} for src in SOURCES}
     for v in records:
-        if v.get("event") == "claude_verdict" and v.get("claude_event") in ENTRY_EVENTS:
-            verdicts[(v.get("symbol"), v.get("claude_event"), v.get("bar"))] = v          # latest wins
+        for src in SOURCES:
+            if v.get("event") == f"{src}_verdict" and _ev(v, src) in ENTRY_EVENTS:
+                verdicts[src][(v.get("symbol"), _ev(v, src), v.get("bar"))] = v        # latest wins
     decisions = {}
     for d in records:
         if d.get("event") == "decision" and d.get("decision") in ("TAKE", "SKIP", "EXPIRED"):
@@ -84,9 +95,10 @@ def build_rows(records: list[dict], graded: list, since: int, until: int, off: f
                 row.status = "OPEN"
             elif g.points is not None:
                 row.status = "GRADED"; row.points = float(g.points)
-        v = verdicts.get((row.symbol, kind, row.bar))
-        if v is not None and _valid_entry_verdict(v):
-            row.claude = v["decision"]
+        for src in SOURCES:
+            v = verdicts[src].get((row.symbol, kind, row.bar))
+            if v is not None and _valid_entry_verdict(v, src):
+                setattr(row, src, v["decision"])
         if decisions.get((row.symbol, row.bar)) == "TAKE":
             row.me, row.me_via = "TAKEN", "button"
         rows.append(row)
@@ -150,7 +162,30 @@ def groups(rows: list[Row]) -> dict[str, list[Row]]:
         "dis_ct_ms": [r for r in rows if r.claude == "TAKE" and r.me == "SKIPPED"],
         "dis_cs_mt": [r for r in rows if r.claude == "SKIP" and r.me == "TAKEN"],
         "no_verdict": [r for r in rows if r.claude is None],
+        # v2.3.0
+        "codex_take": [r for r in rows if r.codex == "TAKE"],
+        "codex_skip": [r for r in rows if r.codex == "SKIP"],
+        "codex_no_verdict": [r for r in rows if r.codex is None],
+        "both": [r for r in rows if r.claude is not None and r.codex is not None],
+        "split": [r for r in rows if r.claude is not None and r.codex is not None and r.claude != r.codex],
+        "both_take": [r for r in rows if r.claude == "TAKE" and r.codex == "TAKE"],
     }
+
+
+def head_to_head(g: dict[str, list[Row]]) -> dict:
+    """v2.3.0 Claude vs Codex on the signals both judged. A SPLIT is won by the TAKE side when the if-taken result was a gain
+    and by the SKIP side when it was a loss; points = |if-taken result| credited to the side that was right."""
+    both, split = g["both"], g["split"]
+    out = {"both": len(both), "agree": len(both) - len(split), "agree_pct": round(100 * (len(both) - len(split)) / len(both), 1) if both else None,
+           "split": len(split), "claude_right": 0, "claude_pts": 0.0, "codex_right": 0, "codex_pts": 0.0, "tie": 0, "ungraded": 0}
+    for r in split:
+        if r.status != "GRADED" or r.points is None:
+            out["ungraded"] += 1; continue
+        if r.points == 0:
+            out["tie"] += 1; continue
+        winner = ("claude" if r.claude == "TAKE" else "codex") if r.points > 0 else ("claude" if r.claude == "SKIP" else "codex")
+        out[f"{winner}_right"] += 1; out[f"{winner}_pts"] = round(out[f"{winner}_pts"] + abs(r.points), 2)
+    return out
 
 
 # ============================================================================= verdict lines
@@ -169,6 +204,9 @@ def verdict(m: dict[str, Metrics]) -> list[str]:
     else:
         line = "➖ Mixed — no clear edge yet."
     out = [line]
+    cx_take, cx_skip = m.get("codex_take"), m.get("codex_skip")
+    if cx_take is not None and cx_skip is not None and (cx_take.n + cx_skip.n):
+        out.append(advisor_line("Codex", cx_take, cx_skip, det))
     if me.n:
         d = round(me.expectancy - det.expectancy, 2)
         out.append(f"You: your filtering {'added' if d >= 0 else 'cost'} {abs(d):.1f} pts per signal "
@@ -176,6 +214,21 @@ def verdict(m: dict[str, Metrics]) -> list[str]:
     else:
         out.append("You: none of the graded signals were taken.")
     return out
+
+
+def advisor_line(label: str, take: Metrics, skip: Metrics, det: Metrics) -> str:
+    """v2.3.0: the same three tests as the Claude verdict, for any advisor."""
+    n = take.n + skip.n
+    if n < MIN_N or det.n < MIN_N:
+        return f"{label}: not enough data yet — {min(n, det.n)}/{MIN_N} signals."
+    c1 = skip.n > 0 and skip.expectancy < 0
+    c2 = take.n > 0 and take.expectancy > det.expectancy
+    c3 = take.total >= 0.8 * det.total
+    if c1 and c2 and c3:
+        return f"✅ {label} helps — its skips lost, its takes beat the detector and kept ≥80% of the points."
+    if skip.n > 0 and not c1:
+        return f"⚠️ {label} is skipping good trades — keep it as reviewer only."
+    return f"➖ {label}: mixed — no clear edge yet."
 
 
 def disagreements(g: dict[str, list[Row]]) -> dict:
@@ -217,12 +270,12 @@ def _tighten_hit(bars, side: str, level: float, after: int, before: int | None) 
     return bool((seg["low"] <= level).any()) if side == "long" else bool((seg["high"] >= level).any())
 
 
-def pullbacks(records: list[dict], since: int, until: int, off: float, bars=None) -> PullbackScore:
+def pullbacks(records: list[dict], since: int, until: int, off: float, bars=None, source: str = "claude") -> PullbackScore:
     closes = {r.get("ticket"): r for r in records if r.get("event") == "closed"}
     exits = {r.get("ticket"): r for r in records if r.get("event") == "exit"}
     ps = PullbackScore()
     for v in records:
-        if v.get("event") != "claude_verdict" or v.get("claude_event") != "pullback" or not (since <= v["t"] < until):
+        if v.get("event") != f"{source}_verdict" or _ev(v, source) != "pullback" or not (since <= v["t"] < until):
             continue
         dec = v.get("decision")
         if dec not in ("HOLD", "TIGHTEN", "CLOSE"):
@@ -263,7 +316,7 @@ def breakdown(rows: list[Row]) -> dict[str, dict[str, Metrics]]:
                        [(s, lambda r, s=s: r.session == s) for s in ("Asia", "London", "New York")]:
         sub = [r for r in rows if pick(r)]
         g = groups(sub)
-        out[label] = {k: metrics(g[k]) for k in ("detector", "claude_take", "me_taken")}
+        out[label] = {k: metrics(g[k]) for k in ("detector", "claude_take", "codex_take", "me_taken")}
     return out
 
 
@@ -277,7 +330,8 @@ def chart(rows: list[Row], path: str, off: float, title: str = "", end_ts: int |
         import matplotlib.dates as mdates
     except Exception:
         return None
-    series = [("detector", "Detector · all", "#95A5A6"), ("claude_take", "Claude · TAKE", "#5865F2"), ("me_taken", "Me · TAKEN", "#57F287")]
+    series = [("detector", "Detector · all", "#95A5A6"), ("claude_take", "Claude · TAKE", "#5865F2"), ("codex_take", "Codex · TAKE", "#E67E22"),
+              ("me_taken", "Me · TAKEN", "#57F287")]
     fig, ax = plt.subplots(figsize=(9, 4.2), dpi=110)
     fig.patch.set_facecolor("#1e1f22"); ax.set_facecolor("#1e1f22")
     drew = False
@@ -300,7 +354,7 @@ def chart(rows: list[Row], path: str, off: float, title: str = "", end_ts: int |
     ax.tick_params(colors="#dbdee1", labelsize=8)
     ax.set_ylabel("cumulative points (if taken)", color="#dbdee1", fontsize=9)
     ax.set_xlabel("IST", color="#dbdee1", fontsize=8)
-    ax.set_title(title or "Detector vs Claude vs Me", color="#f2f3f5", fontsize=11)
+    ax.set_title(title or "Detector vs Claude vs Codex vs Me", color="#f2f3f5", fontsize=11)
     if drew:
         ax.legend(facecolor="#2b2d31", edgecolor="#4e5058", labelcolor="#dbdee1", fontsize=8, loc="upper left")
     else:
@@ -328,6 +382,8 @@ class CompareResult:
     png: str | None = None
     history: list = field(default_factory=list)
     alerts: dict | None = None           # v2.0.0: alerts.stats() of the window (fired, taken, agreed, win/loss)
+    h2h: dict = field(default_factory=dict)              # v2.3.0 head_to_head()
+    codex_pullback: PullbackScore = field(default_factory=PullbackScore)
 
 
 def rules_hash(path: str = RULES_PATH) -> str:
@@ -345,15 +401,16 @@ def compute(records: list[dict], graded: list, since: int, until: int, off: floa
     m = {k: metrics(v) for k, v in g.items()}
     if graded and rows and not any(r.grade for r in rows) and grading_note is None:
         grading_note = f"scorecard graded {len(graded)} signal(s) but none matched a journal signal bar — check the bar-time field"
-    models = sorted({str(v.get("model")) for v in records if v.get("event") == "claude_verdict" and v.get("model")
+    models = sorted({str(v.get("model")) for v in records if v.get("event") in ("claude_verdict", "codex_verdict") and v.get("model")
                      and since <= v["t"] < until})
     from . import alerts as _alerts
     res = CompareResult(since, until, rows, g, m, verdict(m), disagreements(g), pullbacks(records, since, until, off, bars),
                         grading_note, models, rules_hash(), history=history or [],
-                        alerts=_alerts.stats([r for r in records if since <= r.get("t", 0) < until]))
+                        alerts=_alerts.stats([r for r in records if since <= r.get("t", 0) < until]),
+                        h2h=head_to_head(g), codex_pullback=pullbacks(records, since, until, off, bars, source="codex"))
     if png_path:
         last_bar = max([r.bar for r in rows], default=None)
-        res.png = chart(rows, png_path, off, f"Detector vs Claude vs Me · {_fmt_day(since)} → {_fmt_day(until - 1)}",
+        res.png = chart(rows, png_path, off, f"Detector vs Claude vs Codex vs Me · {_fmt_day(since)} → {_fmt_day(until - 1)}",
                         end_ts=int(last_bar - off * 3600 + BAR_S) if last_bar else None)
     return res
 
@@ -405,7 +462,9 @@ def summary_for_batch(res: CompareResult, week: str | None = None) -> dict:
             "open": res.metrics["detector"].open, "ungraded": res.metrics["detector"].ungraded,
             "disagree": res.disagree, "pullback": {"n": res.pullback.n, "right": res.pullback.right,
                                                    "diff_points": res.pullback.diff_points, "applied": res.pullback.applied},
-            "models": res.models, "rules_hash": res.rules_hash, "grading_note": res.grading_note}
+            "models": res.models, "rules_hash": res.rules_hash, "grading_note": res.grading_note,
+            "h2h": res.h2h, "codex_pullback": {"n": res.codex_pullback.n, "right": res.codex_pullback.right,
+                                               "diff_points": res.codex_pullback.diff_points}}
 
 
 def append_history(log_dir: str, week: str, res: CompareResult):
@@ -423,12 +482,15 @@ def latest_summary(log_dir: str) -> dict | None:
 def trend_line(history: list[dict], current: CompareResult | None = None, weeks: int = 4) -> str:
     pts = [(h.get("week", "?"), h.get("compare", {}).get("rows", {})) for h in history][-weeks:]
     if current is not None:
-        pts = (pts + [("now", {k: {"expectancy": current.metrics[k].expectancy} for k in ("detector", "claude_take", "me_taken")})])[-weeks:]
+        pts = (pts + [("now", {k: {"expectancy": current.metrics[k].expectancy} for k in ("detector", "claude_take", "codex_take", "me_taken")})])[-weeks:]
     if not pts:
         return ""
     def seq(k):
         return " → ".join("—" if (r.get(k) or {}).get("expectancy") is None else f"{r[k]['expectancy']:+.1f}" for _, r in pts)
-    return f"Detector {seq('detector')} · Claude TAKE {seq('claude_take')} · Me {seq('me_taken')}"
+    line = f"Detector {seq('detector')} · Claude TAKE {seq('claude_take')} · Me {seq('me_taken')}"
+    if any((r.get("codex_take") or {}).get("expectancy") is not None for _, r in pts):
+        line += f" · Codex TAKE {seq('codex_take')}"
+    return line
 
 
 # ============================================================================= gathering (off the event loop; never holds the MT5 lock while grading)
@@ -454,7 +516,7 @@ def gather(cfg, agents, journal, since: int, until: int, *, lock_timeout: float 
     else:
         graded, note = [], "MT5 busy — grading skipped, try again in a minute"
     bars = None
-    tight = {v.get("symbol") for v in records if v.get("event") == "claude_verdict" and v.get("decision") == "TIGHTEN"}
+    tight = {v.get("symbol") for v in records if v.get("event") in ("claude_verdict", "codex_verdict") and v.get("decision") == "TIGHTEN"}
     if tight and free and not getattr(cfg, "dry", False):
         bars = {}
         n = min(20000, int((until - since) / BAR_S) + 600)
@@ -473,11 +535,17 @@ def _fmt(x, f="{:+.1f}", none="—"):
     return none if x is None else f.format(x)
 
 
+def _rows_shown(res: CompareResult) -> list[tuple[str, str]]:
+    """Codex rows only once Codex has judged something (a Claude-only install keeps the v2.2 table)."""
+    has_codex = any(r.codex is not None for r in res.rows)
+    return [(k, lbl) for k, lbl in ROWS if has_codex or not k.startswith("codex_")]
+
+
 def table(res: CompareResult) -> str:
     money = any(res.metrics[k].money is not None for k, _ in ROWS)
     head = f"{'Row':<24}{'n':>4}{'win':>6}{'exp':>7}{'total':>8}{'STOP':>5}{'strk':>5}{'worst':>7}" + (f"{'money':>9}" if money else "")
     lines = [head, "-" * len(head)]
-    for k, label in ROWS:
+    for k, label in _rows_shown(res):
         m = res.metrics[k]
         lines.append(f"{label:<24}{m.n:>4}{_fmt(m.win_rate, '{:.0%}'):>6}{_fmt(m.expectancy):>7}{_fmt(m.total if m.n else None):>8}"
                      f"{m.stops:>5}{m.worst_streak:>5}{_fmt(m.biggest_loss if m.n and m.biggest_loss < 0 else None):>7}"
@@ -504,7 +572,21 @@ def card(res: CompareResult, *, title: str = "AUREON · MT5 · COMPARE", mode_di
     if extra:
         pbt += "\n" + " · ".join(extra)
     fields.append({"name": "Pullbacks (Claude vs guardian)", "value": pbt, "inline": False})
-    fields.append({"name": "Excluded", "value": f"OPEN {det.open} · UNGRADED {det.ungraded} · no verdict {len(res.groups['no_verdict'])}", "inline": False})
+    h = res.h2h or {}
+    if h.get("both"):                                                     # v2.3.0 head-to-head
+        sp = (f"when they SPLIT ({h['split']}): Claude right {h['claude_right']} ({h['claude_pts']:+.1f} pts) · "
+              f"Codex right {h['codex_right']} ({h['codex_pts']:+.1f} pts)" + (f" · tie {h['tie']}" if h["tie"] else "")
+              + (f" · ungraded {h['ungraded']}" if h["ungraded"] else "")) if h["split"] else "no splits"
+        fields.append({"name": "Claude vs Codex", "value": f"both judged {h['both']} · agree {h['agree_pct']:.0f}%\n{sp}", "inline": False})
+    cpb = res.codex_pullback
+    if cpb.n or cpb.stale or cpb.ungraded:
+        cpbt = (f"{cpb.n} scored · right {cpb.right}/{cpb.n} ({cpb.right / cpb.n:.0%}) · vs guardian-only {cpb.diff_points:+.1f} pts"
+                if cpb.n else "no scored pullback verdicts")
+        if cpb.by_decision:
+            cpbt += "\n" + " · ".join(f"{k} {v['right']}/{v['n']}" for k, v in sorted(cpb.by_decision.items()))
+        fields.append({"name": "Pullbacks (Codex vs guardian · shown only)", "value": cpbt, "inline": False})
+    fields.append({"name": "Excluded", "value": f"OPEN {det.open} · UNGRADED {det.ungraded} · no verdict {len(res.groups['no_verdict'])}"
+                   + (f" · no Codex verdict {len(res.groups['codex_no_verdict'])}" if any(r.codex for r in res.rows) else ""), "inline": False})
     al = res.alerts or {}
     if al.get("fired") or al.get("taken"):                               # v2.0.2 ALERTS table: fired · taken · agent✓ · claude✓ · pts taken
         from . import alerts as _alerts
@@ -521,14 +603,15 @@ def card(res: CompareResult, *, title: str = "AUREON · MT5 · COMPARE", mode_di
 
 def breakdown_card(res: CompareResult, *, mode_display: str = "EMA 50/80") -> dict:
     bd = breakdown(res.rows)
-    head = f"{'':<10}{'Det n':>6}{'win':>5}{'exp':>7}{'Cl n':>6}{'exp':>7}{'Me n':>6}{'exp':>7}"
+    head = f"{'':<10}{'Det n':>6}{'win':>5}{'exp':>7}{'Cl n':>6}{'exp':>7}{'Cx n':>6}{'exp':>7}{'Me n':>6}{'exp':>7}"
     lines = [head, "-" * len(head)]
     for label, m in bd.items():
-        d, c, me = m["detector"], m["claude_take"], m["me_taken"]
-        lines.append(f"{label:<10}{d.n:>6}{_fmt(d.win_rate, '{:.0%}'):>5}{_fmt(d.expectancy):>7}{c.n:>6}{_fmt(c.expectancy):>7}{me.n:>6}{_fmt(me.expectancy):>7}")
+        d, c, x, me = m["detector"], m["claude_take"], m["codex_take"], m["me_taken"]
+        lines.append(f"{label:<10}{d.n:>6}{_fmt(d.win_rate, '{:.0%}'):>5}{_fmt(d.expectancy):>7}{c.n:>6}{_fmt(c.expectancy):>7}"
+                     f"{x.n:>6}{_fmt(x.expectancy):>7}{me.n:>6}{_fmt(me.expectancy):>7}")
         if label == "RE":
             lines.append("")
-    desc = (f"**{_fmt_day(res.since)} → {_fmt_day(res.until - 1)}** · by event type and session · Cl = Claude TAKE\n```\n"
+    desc = (f"**{_fmt_day(res.since)} → {_fmt_day(res.until - 1)}** · by event type and session · Cl = Claude TAKE · Cx = Codex TAKE\n```\n"
             + "\n".join(lines) + "\n```")
     fields = [{"name": "Grading", "value": "⚠️ " + res.grading_note[:1000], "inline": False}] if res.grading_note else []
     return {"title": "AUREON · MT5 · COMPARE · BREAKDOWN", "description": desc[:4096], "fields": fields,
@@ -542,33 +625,41 @@ SELF_REVIEW_PROMPT = ("You are the second opinion for Aureon (XAUUSD M5, EMA 50/
                       "file; the trader edits the rules himself. Never invent data not in the cases.\n\nCASES:\n")
 
 
-def self_review_cases(res: CompareResult, limit: int = 40) -> list[dict]:
+def self_review_cases(res: CompareResult, limit: int = 40, source: str = "claude") -> list[dict]:
     out = []
     for r in res.rows:
-        if r.status != "GRADED" or r.claude is None:
+        mine = getattr(r, source, None)
+        if r.status != "GRADED" or mine is None:
             continue
-        wrong = (r.claude == "TAKE" and r.points < 0) or (r.claude == "SKIP" and r.points > 0)
-        disagree = (r.claude == "TAKE" and r.me == "SKIPPED") or (r.claude == "SKIP" and r.me == "TAKEN")
+        wrong = (mine == "TAKE" and r.points < 0) or (mine == "SKIP" and r.points > 0)
+        disagree = (mine == "TAKE" and r.me == "SKIPPED") or (mine == "SKIP" and r.me == "TAKEN")
         if wrong or disagree:
             out.append({"bar_ist": datetime.fromtimestamp(r.bar, tz=timezone.utc).strftime("%a %H:%M server"), "symbol": r.symbol,
-                        "event": r.kind, "side": r.side, "session": r.session, "claude": r.claude, "trader": r.me,
-                        "grade": r.grade, "points": r.points, "claude_wrong": wrong})
+                        "event": r.kind, "side": r.side, "session": r.session, source: mine, "trader": r.me,
+                        "grade": r.grade, "points": r.points, f"{source}_wrong": wrong})
     return out[-limit:]
 
 
 def self_review(claude, res: CompareResult, notify, week: str) -> str | None:
-    """Runs in its own thread. Uses the advisor's normal call path (budget, one call at a time). Never writes claude_rules.md."""
-    cases = self_review_cases(res)
-    if not cases or claude is None:
+    """Runs in its own thread. Uses the advisor's normal call path (budget, one call at a time). Never writes the rules file.
+    v2.3.0: `claude` may be either advisor — Claude posts CLAUDE SELF-REVIEW, Codex posts a CODEX REVIEW · SATURDAY card."""
+    if claude is None:
         return None
-    r = claude._call(SELF_REVIEW_PROMPT + json.dumps(cases, default=str), claude.cfg.claude_review_model, "review", kind_override="compare")
+    src = getattr(claude, "SOURCE", "claude")
+    cases = self_review_cases(res, source=src)
+    if not cases:
+        return None
+    model = getattr(claude, "review_model", None)
+    model = claude.cfg.claude_review_model if model is None else model
+    r = claude._call(SELF_REVIEW_PROMPT + json.dumps(cases, default=str), model, "review", kind_override="compare", free_text=True)
     if r is None or not r.ok or not r.text:
         return None
     text = "\n".join(r.text.strip().splitlines()[:5])[:1800]
-    notify.send(f"{STRATEGY}:ALL:COMPARE_SELF_REVIEW:{week}", f"AUREON · MT5 · CLAUDE SELF-REVIEW · {week}", [text],
+    title = f"AUREON · MT5 · CLAUDE SELF-REVIEW · {week}" if src == "claude" else f"AUREON · MT5 · CODEX REVIEW · SATURDAY · {week}"
+    notify.send(f"{STRATEGY}:ALL:COMPARE_SELF_REVIEW{'' if src == 'claude' else '_' + src.upper()}:{week}", title, [text],
                 fields=[{"name": "Cases", "value": str(len(cases)), "inline": True},
-                        {"name": "Rules", "value": f"unchanged ({res.rules_hash}) — you edit claude_rules.md", "inline": True}],
-                footer="Aureon MT5 · Claude · advisory only")
+                        {"name": "Rules", "value": f"unchanged ({res.rules_hash}) — you edit advisor_rules.md", "inline": True}],
+                footer=f"Aureon MT5 · {LABELS.get(src, src)} · advisory only")
     return text
 
 
@@ -578,26 +669,28 @@ PROPOSAL_FIELDS = ("gap", "dist_to_fast_ema_pts", "swing_against_last6_pts", "at
 MIN_SUPPORT = 2
 
 
-def _verdict_rows(records: list[dict], res: "CompareResult") -> list[dict]:
-    """Entry verdicts of the window joined with their graded outcome: [{claude, points, fields, event, symbol, bar}]."""
+def _verdict_rows(records: list[dict], res: "CompareResult", source: str = "claude") -> list[dict]:
+    """Entry verdicts of the window joined with their graded outcome: [{claude, points, fields, event, symbol, bar}].
+    (The decision sits under "claude" for both sources — it is the advisor column the proposal logic reads.)"""
     graded = {(r.symbol, r.bar): r for r in res.rows if r.status == "GRADED" and r.points is not None}
     out = []
     for v in records:
-        if v.get("event") != "claude_verdict" or v.get("claude_event") not in ENTRY_EVENTS or v.get("decision") not in ("TAKE", "SKIP") or v.get("stale"):
+        if v.get("event") != f"{source}_verdict" or _ev(v, source) not in ENTRY_EVENTS or v.get("decision") not in ("TAKE", "SKIP") or v.get("stale"):
             continue
         row = graded.get((v.get("symbol"), v.get("bar")))
         if row is None or not isinstance(v.get("snapshot_fields"), dict):
             continue
-        out.append({"claude": v["decision"], "points": float(row.points), "fields": v["snapshot_fields"], "event": v["claude_event"],
-                    "symbol": v.get("symbol"), "bar": v.get("bar"), "evidence": v.get("evidence") or []})
+        out.append({"claude": v["decision"], "points": float(row.points), "fields": v["snapshot_fields"], "event": _ev(v, source),
+                    "symbol": v.get("symbol"), "bar": v.get("bar"), "evidence": v.get("evidence") or [], "source": source})
     return out
 
 
-def rule_proposals(records: list[dict], res: "CompareResult", mode_display: str = "EMA 50/80", limit: int = 3) -> list[dict]:
+def rule_proposals(records: list[dict], res: "CompareResult", mode_display: str = "EMA 50/80", limit: int = 3,
+                   source: str = "claude") -> list[dict]:
     """Wrong calls (TAKE that lost, SKIP that won) + their snapshot fields → up to `limit` proposed rule lines with the supporting count.
     Deterministic: for each numeric field, every wrong value is tried as a >= / <= threshold; the best side (most wrong minus right)
     is proposed when it holds >= MIN_SUPPORT wrong calls and strictly more wrong than right calls. Nothing is written by this function."""
-    rows = _verdict_rows(records, res)
+    rows = _verdict_rows(records, res, source)
     wrong = [r for r in rows if (r["claude"] == "TAKE" and r["points"] < 0) or (r["claude"] == "SKIP" and r["points"] > 0)]
     right = [r for r in rows if r not in wrong]
     props = []
@@ -633,63 +726,67 @@ def rule_proposals(records: list[dict], res: "CompareResult", mode_display: str 
         if len(out) >= limit:
             break
     for i, p in enumerate(out, 1):
-        p["n"] = i
+        p["n"] = i; p["source"] = source
     return out
 
 
-def proposals_path(log_dir: str) -> str:
-    return os.path.join(log_dir, "claude_rule_proposals.json")
+def proposals_path(log_dir: str, source: str = "claude") -> str:
+    return os.path.join(log_dir, f"{source}_rule_proposals.json")
 
 
-def save_proposals(log_dir: str, week: str, props: list[dict]):
+def save_proposals(log_dir: str, week: str, props: list[dict], source: str = "claude"):
     os.makedirs(log_dir, exist_ok=True)
-    tmp = proposals_path(log_dir) + ".tmp"
+    tmp = proposals_path(log_dir, source) + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"week": week, "made": datetime.now(IST).strftime("%Y-%m-%d %H:%M"), "proposals": props}, f, indent=1)
-    os.replace(tmp, proposals_path(log_dir))
+        json.dump({"week": week, "made": datetime.now(IST).strftime("%Y-%m-%d %H:%M"), "source": source, "proposals": props}, f, indent=1)
+    os.replace(tmp, proposals_path(log_dir, source))
 
 
-def load_proposals(log_dir: str) -> dict:
+def load_proposals(log_dir: str, source: str = "claude") -> dict:
     try:
-        with open(proposals_path(log_dir), encoding="utf-8") as f:
+        with open(proposals_path(log_dir, source), encoding="utf-8") as f:
             d = json.load(f)
         return d if isinstance(d, dict) else {}
     except Exception:
         return {}
 
 
-def proposals_card(week: str, props: list[dict], n_wrong: int, rules_hash_: str) -> dict:
+def proposals_card(week: str, props: list[dict], n_wrong: int, rules_hash_: str, source: str = "claude") -> dict:
+    tag, label = source.upper(), LABELS.get(source, source)
     if props:
-        desc = "\n".join(f"**{p['n']}.** {p['line']} — {p['support']}" for p in props) + "\n\napprove one with `/claude-rules-approve <n>` — nothing changes until you do"
+        desc = ("\n".join(f"**{p['n']}.** {p['line']} — {p['support']}" for p in props)
+                + f"\n\napprove one with `/{source}-rules-approve <n>` — nothing changes until you do")
     else:
         desc = f"{n_wrong} wrong call(s) this week — no field separates them yet (need ≥ {MIN_SUPPORT} wrong calls on one side of a threshold)"
-    return {"title": f"AUREON · MT5 · CLAUDE RULE PROPOSALS · {week}", "description": desc[:4096],
+    return {"title": f"AUREON · MT5 · {tag} RULE PROPOSALS · {week}", "description": desc[:4096],
             "fields": [{"name": "Wrong calls", "value": str(n_wrong), "inline": True}, {"name": "Rules file", "value": f"unchanged ({rules_hash_})", "inline": True}],
-            "footer": "Aureon MT5 · Claude · proposals only — approval appends a dated line to claude_rules.md", "png": None}
+            "footer": f"Aureon MT5 · {label} · proposals only — approval appends a dated [{source}] line to advisor_rules.md", "png": None}
 
 
-def approve_proposal(n: int, log_dir: str, rules_path: str = RULES_PATH) -> str:
-    """/claude-rules-approve <n>: append the proposed line, dated, to claude_rules.md. Returns the appended line."""
-    d = load_proposals(log_dir); props = d.get("proposals") or []
+def approve_proposal(n: int, log_dir: str, rules_path: str = RULES_PATH, source: str = "claude") -> str:
+    """/claude-rules-approve <n> · /codex-rules-approve <n>: append the proposed line to the shared advisor_rules.md,
+    tagged with its source and dated. Returns the appended line."""
+    d = load_proposals(log_dir, source); props = d.get("proposals") or []
     p = next((x for x in props if int(x.get("n", 0)) == int(n)), None)
     if p is None:
-        raise ValueError(f"no proposal {n} (latest card: {d.get('week') or 'none'})")
+        raise ValueError(f"no {source} proposal {n} (latest card: {d.get('week') or 'none'})")
     if p.get("approved"):
         raise ValueError(f"proposal {n} already approved on {p['approved']}")
-    line = f"- [approved {datetime.now(IST):%Y-%m-%d} · {d.get('week', '')}] {p['line']} — {p['support']}"
+    line = f"- [{source}] [approved {datetime.now(IST):%Y-%m-%d} · {d.get('week', '')}] {p['line']} — {p['support']}"
     with open(rules_path, "a", encoding="utf-8") as f:
         f.write(("\n" if not open(rules_path, encoding="utf-8").read().endswith("\n") else "") + line + "\n")
-    p["approved"] = datetime.now(IST).strftime("%Y-%m-%d"); save_proposals(log_dir, d.get("week", ""), props)
+    p["approved"] = datetime.now(IST).strftime("%Y-%m-%d"); save_proposals(log_dir, d.get("week", ""), props, source)
     return line
 
 
-def rule_proposals_tick(cfg, journal, notify, res: "CompareResult", week: str, mode_display: str = "EMA 50/80") -> list[dict]:
-    """After the Saturday COMPARE card: build, save and post the proposals. No Claude call, no file edit."""
+def rule_proposals_tick(cfg, journal, notify, res: "CompareResult", week: str, mode_display: str = "EMA 50/80",
+                        source: str = "claude") -> list[dict]:
+    """After the Saturday COMPARE card: build, save and post the proposals (one card per advisor). No CLI call, no file edit."""
     records = journal.read(res.since - 86400, res.until + 3 * 86400)
-    props = rule_proposals(records, res, mode_display)
-    rows = _verdict_rows(records, res)
+    props = rule_proposals(records, res, mode_display, source=source)
+    rows = _verdict_rows(records, res, source)
     n_wrong = sum(1 for r in rows if (r["claude"] == "TAKE" and r["points"] < 0) or (r["claude"] == "SKIP" and r["points"] > 0))
-    save_proposals(cfg.log_dir, week, props)
-    c = proposals_card(week, props, n_wrong, res.rules_hash)
-    notify.send(f"{cfg.mode}:ALL:CLAUDE_RULE_PROPOSALS:{week}", c["title"], [c["description"]], fields=c["fields"], footer=c["footer"])
+    save_proposals(cfg.log_dir, week, props, source)
+    c = proposals_card(week, props, n_wrong, res.rules_hash, source)
+    notify.send(f"{cfg.mode}:ALL:{source.upper()}_RULE_PROPOSALS:{week}", c["title"], [c["description"]], fields=c["fields"], footer=c["footer"])
     return props

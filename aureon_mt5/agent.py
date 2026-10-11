@@ -32,7 +32,8 @@ import numpy as np
 
 
 class SymbolAgent(threading.Thread):
-    def __init__(self, symbol: str, cfg: Config, strategy: Strategy, notify: Notifier, journal: Journal, news: tuple, claude=None, alerts=None):
+    def __init__(self, symbol: str, cfg: Config, strategy: Strategy, notify: Notifier, journal: Journal, news: tuple, claude=None, alerts=None,
+                 codex=None):
         super().__init__(daemon=True, name=f"agent-{symbol}")
         # v1.10.0 Claude add-on: hooks only when the advisor advises this strategy (advisory/manage). None = v1.9.x behaviour.
         self.claude = claude if (claude is not None and claude.advises(strategy)) else None
@@ -40,6 +41,10 @@ class SymbolAgent(threading.Thread):
         self.alerts = alerts if alerts is not None else alerts_mod.AlertStore(cfg.log_dir)   # v2.0.0 /alert store (shared by main)
         self.pending_alert: dict | None = None   # {"alert_id", "side"}: attach to the next position seen on this symbol
         self.claude_inbox: "queue.Queue[dict]" = queue.Queue()
+        # v2.3.0 Codex add-on: same hooks as Claude; its verdicts are journaled and shown, never applied
+        self.codex = codex if (codex is not None and codex.advises(strategy)) else None
+        self.codex_any = codex
+        self.codex_inbox: "queue.Queue[dict]" = queue.Queue()
         self.symbol, self.cfg, self.S, self.notify, self.journal, self.news = symbol, cfg, strategy, notify, journal, news
         self.dry = cfg.dry
         g = strategy.guardian_for(symbol)
@@ -143,6 +148,10 @@ class SymbolAgent(threading.Thread):
                 report_crash(self, e)
                 return  # supervisor restarts this agent, unless crash guard paused it
             _time.sleep(self.cfg.poll_seconds)
+
+    def advisors(self) -> list:
+        """v2.3.0: the advisors attached to this agent (advisory / manage), Claude first."""
+        return [a for a in (self.claude, self.codex) if a is not None]
 
     def chart_now(self) -> str | None:
         """Context chart of the latest closed bars (used by /chart)."""
@@ -482,8 +491,8 @@ class SymbolAgent(threading.Thread):
                             color=EVENT_COLOURS["signal_long" if r.side == "LONG" else "signal_short"], footer=cfooter(self.S.display_name, "re-entry"),
                             meta={"symbol": self.symbol, "side": r.side, "kind": "reentry", "price": r.price, "bar": bar_t, "mode": self.S.name,
                                   "sl": stop, **self._suggested(r.price - stop)})
-            if self.claude is not None:
-                self.claude.request_entry(self, "reentry", r.side, bar_t, df, card_key=re_key)
+            for adv in self.advisors():
+                adv.request_entry(self, "reentry", r.side, bar_t, df, card_key=re_key)
 
     # ------------------------------------------------------------------ session dividers as cards
     def _session(self, df, bar_t, close, ef, es):
@@ -651,8 +660,9 @@ class SymbolAgent(threading.Thread):
                                    "sl": (close - s * g.pre_stop) if g else None, **(self._suggested(g.pre_stop) if g else {})},
                              fields=fields, color=EVENT_COLOURS["signal_long" if side == "LONG" else "signal_short"],
                              footer=cfooter(self.S.display_name, f"bar {ist(bar_t, self.off)}"))
-            if self.claude is not None and kind in ("P", "cross"):          # v1.10.0: enqueue only — never blocks the poll
-                self.claude.request_entry(self, kind, side, bar_t, df, card_key=ask_key)
+            if kind in ("P", "cross"):                                       # v1.10.0: enqueue only — never blocks the poll
+                for adv in self.advisors():
+                    adv.request_entry(self, kind, side, bar_t, df, card_key=ask_key)
 
     # ------------------------------------------------------------------ v2.0.0 price alerts (every poll, on the guardian's tick)
     def _tick(self, df) -> dict | None:
@@ -687,6 +697,9 @@ class SymbolAgent(threading.Thread):
                 cl = self.claude_any
                 if card.get("claude_state") == "asking" and cl is not None and hasattr(cl, "request_alert"):
                     cl.request_alert(self, a, card, df, bar_t)                   # never before the agent block exists (it is on the card)
+                cx = self.codex_any
+                if card.get("codex_state") == "asking" and cx is not None and hasattr(cx, "request_alert"):
+                    cx.request_alert(self, a, card, df, bar_t)
         except Exception as e:
             telemetry.failure(self.notify, self.journal, title="AUREON ALERT ERROR", key=self.key("ERROR", "alerts"), mode=self.S.name,
                               symbol=self.symbol, action="alert check", exc=e)
@@ -770,8 +783,8 @@ class SymbolAgent(threading.Thread):
                                 meta={"symbol": self.symbol, "side": side, "kind": kind, "price": close, "bar": bar_t, "mode": self.S.name,
                                       "sl": stop, **(self._suggested(g.pre_stop) if g else {})},
                                 fields=fields, color=colour, footer=cfooter(self.S.display_name, f"bar {ist(bar_t, off)}"))
-                if self.claude is not None:                                    # the ENTER bar only — never raw CROSS / MULTI
-                    self.claude.request_entry(self, "enter", side, bar_t, df, card_key=ask_key)
+                for adv in self.advisors():                                    # the ENTER bar only — never raw CROSS / MULTI
+                    adv.request_entry(self, "enter", side, bar_t, df, card_key=ask_key)
 
     # ------------------------------------------------------------------ guardian helpers
     def _locked(self, p: dict) -> float:
@@ -840,8 +853,8 @@ class SymbolAgent(threading.Thread):
         for t in list(self.state):
             if t not in live:
                 st = self.state.pop(t)
-                if self.claude is not None:
-                    self.claude.forget(self.symbol, t)
+                for adv in self.advisors():
+                    adv.forget(self.symbol, t)
                 final, approx = self._final_points(t, st)             # v1.11.0: for the weekly compare (measurement only)
                 self.journal.log("closed", symbol=self.symbol, mode=self.S.name, ticket=t, direction=st.get("direction"),
                                  entry=st.get("entry"), secured=st.get("secured"), peak=st.get("peak"),
@@ -1016,8 +1029,8 @@ class SymbolAgent(threading.Thread):
                                                             points=p["points"], sl=p["sl"] or None),
                                      color=EVENT_COLOURS["cross"], footer=cfooter(self.S.display_name))
                 codes = self._advise(p, st, bar_t, df, ef, es, g)
-                if self.claude is not None:                                  # v1.10.0: enqueue only
-                    self.claude.maybe_pullback(self, p, st, bar_t, df, codes or ())
+                for adv in self.advisors():                                  # v1.10.0: enqueue only (one job per pullback, per advisor)
+                    adv.maybe_pullback(self, p, st, bar_t, df, codes or ())
                 if st["bars"] and st["bars"] % self.SNAPSHOT_BARS == 0:
                     self._snapshot(p, st, bar_t)
 
@@ -1034,6 +1047,6 @@ class SymbolAgent(threading.Thread):
                                          color=EVENT_COLOURS["news"], footer=cfooter(self.S.display_name))
         if sig and not sig["consumed"] and sig["bar_time"] == bar_t:
             sig["consumed"] = True                       # nothing to flip; signal spent
-        if self.claude is not None:                      # v1.10.0: Claude verdicts AFTER the guardian — its hard exits win
-            self.claude.drain(self, pos)
+        for adv in self.advisors():                      # v1.10.0: advisor verdicts AFTER the guardian — its hard exits win
+            adv.drain(self, pos)                         # v2.3.0: Claude first (may apply in manage), then Codex (shown only)
         self.journal.save_state(self.symbol, self.state)

@@ -1,4 +1,4 @@
-# Aureon MT5 v2.2.2
+# Aureon MT5 v2.3.0
 
 You place the trade. Aureon detects (per selected EMA mode), fires a Discord gunshot, then manages what you placed:
 protect → secure +10 → ride in +5 steps → close on the fast-EMA turn → news safeguard. Reports and slash commands.
@@ -203,8 +203,8 @@ Advises **both modes**. ema2050 is asked at the ENTER bar (confirmed cross + pul
 CROSS or a MULTI CROSS. Snapshots add `crosses_today, bars_since_cross, confirm_state, dist_to_fast_ema_pts, swing_against_last6_pts, atr20,
 day_pnl_pts, trades_today` and, for positions, `mae_so_far, retrace_from_peak_pts, retrace_pct, bars_since_peak, closed_through_slow_ema, dist_to_sl`
 (still no account data). The reply contract adds `"evidence": [field names used]`, journaled with every verdict together with the compact
-snapshot fields. The prompt is mode-aware (first line names the fast/slow EMA; `prompts/claude_rules.md` has one section per mode — a
-placeholder until `research/claude_rules_v2.md` is supplied). Saturday, after the COMPARE card: **CLAUDE RULE PROPOSALS** — wrong calls and their
+snapshot fields. The prompt is mode-aware (first line names the fast/slow EMA; `prompts/advisor_rules.md` — v2.3.0, alias
+`prompts/claude_rules.md` — has one section per mode, a placeholder until `research/claude_rules_v2.md` is supplied). Saturday, after the COMPARE card: **CLAUDE RULE PROPOSALS** — wrong calls and their
 snapshot fields → up to 3 proposed rule lines with the supporting count (`logs/claude_rule_proposals.json`). `/claude-rules` lists them;
 `/claude-rules-approve <n>` appends the line, dated, to `claude_rules.md`. Nothing changes without approval.
 
@@ -215,16 +215,53 @@ Every 5 min, and before `/restart` / `/mode`: if origin/master moved, local edit
 HEAD == origin/master. Never edit tracked files on the server — commit them. Server-local, never touched: `.env`, `logs/`, `out/`,
 `news_blackout.txt` (copied from `news_blackout.example.txt` when missing). No network → `UPDATE FAILED` once per hour, current build keeps running.
 
-## Codex read-only advisor (PR #7–#10)
-| `AUREON_CODEX` | what happens |
-|---|---|
-| `off` (default) | no Codex process is started |
-| `advisory` | `/codex-test` and `/codex-alert` may call `codex exec --sandbox read-only`; verdicts journaled, never applied |
+## Advisors (v2.3.0) — Claude and Codex, same second opinion, CLI login only
+Both advisors are the same code path (`CodexAdvisor` subclasses `ClaudeAdvisor`): same triggers (ema2050: ENTER bar + pullback-in-trade;
+ema5080: P / CROSS / RE + pullback), same `build_snapshot` (market data only — no account, balance, login or token), same rules prompt
+`prompts/advisor_rules.md` (`prompts/claude_rules.md` is an alias), same reply contract `{decision, side, tighten_to, confidence,
+reason ≤ 20 words, evidence[], p_win?}` validated the same way, same fail-closed and STALE handling, one job per pullback,
+fast exit identical (guardian first, the queued verdict becomes "position no longer open", a late verdict is STALE).
+Each has its own worker thread, daily budget, usage ledger and journal rows. **Never an API-key path:** `ANTHROPIC_API_KEY` /
+`OPENAI_API_KEY` / `CODEX_API_KEY` are stripped from the child process; a startup card warns if one is set.
 
-`/codex` · `/codex-status` (version, login, local calls today) · `/codex-test` (one schema-constrained verdict) ·
-`/codex-alert [symbol] [side]` (frozen closed-bar snapshot; refused when the cached bar is stale). CLI login only — run `codex login`;
-`OPENAI_API_KEY` / `CODEX_API_KEY` are stripped from the child environment. Optional: `AUREON_CODEX_BIN`, `AUREON_CODEX_MODEL`,
-`AUREON_CODEX_TIMEOUT` (30 s), `AUREON_CODEX_MAX_CALLS` (30/day), `AUREON_CODEX_WORKDIR`. One call at a time, no queue.
+| | Claude (`AUREON_CLAUDE`) | Codex (`AUREON_CODEX`) |
+|---|---|---|
+| CLI | `claude -p --output-format json` | `codex exec --sandbox read-only --json --output-schema …` (workdir outside the repo) |
+| modes | off · review · advisory · manage | off · review · advisory |
+| `review` | 23:00 IST CLAUDE REVIEW + `/alert` line | 23:00 IST CODEX REVIEW + `/alert` line |
+| `advisory` | verdicts on ENTER / pullback / ALERT cards, journaled | verdicts on ENTER / pullback / ALERT cards, journaled |
+| **applies to your trade** | **TIGHTEN and CLOSE-in-profit, only in `manage`** (through the guardian's `_move_sl` / `_close`) | **never** — journaled and shown only, in every mode (a test walks every verdict kind) |
+| budget | `AUREON_CLAUDE_MAX_CALLS` → `logs/claude_budget.json` | `AUREON_CODEX_MAX_CALLS` → `logs/codex_budget.json` |
+| usage ledger | `logs/claude_usage.jsonl` | `logs/codex_usage.jsonl` (tokens when `codex exec --json` reports them, else null; cost null unless reported) |
+| journal | `claude_verdict` (`claude_event`) | `codex_verdict` (`codex_event`) |
+| models | entry / pullback / review env vars | `AUREON_CODEX_MODEL` for verdicts, CLI default for reviews |
+| Saturday | COMPARE column · CLAUDE RULE PROPOSALS · optional self-review | COMPARE column · CODEX RULE PROPOSALS · CODEX REVIEW (self-review) |
+
+**Two verdicts on one card.** ENTER, pullback and ALERT REACHED cards carry one line per attached advisor and a one-word tag once both
+have answered:
+
+    CLAUDE: TAKE · medium · "pullback to EMA 20, gap growing" · evidence gap, dist_to_fast_ema_pts
+    CODEX : SKIP · low · "crosses_today 5, chop" · evidence crosses_today          Advisors: SPLIT ⚠️
+
+AGREE = same decision (two TAKEs on the same side). The second advisor to answer edits the card (bot) or posts its card with both lines (webhook).
+
+**Compare / reports.** `/compare`, `/compare-breakdown` and the Saturday COMPARE card show Detector · Claude · Codex · You with the same
+metrics, Claude-vs-Codex agreement %, and *when they SPLIT, who was right* (the TAKE side when the if-taken result was a gain, the SKIP side
+when it was a loss; count and points). Codex rows appear once Codex has judged a signal. `/advisor-report [week|month]` (alias
+`/claude-report`): one card, a section per advisor (verdict counts, agreement with detector / you, SKIP precision, TAKE expectancy vs
+detector-all, calibration by confidence, pullbacks, usage) plus head-to-head; auto-posted Saturday after COMPARE and on the 1st.
+Rule proposals: separate CLAUDE / CODEX RULE PROPOSALS cards; `/claude-rules-approve <n>` · `/codex-rules-approve <n>` append to the shared
+`advisor_rules.md` as `- [claude] [approved YYYY-MM-DD · week] …` / `- [codex] …`.
+
+**Replay.** `run.py --codex entry|entry+pullback [--codex-max 60] [--codex-sleep 2] [--codex-model id] [--codex-refresh]` — the same
+no-look-ahead shadow replay as `--claude`, own cache `out/codex_replay_<mode>_<symbol>.jsonl`. With both flags: Detector-all ·
+filtered-by-Claude · filtered-by-Codex · filtered-by-BOTH-agree (kept only when neither said SKIP), SKIP precision and calibration each, and
+the SPLIT list → `out/advisors_replay_<mode>_<symbol>.md`.
+
+Codex commands: `/codex` (health, login, per-agent ATTACHED / REVIEW / OFF) · `/codex-status` (today / week / month usage) · `/codex-test` ·
+`/codex-review [date]` · `/codex-alert [symbol] [side]` · `/codex-attach` / `/codex-detach <symbol>` · `/codex-rules` · `/codex-rules-approve <n>`.
+Codex settings: `AUREON_CODEX_BIN`, `AUREON_CODEX_MODEL`, `AUREON_CODEX_TIMEOUT` (30 s; reviews ≥ 120 s), `AUREON_CODEX_MAX_CALLS` (30/day),
+`AUREON_CODEX_WORKDIR`. Run `codex login` once on the server.
 
 ## v2.2.0 operations (staging)
 See `STATE.md`. Voice commands are **NOT IMPLEMENTED**; planned intents and safety controls: `docs/VOICE_SCOPE.md`. Existing trading strategy rules are unchanged. Do not operate deployment from unreviewed branches.
@@ -235,8 +272,8 @@ See `STATE.md`. Voice commands are **NOT IMPLEMENTED**; planned intents and safe
 | Monitoring | `/status`, `/agents`, `/parallel-status`, `/market`, `/chart`, `/symbols`, `/symbol-present` | Read-only snapshots; bot polls automatically |
 | Trading | `/take`, `/skip`, `/alert`, `/alerts`, `/alert-cancel`, `/alert-clear` | Alerts monitored automatically after arming; trading decision belongs to operator |
 | Claude | `/claude`, `/claude-status`, `/claude-test`, `/claude-review`, `/claude-rules`, `/claude-rules-approve`, `/claude-report` | Status/report read-only; CLI calls consume usage; rule approval manual |
-| Codex | `/codex`, `/codex-status`, `/codex-test`, `/codex-alert` | Read-only advisor, off unless `AUREON_CODEX=advisory`; test/alert consume a local call; never applied |
-| Reports | `/report`, `/compare`, `/compare-breakdown`, `/git-history`, `/pull-history` | On-demand historical diagnostics |
+| Codex | `/codex`, `/codex-status`, `/codex-test`, `/codex-review`, `/codex-alert`, `/codex-attach`, `/codex-detach`, `/codex-rules`, `/codex-rules-approve` | Same as Claude, but verdicts are never applied; CLI calls consume the Codex budget |
+| Reports | `/report`, `/compare`, `/compare-breakdown`, `/advisor-report`, `/git-history`, `/pull-history` | On-demand historical diagnostics |
 | Control | `/restart`, `/mode`, `/discord-bot sync` | Administrator actions only where implemented; restart/mode require configured role ID |
 
 Set `AUREON_ADMIN_ROLE_ID` in your private environment to the Discord server administrator role ID; when missing, privileged restart/mode commands are denied. Changes are not live until the draft branch is merged and validated. `/commands` lists live registered commands. Voice command interface is **NOT IMPLEMENTED**.
