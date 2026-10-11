@@ -52,6 +52,7 @@ class SymbolAgent(threading.Thread):
         self.last_confirmed_cross: dict | None = None   # v2.0.0 ema2050: {"bar_time", "direction"} — the guardian's exit signal
         self.last_bar: int | None = None
         self.caught_up = False            # late-start catch-up card sent once
+        self.started_wall = _time.time()
         self.last_bar_wall: float | None = None   # wall clock of the last processed closed bar (heartbeat)
         self.closed_by_aureon: set = set()        # tickets Aureon closed (anything else that disappears was closed by you)
         self._evidence = {"at": 0.0, "graded": [], "busy": False}
