@@ -77,6 +77,14 @@ def news_status(path: str | None) -> tuple[str, bool]:
 def greet(notify, cfg, S, why, news_line):
     art = banner()
     gv = git_version() if "git_version" in globals() else ""
+    try:
+        from aureon_mt5.common import gitinfo
+        gv = (gv or subprocess.run(["git", "describe", "--tags", "--always"], capture_output=True, text=True, timeout=10).stdout.strip())
+        md = gitinfo.head_merge_date()
+        if md:
+            gv = f"{gv} · merged {md}" if gv else f"merged {md}"      # v2.0.2: the merge date of HEAD on the banner
+    except Exception:
+        pass
     print(art); print(f"v{VERSION}{' · ' + gv if gv else ''} · {S.display_name} · {why} · {datetime.now(IST):%a %d %b %H:%M} IST · {', '.join(cfg.symbols)}")
     srv = datetime.now(timezone.utc) + timedelta(hours=cfg.server_utc_offset)
     guardian_on = any(S.guardian_for(s) for s in cfg.symbols)

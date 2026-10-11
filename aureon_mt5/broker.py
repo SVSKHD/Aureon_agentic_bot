@@ -31,6 +31,9 @@ class BrokerResult:
     requested_sl: float | None = None
     bid: float | None = None
     ask: float | None = None
+    ticket: int | None = None        # v2.0.2 place_market: the position / order ticket
+    price: float | None = None       # v2.0.2 place_market: the fill price
+    volume: float | None = None
 
     def __bool__(self):
         return self.ok
@@ -228,31 +231,55 @@ def is_demo() -> bool | None:
     return None if a is None else (a["trade_mode"] in ("demo", "contest"))
 
 
-def place_market(symbol: str, side: str, lots: float, sl: float | None = None, comment: str = "aureon-alert") -> BrokerResult:
+REQUOTE_RETCODES = (10004, 10020, 10021)      # TRADE_RETCODE_REQUOTE, PRICE_CHANGED, PRICE_OFF
+
+
+def _is_requote(r) -> bool:
+    if r is None:
+        return False
+    c = str(getattr(r, "comment", "") or "").lower()
+    return getattr(r, "retcode", None) in REQUOTE_RETCODES or "requote" in c or "price changed" in c
+
+
+def place_market(symbol: str, side: str, lots: float, sl: float | None = None, comment: str = "aureon-alert", *,
+                 retry_sleep: float = 2.0, sleep=_time.sleep) -> BrokerResult:
     """v2.0.0 — the ONE order-placement path (used by the alert LONG/SHORT buttons when AUREON_EXECUTION=1).
-    Callers decide the policy (execution_enabled, demo/allow_live, max_lots); this only sends the request and reports the retcode."""
+    Callers decide the policy (execution_enabled, demo/allow_live, max_lots); this only sends the request and reports the retcode.
+    v2.0.2: a requote / price-changed rejection is retried ONCE after `retry_sleep` s with a fresh tick; the result carries
+    ticket, fill price and volume."""
     m = mt5()
     if not m:
         return BrokerResult(False, "NO_CONNECTION", comment="no MT5")
-    with _lock:
-        m.symbol_select(symbol, True)
-        t = m.symbol_info_tick(symbol)
-        if not t:
-            return BrokerResult(False, "BROKER_REJECTED", comment="no tick", last_error=_err())
-        is_buy = side.upper() in ("LONG", "BUY")
-        req = {"action": m.TRADE_ACTION_DEAL, "symbol": symbol, "volume": float(lots),
-               "type": m.ORDER_TYPE_BUY if is_buy else m.ORDER_TYPE_SELL, "price": t.ask if is_buy else t.bid,
-               "deviation": 30, "comment": comment[:31], "type_filling": m.ORDER_FILLING_IOC}
-        if sl is not None:
-            req["sl"] = round(float(sl), digits(symbol))
-        r = m.order_send(req)
-        if r is not None and r.retcode != m.TRADE_RETCODE_DONE:
-            req["type_filling"] = m.ORDER_FILLING_FOK; r = m.order_send(req)
+    is_buy = side.upper() in ("LONG", "BUY")
+    attempts = 0; r = None; t = None
+    while attempts < 2:
+        attempts += 1
+        with _lock:
+            m.symbol_select(symbol, True)
+            t = m.symbol_info_tick(symbol)
+            if not t:
+                return BrokerResult(False, "BROKER_REJECTED", comment="no tick", last_error=_err())
+            req = {"action": m.TRADE_ACTION_DEAL, "symbol": symbol, "volume": float(lots),
+                   "type": m.ORDER_TYPE_BUY if is_buy else m.ORDER_TYPE_SELL, "price": t.ask if is_buy else t.bid,
+                   "deviation": 30, "comment": comment[:31], "type_filling": m.ORDER_FILLING_IOC}
+            if sl is not None:
+                req["sl"] = round(float(sl), digits(symbol))
+            r = m.order_send(req)
+            if r is not None and r.retcode != m.TRADE_RETCODE_DONE and not _is_requote(r):
+                req["type_filling"] = m.ORDER_FILLING_FOK; r = m.order_send(req)
+        if r is not None and r.retcode == m.TRADE_RETCODE_DONE:
+            break
+        if _is_requote(r) and attempts < 2:
+            sleep(retry_sleep); continue
+        break
     if r is None:
         return BrokerResult(False, "BROKER_REJECTED", comment="order_send returned None", last_error=_err(), bid=t.bid, ask=t.ask)
     ok = r.retcode == m.TRADE_RETCODE_DONE
+    ticket = getattr(r, "order", None) or getattr(r, "deal", None)
+    price = getattr(r, "price", None)
     return BrokerResult(ok, "PLACED" if ok else "BROKER_REJECTED", changed=ok, retcode=r.retcode, comment=getattr(r, "comment", ""),
-                        last_error="" if ok else _err(), requested_sl=sl, bid=t.bid, ask=t.ask)
+                        last_error="" if ok else _err(), requested_sl=sl, bid=t.bid, ask=t.ask,
+                        ticket=int(ticket) if ticket else None, price=float(price) if price else None, volume=float(getattr(r, "volume", lots) or lots))
 
 
 def spread(symbol: str) -> float | None:

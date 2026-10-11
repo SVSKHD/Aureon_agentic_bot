@@ -1,4 +1,4 @@
-# Aureon MT5 v2.0.1
+# Aureon MT5 v2.0.2
 
 You place the trade. Aureon detects (per selected EMA mode), fires a Discord gunshot, then manages what you placed:
 protect → secure +10 → ride in +5 steps → close on the fast-EMA turn → news safeguard. Reports and slash commands.
@@ -68,6 +68,9 @@ rejected modifications → `❌ AUREON GUARDIAN FAILURE` with retcode, retried, 
 `/claude` (v2.0.1: is Claude Code attached to each agent? header mode · bin · `claude --version` · login; models as configured and as the CLI reported;
 budget calls/max, entry/pullback/alert calls, fast-exit cancellations, last latency/error; one line per agent ATTACHED / REVIEW / NOT ATTACHED / DETACHED) ·
 `/claude-attach <symbol>` · `/claude-detach <symbol>` (runtime toggle, no restart; detach cancels queued jobs; journaled `claude_attach` / `claude_detach`) ·
+`/pull-history [days=7] [symbol]` (v2.0.2: MT5 closed deals ↔ journal by ticket, fills missing `final_points`, per-day lines, unmatched = manual trades) ·
+`/git-history [n=10] [tags]` (v2.0.2: running build, origin/master status, merges on master with PR links in IST + own offset; `tags=true` = last 10 tags) ·
+`/discord-bot sync` (admin: re-sync the slash commands for the guild, stale ones dropped) ·
 `/status` (version, mode, market, tick age, MT5, agent, guardian, position phase/SL/secured/peak, IST-day counters, last broker action, Claude ATTACHED/REVIEW/OFF) ·
 `/parallel-status` · `/agents` (components ✅/❌) · `/symbols` (mode, profile) · `/symbol-present` · `/market` · `/report [current]` (mode, signals by kind, secure steps, exits).
 Every command is acknowledged at once and answered by a followup. Status commands read a per-symbol snapshot the agent refreshes
@@ -147,6 +150,23 @@ points and the last 4 weeks' expectancy. Footer: models used that week and the `
 History: `logs/compare_weekly.jsonl`. For the Saturday Supabase batch, `compare.latest_summary(log_dir)` returns the `compare`
 field for the `aureon_weekly` row (no extra request). Optional `AUREON_COMPARE_CLAUDE_REVIEW=1`: Claude's 5-line "what I got wrong"
 card after the COMPARE card (counts toward the budget; never edits `claude_rules.md`).
+
+## Price alerts (v2.0.2) — two verdicts, clearly labelled
+`/alert <price>` answers with the armed line and a **PREVIEW** card (PRICE · EMA · TREND · AGENT VERDICT for the current bar, "if it hit right
+now", no Claude call). When the level is hit the **🔔 ALERT REACHED** card has five blocks: **PRICE** (hit, server/IST time, approach, pts from
+EMA fast/slow) · **EMA** (values, gap and 6-bar trend, 4-bar fast slope, price position, last cross side/time/confirmed/bars ago/multi, crosses
+today, session, ATR20) · **TREND** (state, pre-cross shoot) · **AGENT VERDICT** — deterministic, the mode's own rules on the last closed bar
+(`AGENT: SHORT — confirmed cross 09:00, pullback touch now, 0.8 pts from EMA20, window open` + the SL the guardian would set, or `WAIT — …`,
+`NO TRADE — 6.4 pts from EMA20 (chase) | no-entry hour | news in 42 min | multi cross`) · **CLAUDE VERDICT** (`⏳ asking Claude (opus) …`,
+`— not attached (mode=off)`, `— budget used`, `— unavailable`). The agent block is always on the card before the Claude call is queued; when
+Claude answers the same card is **edited**: `CLAUDE: SHORT · TAKE · p_win 0.68 · confidence medium`, the reason, `evidence: …`, and
+`AGREES with agent ✅` / `DISAGREES with agent ⚠️ (agent SHORT, Claude SKIP)`. If the card cannot be edited (webhook only) a follow-up
+`ALERT VERDICT · <id>` card repeats both blocks. Buttons `[LONG] [SHORT] [SKIP]`; `alert_decision` journals `agent_verdict, claude_verdict,
+agreed_agent, agreed_claude`; `/report` and the Saturday card show an **ALERTS** table (fired · taken · agent✓ · claude✓ · pts taken).
+Placement feedback: after a successful `place_market` an **ORDER PLACED** card (ticket, side, lots, fill, slippage vs the card price, SL as set,
+spread at fill, time), then PROTECTED; a requote / price-changed rejection is retried once after 2 s, then ❌. The decision is edited into the
+card itself (`TAKEN SHORT · ticket 1234567 · filled 4120.3` / `SKIPPED`); with execution off the card shows the exact guardian SL and
+"waiting for your ticket…", then `ATTACHED · ticket …` when the position appears (≤ 1 poll).
 
 ## Price alerts (v2.0.0) — `/alert`, both modes
 `/alert 4120 [XAUUSD] [note]` arms an alert (`logs/alerts.json`, restart-safe; `side_hint` from below / from above by the current price) and

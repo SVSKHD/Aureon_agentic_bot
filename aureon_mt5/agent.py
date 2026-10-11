@@ -683,8 +683,8 @@ class SymbolAgent(threading.Thread):
                                 footer=card["footer"], meta=card["meta"])
                 self.health["last_signal"] = f"ALERT {a['price']:.2f} @ {ist(bar_t, self.off)}"
                 cl = self.claude_any
-                if cl is not None and getattr(cl, "mode", "off") != "off" and hasattr(cl, "request_alert"):
-                    cl.request_alert(self, a, card, df, bar_t)
+                if card.get("claude_state") == "asking" and cl is not None and hasattr(cl, "request_alert"):
+                    cl.request_alert(self, a, card, df, bar_t)                   # never before the agent block exists (it is on the card)
         except Exception as e:
             telemetry.failure(self.notify, self.journal, title="AUREON ALERT ERROR", key=self.key("ERROR", "alerts"), mode=self.S.name,
                               symbol=self.symbol, action="alert check", exc=e)
@@ -864,6 +864,16 @@ class SymbolAgent(threading.Thread):
                     alert_id = pa["alert_id"]; self.pending_alert = None          # v2.0.0: the trade you placed for an alert
                 self.journal.log("position_seen", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"],
                                  side="LONG" if s > 0 else "SHORT", entry=p["price_open"], open_time=p.get("time"), alert_id=alert_id)
+                if alert_id:                                                       # v2.0.2: the card shows the ticket (≤ 1 poll)
+                    self.notify.edit_card(alerts_mod.key_for(self.symbol, alert_id),
+                                          {"Decision": f"ATTACHED · ticket {p['ticket']} · {p['direction'].upper()} @ {p['price_open']:.2f}"
+                                                       f" · SL {p['sl'] if p['sl'] else '— (protecting)'} · {ist(bar_t, self.off)} IST"})
+                    if p["sl"]:                                                    # SL came with the order: say so (the guardian's PROTECTED card)
+                        self.notify.send(self.key("PROTECTED", p["ticket"]), ctitle(self.symbol, "PROTECTED", p["direction"]),
+                                         [f"initial stop −{g.pre_stop:g} set with the order (alert {alert_id})"],
+                                         fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"],
+                                                                points=p["points"], sl=p["sl"]),
+                                         color=EVENT_COLOURS["protected"], footer=cfooter(self.S.display_name))
             st = self.state.setdefault(p["ticket"], {"symbol": self.symbol, "mode": self.S.name, "direction": p["direction"],
                                                      "entry": p["price_open"], "peak": p["points"], "pre": (sgn != s) if g.p_phase else False, "bars": 0,
                                                      "news_done": False, "secured": 0.0, "alert_id": alert_id})

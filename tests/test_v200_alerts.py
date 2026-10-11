@@ -117,16 +117,18 @@ def test_card_contains_ema_trend_guardian_and_suggestion(rig):
     r.ag._check_alerts(df, df, int(df["time"].iloc[-1]))
     ask = r.n.asks[0]
     assert ask["key"] == "alert:XAUUSD:A1" and ask["title"].startswith("🔔 ALERT REACHED · XAUUSD 4000.00 · cpi")
-    names = [f["name"] for f in ask["fields"]]
-    for key in ("Hit", "Time", "Approach", "Set", "EMA 20 / 50", "Gap", "EMA 20 slope", "Price sits", "Last cross", "Trend", "EMA 50 slope",
-                "Pre-cross shoot", "Session", "ATR 20", "Crosses today", "Position", "Entry window", "News block", "Today"):
-        assert key in names, key
+    vals = {f["name"]: f["value"] for f in ask["fields"]}
+    assert [f["name"] for f in ask["fields"]] == ["PRICE", "EMA", "TREND", "AGENT VERDICT", "CLAUDE VERDICT"]
+    assert "hit **3999.50**" in vals["PRICE"] and "approach from above" in vals["PRICE"] and "pts from EMA20" in vals["PRICE"] and "pts from EMA50" in vals["PRICE"]
+    assert "EMA 20 / 50:" in vals["EMA"] and "gap" in vals["EMA"] and "slope" in vals["EMA"] and "last cross: LONG" in vals["EMA"] and "confirmed yes" in vals["EMA"]
+    assert "crosses today" in vals["EMA"] and "ATR20" in vals["EMA"] and "BULLISH" in vals["TREND"] and "pre-cross shoot" in vals["TREND"]
     line = ask["lines"][0]
-    assert line.startswith("**SUGGEST: LONG — confirmed bull cross, price back at EMA20 (pullback)") and "window open" in line and "guardian SL 3987.50" in line    # hit on the bid (from above) − 12
+    assert line.startswith("**AGENT: LONG — confirmed cross") and "pullback touch now" in line and "pts from EMA20, window open" in line
+    assert "SL would be 3987.5 (−12) · early lock +3 → +1 · secure +10" in vals["AGENT VERDICT"] and "position: flat" in vals["AGENT VERDICT"]
+    assert vals["CLAUDE VERDICT"] == "— not attached (mode=off)"
     m = ask["meta"]
     assert m["kind"] == "alert" and m["suggested_side"] == "LONG" and abs(m["sl"] - (3999.5 - 12.0)) < 1e-9 and m["stop_pts"] == 12.0
-    vals = {f["name"]: f["value"] for f in ask["fields"]}
-    assert vals["Position"] == "flat" and "confirmed yes" in vals["Last cross"] and "LONG" in vals["Last cross"]
+    assert m["agent_verdict"].startswith("AGENT: LONG") and m["claude_state"] == "off"
 
 
 def test_suggestion_equals_detect_verdict_for_every_bar(rig):
@@ -138,7 +140,11 @@ def test_suggestion_equals_detect_verdict_for_every_bar(rig):
         row = detect.bar_row(S2050, res, i, OFF)
         sug = A.suggestion(r.ag, d, res, int(d["time"].iloc[-1]), {"position": None, "window_open": True, "news_block": False}, 4000.0)
         v = entry_verdict(S2050, res, i, OFF)
-        assert sug["decision"] == v["decision"] and sug["reason"] == v["reason"] and f"{v['decision']}: {v['reason']}" in row
+        assert sug["decision"] == v["decision"] and f"{v['decision']}: {v['reason']}" in row
+        if v["decision"] == "WAIT":
+            assert sug["reason"] == v["reason"]
+        if "too far" in v["reason"]:
+            assert sug["reason"].endswith("(chase)") and v["reason"].split("(")[1].split()[0] in sug["reason"]
 
 
 def test_suggestion_for_ema5080_reads_its_own_events(rig):
@@ -166,15 +172,15 @@ def test_buttons_journal_and_no_order_when_execution_disabled(rig):
     r = rig(); r.cfg.execution_enabled = False
     r.store.arm("XAUUSD", 4000.0, 4010.0)
     item = {"meta": {"kind": "alert", "alert_id": "A1", "symbol": "XAUUSD", "price": 3999.9, "bar": 1, "mode": "ema2050", "suggested_side": "LONG"}}
-    text = bot.alert_decision(r.cfg, {"XAUUSD": r.ag}, r.j, r.store, item, "LONG", "tester")
+    text = bot.alert_decision(r.cfg, {"XAUUSD": r.ag}, r.j, r.store, item, "LONG", "tester")["text"]
     assert text.startswith("noted — place it in MT5, I will manage it") and "SL 3988.80" in text      # ask 4000.8 − 12
     assert r.fake.orders == [] and r.ag.pending_alert == {"alert_id": "A1", "side": "LONG", "t": pytest.approx(time.time(), abs=5)}
     d = [x for x in r.j.read(0) if x["event"] == "alert_decision"][-1]
     assert (d["alert_id"], d["side"], d["suggested_side"], d["agreed"]) == ("A1", "LONG", "LONG", True)
-    text = bot.alert_decision(r.cfg, {"XAUUSD": r.ag}, r.j, r.store, item, "SHORT", "tester")
+    text = bot.alert_decision(r.cfg, {"XAUUSD": r.ag}, r.j, r.store, item, "SHORT", "tester")["text"]
     d = [x for x in r.j.read(0) if x["event"] == "alert_decision"][-1]
     assert d["side"] == "SHORT" and d["agreed"] is False and r.fake.orders == []
-    assert bot.alert_decision(r.cfg, {"XAUUSD": r.ag}, r.j, r.store, item, "SKIP", "tester") == "⏭ skipped"
+    assert bot.alert_decision(r.cfg, {"XAUUSD": r.ag}, r.j, r.store, item, "SKIP", "tester")["line"] == "SKIPPED"
     d = [x for x in r.j.read(0) if x["event"] == "alert_decision"][-1]
     assert d["side"] == "skip" and d["agreed"] is False and r.store.get("A1")["decision"] == "skip"
 
@@ -183,10 +189,10 @@ def test_button_places_order_only_on_demo_with_execution_enabled(rig):
     r = rig(); r.cfg.execution_enabled = True; r.cfg.allow_live = False; r.cfg.max_lots = 0.5
     item = {"meta": {"kind": "alert", "alert_id": "A1", "symbol": "XAUUSD", "price": 3999.9, "bar": 1, "mode": "ema2050", "suggested_side": "LONG", "lots": 2.0}}
     r.fake.trade_mode = 2                                                    # real account, allow_live off -> never
-    text = bot.alert_decision(r.cfg, {"XAUUSD": r.ag}, r.j, r.store, item, "LONG", "tester")
+    text = bot.alert_decision(r.cfg, {"XAUUSD": r.ag}, r.j, r.store, item, "LONG", "tester")["text"]
     assert r.fake.orders == [] and "live account" in text
     r.fake.trade_mode = 0                                                    # demo -> placed through broker.place_market with the guardian SL
-    text = bot.alert_decision(r.cfg, {"XAUUSD": r.ag}, r.j, r.store, item, "LONG", "tester")
+    text = bot.alert_decision(r.cfg, {"XAUUSD": r.ag}, r.j, r.store, item, "LONG", "tester")["text"]
     assert text.startswith("✅ placed LONG 0.5 lots XAUUSD") and len(r.fake.orders) == 1
     o = r.fake.orders[0]
     assert o["volume"] == 0.5 and o["type"] == r.fake.ORDER_TYPE_BUY and abs(o["sl"] - (r.fake.ask - 12.0)) < 1e-9
@@ -212,13 +218,14 @@ def test_alert_stats_in_report_and_compare_card():
             {"t": 13, "event": "alert_decision", "alert_id": "A2", "side": "skip", "suggested_side": None, "agreed": True},
             {"t": 20, "event": "closed", "alert_id": "A1", "final_points": 8.5}]
     st = A.stats(recs)
-    assert st == {"fired": 2, "taken": 1, "skipped": 1, "agreed": 1, "graded": 1, "wins": 1, "losses": 0, "points": 8.5}
+    assert st == {"fired": 2, "taken": 1, "skipped": 1, "agreed": 1, "agreed_agent": 1, "agreed_claude": 0, "with_claude": 0, "graded": 1,
+                  "wins": 1, "losses": 0, "points": 8.5}
     lines = "\n".join(A.stats_lines(st))
-    assert "fired 2 · taken 1 (skipped 1) · agreed with the bot 1/1" in lines and "win 1 / loss 0 · +8.5 pts" in lines
+    assert "**ALERTS**" in lines and "fired" in lines and "agent✓" in lines and "claude✓" in lines and "+8.5" in lines and "win 1 / loss 0" in lines
     assert A.stats_lines(A.stats([])) == []
     res = compare.compute(recs, [], 0, 100, OFF)
     c = compare.card(res)
-    assert any(f["name"] == "Alerts" and "taken 1" in f["value"] for f in c["fields"])
+    assert any(f["name"] == "ALERTS" and "+8.5" in f["value"] for f in c["fields"])
 
 
 def test_every_alert_command_goes_through_run():

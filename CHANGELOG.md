@@ -2,6 +2,34 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.0.2 — 2026-10-11  (/alert: two verdicts · placement feedback · /pull-history · /git-history · command sync)
+- `/alert` card (`alerts.reached_card`) rebuilt as five blocks: PRICE · EMA · TREND · **AGENT VERDICT** (deterministic, the mode's own rules on
+  the last closed bar, with the SL the guardian would set / early lock / secure) · **CLAUDE VERDICT** (placeholder `⏳ asking Claude (<model>) …`,
+  `— not attached (mode=off)`, `— budget used`, `— unavailable`). The agent block always exists before the Claude call is queued. When the
+  add-on answers (`request_alert` → `process`) the same card is edited (message id stored on the alert): `CLAUDE: <side> · TAKE|SKIP ·
+  p_win · confidence`, the reason, `evidence: …`, `AGREES with agent ✅` / `DISAGREES with agent ⚠️ (agent X, Claude Y)`; if the edit fails
+  (webhook only) a follow-up `ALERT VERDICT · <id>` card repeats both blocks. Optional `p_win` (0–1) accepted in the reply contract.
+- `/alert <price>` replies with a PREVIEW card of the same blocks for the current bar (zero Claude calls). The alert snapshot is
+  `build_snapshot(event="alert", side=agent side or None)` + alert price/note + the agent verdict; entry model; counts toward the budget;
+  skipped silently when the budget is used.
+- `alert_decision` journals `agent_verdict, claude_verdict, claude_side, agreed_agent, agreed_claude`; `/report` and the Saturday COMPARE card
+  show an ALERTS table (fired · taken · agent✓ · claude✓ · pts taken).
+- Placement feedback: ORDER PLACED card after a successful `place_market` (ticket, side, lots, fill, slippage vs the card price, SL as set, spread
+  at fill, time) then PROTECTED (also when the SL came with the order); a requote / price-changed rejection (10004 / 10020 / 10021 or the
+  comment) is retried once after 2 s with a fresh tick, then ❌ with the reason. `BrokerResult` gains `ticket, price, volume`. The decision is
+  edited into the card's fields (`TAKEN SHORT · ticket … · filled …` / `SKIPPED`); with execution off the card shows the exact guardian SL and
+  "waiting for your ticket…", then `ATTACHED · ticket …` on the first poll that sees the position (`notify.edit_card` → bot card-edit hook).
+- Start-up command sync for the configured guild (`DISCORD_GUILD`): `copy_global_to` + `sync(guild=…)`, stale commands not defined in bot.py
+  dropped, final list logged; `/discord-bot sync` (admin) forces it at runtime.
+- `/pull-history [days=7] [symbol]`: MT5 closed deals of the window (shared RLock, 2 s wait else "MT5 busy — try again"), matched to journal
+  `position_seen` / `closed` rows by ticket, missing `final_points` filled as journal `final_points` rows (read by the alerts stats), one
+  `history_pull` row; card with deals found / matched / newly graded, net points, per-day lines, unmatched tickets; `reports.graded_signals()` line.
+- `/git-history [n=10] [tags]`: running build (`git describe`, HEAD, up to date / behind by N vs origin/master after a 5 s fetch, "fetch failed —
+  showing local"), merges on master newest first in IST and the commit's own offset with `#N` linked to the PR; `tags=true` lists the last 10
+  tags with dates; "not a git checkout" when git is missing — never raises. The start-up banner adds the merge date of HEAD.
+- 15 new tests (211 in this repository).
+- Strategy rules changed: NO.
+
 ## v2.0.1 — 2026-10-11  (thread stop fix · /claude attachment card)
 - FIX `SymbolAgent` set `self._stop = threading.Event()`, shadowing `threading.Thread._stop()`: `join()` raised `TypeError: 'Event' object is
   not callable` (`tests/test_claude_advisor.py::test_off_means_zero_calls`; the supervisor restart / shutdown path live). Renamed to

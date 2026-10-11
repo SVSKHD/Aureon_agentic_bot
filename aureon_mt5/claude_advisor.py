@@ -354,13 +354,16 @@ class ClaudeAdvisor:
         a used budget skips silently (no card). Enqueue only; the poll never waits."""
         if self.mode == "off":
             return False
-        sug = (card.get("meta") or {}).get("suggested_side")
-        snap = build_snapshot(agent, "ALERT", sug or "", bar_t, df)
+        meta = card.get("meta") or {}
+        sug = meta.get("suggested_side")
+        snap = build_snapshot(agent, "alert", sug or "", bar_t, df)                 # event="alert", side = the agent's side or None
         snap["alert"] = {"id": alert["id"], "price": alert["price"], "hit": alert.get("hit_price"), "side_hint": alert.get("side_hint"), "note": alert.get("note")}
-        snap["bot_suggestion"] = {"decision": (card.get("meta") or {}).get("suggestion"), "side": sug, "reason": (card.get("meta") or {}).get("reason")}
+        snap["agent_verdict"] = {"decision": meta.get("suggestion"), "side": sug, "reason": meta.get("reason")}
         return self._enqueue({"type": "alert", "event": "ALERT", "symbol": agent.symbol, "side": sug, "bar_t": bar_t, "off": agent.off,
                               "snapshot": snap, "card_key": card.get("key"), "agent": agent, "alert_id": alert["id"],
-                              "model": self.cfg.claude_entry_model, "mode_name": agent.S.name, "display": agent.S.display_name})
+                              "agent_block": meta.get("agent_block") or meta.get("agent_verdict") or "", "agent_side": sug,
+                              "title": card.get("title", ""), "model": self.cfg.claude_entry_model, "mode_name": agent.S.name,
+                              "display": agent.S.display_name})
 
     def forget(self, symbol: str, ticket):
         self.fired.pop((symbol, ticket), None)
@@ -400,13 +403,17 @@ class ClaudeAdvisor:
             self.daily_review(job.get("day"), force=job.get("force", False)); return
         res = self._call(self.prompt_for(job["snapshot"]), job["model"], job["event"])
         if res is None:
-            self._journal(job, None, latency=0.0, acted=False, stale=False, error="budget used"); return
+            self._journal(job, None, latency=0.0, acted=False, stale=False, error="budget used")
+            if job["type"] == "alert":
+                self.notify.edit_card(job.get("card_key") or "", {"CLAUDE VERDICT": "— budget used"})   # silent: no card, no call
+            return
         v = res.verdict if res.ok else None
         if job["type"] == "alert":
             self._journal(job, v, latency=res.latency_s, acted=False, stale=False, error=("" if v is not None else (res.error or "no verdict")))
             if v is not None:
                 self.stats["last_verdict"] = f"{job['symbol']} ALERT {v['decision']} · {v['confidence']} · {datetime.now(IST):%H:%M} IST"
-                self._alert_line(job, v)
+            job["latency"] = res.latency_s
+            self._alert_line(job, v, error=(res.error or "unavailable") if v is None else "")
             return
         if v is not None and job["type"] == "entry":
             want = _side_word(job["side"])
@@ -564,21 +571,25 @@ class ClaudeAdvisor:
         except Exception as e:
             telemetry.info(f"claude journal failed: {e!r}")
 
-    def _alert_line(self, job, v):
-        """Second line on the ALERT REACHED card: 'Claude: TAKE · high · reason (evidence: ...)'. Falls back to a small card."""
-        ev = ", ".join(v.get("evidence") or [])
-        label = f"{v['decision']}" + (f" {v['side']}" if v.get("side") else "") + f" · {v['confidence']} · {v['reason']}" + (f" (evidence: {ev})" if ev else "")
-        fld = field("Claude add-on", label, inline=False)
-        hook = getattr(self.notify, "claude_edit_hook", None)
-        if hook and job.get("card_key"):
+    def _alert_line(self, job, v, error: str = ""):
+        """v2.0.2: EDIT the ALERT REACHED card's CLAUDE VERDICT block (AGREES / DISAGREES with the agent). If the card cannot be
+        edited (webhook only, expired), post a follow-up 'ALERT VERDICT · <id>' card repeating the AGENT and CLAUDE blocks.
+        The agent block always exists first — the hit card carried it before this call was even queued."""
+        from .alerts import claude_verdict_block
+        blk = claude_verdict_block(v, job.get("agent_side"), error=error)
+        agent = job.get("agent"); store = getattr(agent, "alerts", None)
+        if store is not None:
             try:
-                if hook(job["card_key"], fld):
-                    return
+                store.set_claude(job.get("alert_id"), v, blk["side"], blk["agreed"])
             except Exception:
                 pass
-        self.notify.send(f"{job['mode_name']}:{job['symbol']}:CLAUDE_ALERT:{job.get('alert_id')}", ctitle(job["symbol"], "CLAUDE · ALERT", job.get("side")),
-                         [f"Claude: **{label}**", "second opinion only — you decide; nothing is placed"],
-                         fields=[field("Model", job["model"]), field("Latency", f"{job.get('latency', 0):.0f} s")],
+        if self.notify.edit_card(job.get("card_key") or "", {"CLAUDE VERDICT": blk["text"]}):
+            return
+        self.notify.send(f"{job['mode_name']}:{job['symbol']}:CLAUDE_ALERT:{job.get('alert_id')}",
+                         ctitle(job["symbol"], f"ALERT VERDICT · {job.get('alert_id')}", blk["side"] or job.get("agent_side")),
+                         ["second opinion only — you decide; nothing is placed"],
+                         fields=[field("AGENT VERDICT", job.get("agent_block") or "—", inline=False), field("CLAUDE VERDICT", blk["text"], inline=False),
+                                 field("Model", job["model"]), field("Latency", f"{job.get('latency', 0):.0f} s")],
                          color=EVENT_COLOURS["info"], footer=cfooter(job["display"], "Claude"))
 
     def _entry_card(self, job, v, stale):

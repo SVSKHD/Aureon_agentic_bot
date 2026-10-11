@@ -101,8 +101,13 @@ def validate(v: dict, event: str) -> dict:
     if isinstance(ev, str):
         ev = [x.strip() for x in ev.split(",")]
     evidence = [str(x)[:40] for x in ev if str(x).strip()][:MAX_EVIDENCE] if isinstance(ev, (list, tuple)) else []
+    p_win = v.get("p_win")
+    try:
+        p_win = None if p_win in (None, "", "null") else min(1.0, max(0.0, float(p_win)))
+    except (TypeError, ValueError):
+        p_win = None
     return {"decision": dec, "side": side, "tighten_to": tt if dec == "TIGHTEN" else None, "confidence": conf,
-            "reason": " ".join(words[:MAX_REASON_WORDS]), "evidence": evidence}
+            "reason": " ".join(words[:MAX_REASON_WORDS]), "evidence": evidence, "p_win": p_win}
 
 
 def _is_auth(text: str) -> bool:

@@ -370,19 +370,25 @@ def current_price(sym: str, ag, cfg, lock_timeout: float = 1.0) -> float | None:
     return ag.health.get("close") if ag is not None else None
 
 
-def alert_decision(cfg, agents, journal, alerts, item: dict, side: str, user) -> str:
-    """LONG / SHORT / SKIP on an ALERT REACHED card. Runs OFF the event loop. Journals alert_decision; places the order only when
-    AUREON_EXECUTION=1 on a demo account (or AUREON_ALLOW_LIVE=1), otherwise arms the guardian for the trade you place."""
+def alert_decision(cfg, agents, journal, alerts, item: dict, side: str, user, notify=None, retry_sleep: float = 2.0) -> dict:
+    """LONG / SHORT / SKIP on an ALERT REACHED card. Runs OFF the event loop. Journals alert_decision (agent_verdict, claude_verdict,
+    agreed_agent, agreed_claude); places the order only when AUREON_EXECUTION=1 on a demo account (or AUREON_ALLOW_LIVE=1), otherwise
+    arms the guardian for the trade you place. Returns {"line": <edited into the card>, "text": <detail>, "ok", "ticket"}."""
     m = item.get("meta", {}); sym = m.get("symbol"); aid = m.get("alert_id"); sugg = m.get("suggested_side")
     side = side.upper()
+    a = alerts.get(aid) if (alerts is not None and aid) else None
+    claude_side = (a or {}).get("claude_side"); claude_verdict = (a or {}).get("claude_verdict")
+    agent_verdict = m.get("agent_verdict") or (m.get("suggestion") or "—")
+    common = dict(symbol=sym, mode=m.get("mode"), alert_id=aid, suggested_side=sugg, agent_verdict=agent_verdict,
+                  claude_verdict=claude_verdict, claude_side=claude_side, by=str(user), price=m.get("price"), bar=m.get("bar"))
     if side == "SKIP":
-        journal.log("alert_decision", symbol=sym, mode=m.get("mode"), alert_id=aid, side="skip", suggested_side=sugg, agreed=(sugg is None),
-                    by=str(user), price=m.get("price"), bar=m.get("bar"))
+        journal.log("alert_decision", side="skip", agreed=(sugg is None), agreed_agent=(sugg is None),
+                    agreed_claude=(None if claude_verdict is None else claude_side is None), **common)
         if alerts is not None: alerts.decide(aid, "skip")
-        return "⏭ skipped"
+        return {"line": "SKIPPED", "text": "⏭ skipped", "ok": True, "ticket": None}
     agreed = (sugg == side)
-    journal.log("alert_decision", symbol=sym, mode=m.get("mode"), alert_id=aid, side=side, suggested_side=sugg, agreed=agreed,
-                by=str(user), price=m.get("price"), bar=m.get("bar"))
+    journal.log("alert_decision", side=side, agreed=agreed, agreed_agent=agreed,
+                agreed_claude=(None if claude_verdict is None else (claude_side == side)), **common)
     if alerts is not None: alerts.decide(aid, side)
     ag = agents.get(sym); g = ag.g if ag is not None else None
     tk = None
@@ -393,20 +399,138 @@ def alert_decision(cfg, agents, journal, alerts, item: dict, side: str, user) ->
     sl = ((px - g.pre_stop) if side == "LONG" else (px + g.pre_stop)) if (g is not None and px is not None) else None
     sl_txt = f" · SL {sl:.2f} (−{g.pre_stop:g})" if sl is not None else ""
     demo = broker.is_demo() if not getattr(cfg, "dry", False) else None
+    n = notify if notify is not None else (ag.notify if ag is not None else None)
     if cfg.execution_enabled and (demo or cfg.allow_live) and not getattr(cfg, "dry", False):
         lots = min(float(m.get("lots") or cfg.max_lots), cfg.max_lots)
-        r = broker.place_market(sym, side, lots, sl, comment=f"aureon {aid}")
+        r = broker.place_market(sym, side, lots, sl, comment=f"aureon {aid}", retry_sleep=retry_sleep)
         journal.log("order_placed", symbol=sym, mode=m.get("mode"), alert_id=aid, side=side, lots=lots, sl=sl, ok=bool(r.ok),
-                    status=r.status, retcode=r.retcode, by=str(user))
-        if r.ok:
-            if ag is not None: ag.attach_alert(aid, side)
-            return f"✅ placed {side} {lots:g} lots {sym}{sl_txt} — the guardian takes it from here"
+                    status=r.status, retcode=r.retcode, ticket=r.ticket, fill=r.price, by=str(user))
         if ag is not None: ag.attach_alert(aid, side)
-        return f"❌ order rejected ({r.why()}) — place it in MT5, I will manage it{sl_txt}"
+        if r.ok:
+            card_px = float(m.get("price") or px or 0.0); fill = r.price if r.price is not None else px
+            slip = ((fill - card_px) if side == "LONG" else (card_px - fill)) if (fill is not None and card_px) else None
+            spread = (r.ask - r.bid) if (r.ask is not None and r.bid is not None) else None
+            if n is not None:
+                n.send(f"alert:{sym}:{aid}:ORDER", f"{sym} · MT5 · ORDER PLACED · {side}", [f"alert {aid} · {lots:g} lots at market — the guardian takes it from here"],
+                       fields=[_field("Ticket", f"#{r.ticket}" if r.ticket else "—"), _field("Side", side), _field("Lots", f"{lots:g}"),
+                               _field("Fill", f"{fill:.2f}" if fill is not None else "—"),
+                               _field("Slippage vs card", f"{slip:+.2f}" if slip is not None else "—"),
+                               _field("SL as set", f"{sl:.2f}" if sl is not None else "—"),
+                               _field("Spread at fill", f"{spread:.2f}" if spread is not None else "—"),
+                               _field("Time", f"{datetime.now(IST):%H:%M:%S} IST")],
+                       color=GREEN, footer=f"{ag.S.display_name if ag else cfg.mode} · alert {aid}")
+            return {"line": f"TAKEN {side} · ticket {r.ticket or '—'} · filled {fill:.2f}" if fill is not None else f"TAKEN {side} · ticket {r.ticket or '—'}",
+                    "text": f"✅ placed {side} {lots:g} lots {sym}{sl_txt}", "ok": True, "ticket": r.ticket}
+        return {"line": f"TAKEN {side} · ❌ order rejected ({r.status} {r.retcode or ''} {r.comment}) · place it in MT5, I will manage it{sl_txt}".strip(),
+                "text": f"❌ order rejected ({r.why()}) — place it in MT5, I will manage it{sl_txt}", "ok": False, "ticket": None}
     if ag is not None: ag.attach_alert(aid, side)
     why = ("execution off (AUREON_EXECUTION=0)" if not cfg.execution_enabled else
            "dry run" if getattr(cfg, "dry", False) else "live account — set AUREON_ALLOW_LIVE=1 to let the button place it")
-    return f"noted — place it in MT5, I will manage it{sl_txt} · {why}"
+    return {"line": f"TAKEN {side} · waiting for your ticket…{sl_txt} (guardian will set it)",
+            "text": f"noted — place it in MT5, I will manage it{sl_txt} · {why}", "ok": True, "ticket": None}
+
+
+# ----------------------------------------------------------------------------- v2.0.2 command sync + /pull-history (pure helpers, testable)
+def sync_plan(local: set, remote: set) -> dict:
+    return {"add": sorted(local - remote), "keep": sorted(local & remote), "remove": sorted(remote - local)}
+
+
+async def sync_commands(tree, guild_id: int | None, log=None) -> dict:
+    """Sync the command tree (guild-scoped when DISCORD_GUILD is set), dropping stale commands not defined in bot.py.
+    Returns {"guild", "final", "removed", "added"} and logs the final list."""
+    local = {c.name for c in tree.get_commands()}
+    guild = None
+    if guild_id:
+        import discord  # type: ignore
+        guild = discord.Object(id=int(guild_id))
+        tree.copy_global_to(guild=guild)
+    try:
+        before = {c.name for c in await tree.fetch_commands(guild=guild)}
+    except Exception:
+        before = set()
+    plan = sync_plan(local, before)
+    synced = await tree.sync(guild=guild)
+    final = sorted({c.name for c in synced}) if synced is not None else sorted(local)
+    out = {"guild": guild_id, "final": final, "removed": plan["remove"], "added": plan["add"]}
+    (log or telemetry.info)(f"commands synced{' (guild ' + str(guild_id) + ')' if guild_id else ' (global)'}: {final} · removed stale: {plan['remove']}")
+    return out
+
+
+def pull_history(cfg, agents, journal, days: int = 7, symbol: str | None = None, lock_timeout: float = 2.0) -> Reply:
+    """/pull-history: MT5 closed deals of the window (shared RLock, `lock_timeout` s, else 'MT5 busy'), matched to journal
+    position_seen / closed rows by ticket; missing final_points filled (journal `final_points` rows); one `history_pull` row."""
+    from .common.timeutil import IST as _IST
+    days = max(1, min(int(days), 90))
+    end = datetime.now(timezone.utc) + timedelta(minutes=1); start = end - timedelta(days=days)
+    with broker.try_lock(lock_timeout) as got:
+        if not got:
+            return Reply(content="MT5 busy — try again", source="cache")
+        deals = broker.closed_deals(symbol or None, start, end)
+    recs = journal.read(int(start.timestamp()) - 7 * 86400)
+    seen = {r.get("ticket"): r for r in recs if r.get("event") == "position_seen"}
+    closed = {r.get("ticket"): r for r in recs if r.get("event") == "closed"}
+    filled = {r.get("ticket") for r in recs if r.get("event") == "final_points"}
+    matched, unmatched, newly = [], [], []
+    per_day: dict = {}
+    net_pts = 0.0; graded_pts = 0
+    for d in sorted(deals, key=lambda x: x["time"]):
+        t = d["ticket"]; c = closed.get(t); s = seen.get(t)
+        entry = (c or {}).get("entry") or (s or {}).get("entry")
+        direction = (c or {}).get("direction") or (("long" if s.get("side") == "LONG" else "short") if s else d.get("direction"))
+        pts = round((d["price"] - float(entry)) if direction == "long" else (float(entry) - d["price"]), 2) if entry else None
+        day = datetime.fromtimestamp(d["time"], tz=_IST).strftime("%Y-%m-%d")
+        pd_ = per_day.setdefault(day, {"trades": 0, "points": 0.0, "profit": 0.0, "graded": 0})
+        pd_["trades"] += 1; pd_["profit"] += float(d.get("profit") or 0.0)
+        if pts is not None:
+            pd_["points"] += pts; pd_["graded"] += 1; net_pts += pts; graded_pts += 1
+        if c is not None or s is not None:
+            matched.append(d)
+            needs = c is None or c.get("final_points") is None or c.get("final_approx")
+            if pts is not None and needs and t not in filled:
+                journal.log("final_points", symbol=d["symbol"], ticket=t, final_points=pts, profit=d.get("profit"), price=d["price"],
+                            alert_id=(c or {}).get("alert_id") or (s or {}).get("alert_id"), source="history")
+                newly.append(t); filled.add(t)
+        else:
+            unmatched.append(d)
+    journal.log("history_pull", days=days, symbol=symbol, rows=len(deals), matched=len(matched), unmatched=len(unmatched), newly_graded=len(newly),
+                net_points=round(net_pts, 2))
+    try:
+        from . import reports
+        graded, note = reports.graded_signals(cfg, agents, journal, int(start.timestamp()))
+        grade_line = f"graded signals (scorecard): {len(graded)}" + (f" · {note}" if note else "")
+    except Exception as e:
+        grade_line = f"graded signals: unavailable ({e!r})"[:200]
+    lines = [f"{d} · {v['trades']} trades · {v['points']:+.1f} pts" + (f" ({v['graded']}/{v['trades']} graded)" if v["graded"] != v["trades"] else "")
+             + f" · {v['profit']:+.0f} $" for d, v in sorted(per_day.items())]
+    fields = [_field("Deals", f"found **{len(deals)}** · matched **{len(matched)}** · newly graded **{len(newly)}** · unmatched {len(unmatched)}"),
+              _field("Net", f"**{net_pts:+.1f} pts** over {graded_pts} graded · {sum(float(d.get('profit') or 0) for d in deals):+.0f} $ all deals"),
+              _field("Per day", "\n".join(lines) or "no closed deals in the window", False)]
+    if unmatched:
+        fields.append(_field("Unmatched tickets", "manual trades with no alert / signal: " + ", ".join(f"#{d['ticket']}" for d in unmatched[:20])
+                             + (" …" if len(unmatched) > 20 else ""), False))
+    fields.append(_field("Grading", grade_line, False))
+    card = _embed(f"AUREON · MT5 · PULL HISTORY · {days} d" + (f" · {symbol}" if symbol else ""),
+                  f"{start:%d %b} → {datetime.now(timezone.utc):%d %b} · MT5 history ↔ journal by ticket", color=BLUE, fields=fields,
+                  footer=f"Aureon MT5 v{VERSION}")
+    return Reply(card=card, source="live")
+
+
+def alert_preview(ag, a: dict, current: float | None) -> dict | None:
+    """v2.0.2 /alert reply: the PRICE / EMA / TREND / AGENT VERDICT blocks for the current bar, labelled PREVIEW. Zero Claude calls."""
+    if ag is None or current is None or getattr(ag, "last_df", None) is None:
+        return None
+    try:
+        df = ag.last_df; res = getattr(ag, "last_res", None)
+        if res is None:
+            from .common.source import Bars
+            res = ag.S.analyse({"M5": Bars(ag.symbol, "M5", df[["time", "open", "high", "low", "close"] + [c for c in ("volume",) if c in df]])},
+                               ag.symbol, ag.off, ag.news)["M5"]
+            ag.last_res = res
+        c = alerts_mod.preview_card(ag, a, df, res, int(df["time"].iloc[-1]), float(current))
+        return _embed(c["title"], c["description"], color=BLUE, fields=c["fields"], footer=c["footer"])
+    except Exception as e:
+        telemetry.info(f"alert preview failed: {e!r}")
+        return None
 
 
 def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_notify=None, claude=None, alerts=None):
@@ -446,6 +570,25 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
         return True
 
     notify.claude_edit_hook = _claude_edit
+
+    def _card_edit(key, updates: dict) -> bool:
+        """v2.0.2 (any thread): upsert named fields on a posted ask card (CLAUDE VERDICT, Decision, …) and re-render it."""
+        item = pending.get(key)
+        if not item or not item.get("message"):
+            return False
+        fields = list(item.get("fields") or [])
+        for name, value in updates.items():
+            for f in fields:
+                if f.get("name") == name:
+                    f["value"] = str(value); break
+            else:
+                fields.append({"name": name, "value": str(value), "inline": False})
+        item["fields"] = fields
+        fut = asyncio.run_coroutine_threadsafe(item["message"].edit(embed=_ask_embed(item)), client.loop)
+        fut.result(timeout=10)
+        return True
+
+    notify.card_edit_hook = _card_edit
 
     def _decide(item, decision, user):
         m = item.get("meta", {})
@@ -508,6 +651,11 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
                     fname = os.path.basename(item["png"]); em.set_image(url=f"attachment://{fname}"); files = [discord.File(item["png"], filename=fname)]
                 msg = await ch.send(embed=em, view=view, files=files)
                 item["message"] = msg; pending[item["key"]] = item
+                if (item.get("meta") or {}).get("kind") == "alert" and alerts is not None:      # v2.0.2: message id on the alert
+                    try:
+                        alerts.set_message(item["meta"]["alert_id"], msg.id, getattr(ch, "id", None))
+                    except Exception:
+                        pass
                 while len(pending) > 50: pending.pop(next(iter(pending)))
             except Exception as e:
                 print("  (ask post failed:", e, ") — falling back to webhook")
@@ -528,10 +676,12 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
                 await inter.response.send_message(f"already answered: {self.item['decided']}", ephemeral=True); return
             self.item["decided"] = side
             await inter.response.defer()
-            text = await asyncio.to_thread(alert_decision, cfg, agents, journal, alerts, self.item, side, inter.user)
+            r = await asyncio.to_thread(alert_decision, cfg, agents, journal, alerts, self.item, side, inter.user, notify)
             for c in self.children: c.disabled = True
+            # the decision lives in the card's fields (not only an ephemeral reply) so the history is readable later
+            self.item["fields"] = [f for f in (self.item.get("fields") or []) if f.get("name") != "Decision"] + \
+                [{"name": "Decision", "value": f"**{r['line']}** · {inter.user.display_name} · {datetime.now(IST):%H:%M} IST — {r['text']}"[:1024], "inline": False}]
             em = _ask_embed(self.item)
-            em.add_field(name="Decision", value=f"**{side}** · {inter.user.display_name} · {datetime.now(IST):%H:%M} IST — {text}"[:1024], inline=False)
             em.color = GREEN if side == "LONG" else RED if side == "SHORT" else GREY
             try:
                 await self.item["message"].edit(embed=em, view=self)
@@ -588,7 +738,11 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
         monitor.gateway_up()
         if not getattr(client, "_aureon_started", False):
             client._aureon_started = True
-            await tree.sync()
+            try:
+                await sync_commands(tree, cfg.guild_id)                       # v2.0.2: guild sync, stale commands dropped, list logged
+            except Exception as e:
+                telemetry.info(f"command sync failed: {e!r}")
+                await tree.sync()
             client.loop.create_task(_ask_pump())
             client.loop.create_task(monitor.ticker(client))
             monitor.start_watchdog()
@@ -663,8 +817,43 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             a = alerts.arm(sym, price, cur, note, getattr(user, "display_name", str(user)), getattr(ag, "last_bar", None))
             journal.log("alert_armed", symbol=sym, mode=cfg.mode, alert_id=a["id"], price=a["price"], side_hint=a["side_hint"], note=a["note"],
                         current=cur, by=str(user))
-            return Reply(content=alerts_mod.armed_reply(a, cur), source="live" if cur is not None else "cache")
+            card = alert_preview(ag, a, cur)                                   # v2.0.2: PREVIEW of the two blocks, no Claude call
+            return Reply(content=alerts_mod.armed_reply(a, cur), card=card, source="live" if cur is not None else "cache")
         await run(inter, "alert", work)
+
+    @tree.command(name="pull-history", description="MT5 closed deals of the last N days matched to the journal by ticket")
+    @app_commands.describe(days="window in days (default 7)", symbol="default: all symbols")
+    async def pull_history_cmd(inter: discord.Interaction, days: int = 7, symbol: str = ""):
+        await run(inter, "pull-history", lambda: pull_history(cfg, agents, journal, days, symbol.upper() or None), timeout=30)
+
+    @tree.command(name="git-history", description="Merges on master, the running build, origin/master status (or: tags)")
+    @app_commands.describe(n="merges to show (default 10)", tags="true = the last 10 tags with dates")
+    async def git_history_cmd(inter: discord.Interaction, n: int = 10, tags: bool = False):
+        def work():
+            from .common import gitinfo
+            h = gitinfo.history(n)
+            c = gitinfo.card(h, VERSION, n, tags)
+            if not h["ok"]:
+                return Reply(content=c["description"])
+            return Reply(card=_embed(c["title"], c["description"], color=c["color"], fields=c["fields"], footer=f"Aureon MT5 v{VERSION} · git"), source="live")
+        await run(inter, "git-history", work, timeout=15)
+
+    bot_group = app_commands.Group(name="discord-bot", description="Bot administration")
+
+    @bot_group.command(name="sync", description="Admin: re-sync the slash commands now (drops stale ones)")
+    async def discord_bot_sync(inter: discord.Interaction):
+        user = inter.user
+        def work():
+            perms = getattr(user, "guild_permissions", None)
+            if perms is not None and not getattr(perms, "administrator", False):
+                return Reply(content="admin only")
+            fut = asyncio.run_coroutine_threadsafe(sync_commands(tree, cfg.guild_id), client.loop)
+            out = fut.result(timeout=25)
+            return Reply(content=f"synced {len(out['final'])} command(s)" + (f" for guild {out['guild']}" if out["guild"] else " globally")
+                                 + f" · removed stale: {', '.join(out['removed']) or 'none'} · added: {', '.join(out['added']) or 'none'}", source="live")
+        await run(inter, "discord-bot sync", work, timeout=30)
+
+    tree.add_command(bot_group)
 
     @tree.command(name="alerts", description="Armed price alerts with the distance to the current price")
     @app_commands.describe(symbol="default: primary symbol")

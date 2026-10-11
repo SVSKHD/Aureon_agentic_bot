@@ -122,6 +122,14 @@ class AlertStore:
     def decide(self, alert_id: str, decision: str) -> dict | None:
         return self._set(alert_id, decision=decision)
 
+    def set_message(self, alert_id: str, message_id, channel_id=None) -> dict | None:
+        """v2.0.2: the Discord message of the ALERT REACHED card (edited later with the Claude verdict / the decision)."""
+        return self._set(alert_id, message_id=message_id, channel_id=channel_id)
+
+    def set_claude(self, alert_id: str, verdict: dict | None, side: str | None, agreed: bool | None) -> dict | None:
+        return self._set(alert_id, claude_verdict=(verdict or {}).get("decision"), claude_side=side, claude_agreed=agreed,
+                         claude_reason=(verdict or {}).get("reason"), claude_p_win=(verdict or {}).get("p_win"))
+
     # ---- firing
     @staticmethod
     def crossed(a: dict, bid: float, ask: float) -> bool:
@@ -290,83 +298,204 @@ def _losses_today(agent) -> int:
         return 0
 
 
+def _news_minutes(agent, bar_t: int) -> int | None:
+    """Minutes to the next release inside the entry block window (None when clear)."""
+    off = agent.off; tu = bar_t - off * 3600
+    for r in sorted(agent.news or ()):
+        if r - 60 * 60 <= tu < r + 30 * 60:
+            return int(max(0, (r - tu) // 60))
+    return None
+
+
 def suggestion(agent, df, res: dict, bar_t: int, gctx: dict, current: float) -> dict:
-    """SUGGEST line derived strictly from the mode's own verdict for the last closed bar (never a new rule)."""
+    """The AGENT verdict: deterministic, from the mode's own rules on the last closed bar (common/verdict.py) — never a new rule.
+    Returns decision LONG|SHORT|WAIT|NO TRADE, side, reason, sl, line ('AGENT: SHORT — …'), sl_line, text (the block)."""
     S = agent.S; g = agent.g; off = agent.off
     v = entry_verdict(S, res, len(df) - 1, off)
     stop_pts = g.pre_stop if g else None
+    cf = S.ema_cols[0]
+    dist = abs(float(df["close"].iloc[-1]) - float(df[cf].iloc[-1])) if len(df) else 0.0      # the rule's own distance (bar close)
     if gctx.get("position") is not None:
         p = gctx["position"]
-        return {"decision": "WAIT", "side": None, "reason": f"already in a {p['direction'].upper()} ({p['points']:+.1f}) — the guardian manages it",
-                "line": f"SUGGEST: WAIT — in trade {p['direction'].upper()} {p['points']:+.1f}, guardian manages it", "sl": None, "verdict": v}
-    dec = v["decision"]; reason = v["reason"]
-    if dec in ("LONG", "SHORT"):
-        if gctx.get("news_block"):
-            dec, reason = "NO TRADE", "news block"
-        elif not gctx.get("window_open", True):
-            dec, reason = "NO TRADE", "no-entry hour"
-    side = dec if dec in ("LONG", "SHORT") else None
+        dec, side, reason = "WAIT", None, f"in trade {p['direction'].upper()} {p['points']:+.1f} — the guardian manages it"
+    else:
+        dec, reason = v["decision"], v["reason"]
+        if dec in ("LONG", "SHORT"):
+            if gctx.get("news_block"):
+                mins = _news_minutes(agent, bar_t)
+                dec, reason = "NO TRADE", f"news in {mins} min" if mins is not None else "news block"
+            elif not gctx.get("window_open", True):
+                dec, reason = "NO TRADE", "no-entry hour"
+            else:
+                lc = v.get("confirm", "")
+                if S.name == "ema2050":
+                    touched = bool(v.get("touch")); ctime = ""
+                    try:
+                        x = next((x for x in (res.get("cross_infos") or []) if x.confirm_index is not None and x.entry_index == len(df) - 1), None)
+                        if x is not None:
+                            ctime = ist_str(int(df["time"].iloc[x.confirm_index]), off, "%H:%M")
+                    except Exception:
+                        ctime = ""
+                    reason = (f"confirmed cross{(' ' + ctime) if ctime else ''}, {'pullback touch now' if touched else 'no-pullback fallback'}, "
+                              f"{dist:.1f} pts from EMA{S.fast}, window open")
+                else:
+                    reason = f"{reason}, {dist:.1f} pts from EMA{S.fast}, window open"
+        elif dec == "NO TRADE" and reason.startswith("too far from EMA"):
+            reason = f"{dist:.1f} pts from EMA{S.fast} (chase)"
+        elif dec == "NO TRADE" and "multi" in reason:
+            reason = "multi cross"
+        dec = dec if dec in ("LONG", "SHORT", "WAIT", "NO TRADE") else "WAIT"
+        side = dec if dec in ("LONG", "SHORT") else None
     sl = None
     if side and stop_pts is not None:
         sl = current - stop_pts if side == "LONG" else current + stop_pts
-    line = f"SUGGEST: {dec} — {reason}" + (" · window open" if side else "")
-    if sl is not None:
-        line += f" · guardian SL {sl:.2f} (−{stop_pts:g})"
-    elif stop_pts is not None and dec in ("WAIT",):
-        line += f" · guardian stop would be −{stop_pts:g}"
-    return {"decision": dec, "side": side, "reason": reason, "line": line, "sl": sl, "verdict": v}
+    line = f"AGENT: {dec} — {reason}"
+    if g is not None:
+        if g.early_at is not None:
+            sl_line = f"SL would be {sl:.1f} (−{stop_pts:g}) · early lock +{g.early_at:g} → +{g.early_level:g} · secure +{g.secure_at:g}" if sl is not None else \
+                      f"stop −{stop_pts:g} · early lock +{g.early_at:g} → +{g.early_level:g} · secure +{g.secure_at:g}"
+        else:
+            sl_line = f"SL would be {sl:.1f} (−{stop_pts:g}) · secure +{g.secure_at:g} · ride +{g.ride_step:g}" if sl is not None else \
+                      f"stop −{stop_pts:g} · secure +{g.secure_at:g} · ride +{g.ride_step:g}"
+    else:
+        sl_line = "no guardian profile for this symbol"
+    pos = gctx.get("position")
+    ctx = (f"position: {pos['direction'].upper()} {pos['points']:+.1f}" if pos else "position: flat") + \
+          f" · news: {'BLOCK' if gctx.get('news_block') else 'clear'} · losses today {gctx.get('losses', 0)}/{agent.cfg.daily_max_losses}"
+    text = f"**{line}**\n{sl_line}\n{ctx}"
+    return {"decision": dec, "side": side, "reason": reason, "line": line, "sl": sl, "sl_line": sl_line, "text": text, "verdict": v}
 
 
-def reached_card(agent, a: dict, hit_price: float, tick_time: int, bar_t: int, df, res: dict) -> dict:
-    """{key, title, lines, fields, meta, color, footer} for notify.ask(); the bot adds [LONG] [SHORT] [SKIP]."""
-    S = agent.S; off = agent.off
-    created_bar = a.get("created_bar"); bars_since = int((bar_t - created_bar) // BAR_S) if created_bar else None
-    title = f"🔔 ALERT REACHED · {a['symbol']} {a['price']:.2f}" + (f" · {a['note']}" if a.get("note") else "")
-    price_fields = [field("Hit", f"**{hit_price:.2f}**"), field("Time", f"{server_str(tick_time, '%H:%M:%S')} server · {ist_str(tick_time, off, '%H:%M:%S')} IST"),
-                    field("Approach", a["side_hint"]), field("Set", f"{a['created_ist']} IST" + (f" · {bars_since} bars ago" if bars_since is not None else ""))]
+def claude_placeholder(agent) -> tuple[str, str]:
+    """(state, text) for the CLAUDE VERDICT block before any call: asking | off | budget | unavailable."""
+    cl = getattr(agent, "claude_any", None)
+    if cl is None or getattr(cl, "mode", "off") == "off":
+        return "off", "— not attached (mode=off)"
+    st = cl.stats if hasattr(cl, "stats") else {}
+    if st.get("login") in ("NOT FOUND", "FAILED"):
+        return "unavailable", f"— unavailable ({'Claude Code not found' if st.get('login') == 'NOT FOUND' else 'not logged in'})"
+    try:
+        if cl.budget.used() >= cl.cfg.claude_max_calls:
+            return "budget", "— budget used"
+    except Exception:
+        pass
+    return "asking", f"⏳ asking Claude ({cl.cfg.claude_entry_model}) …"
+
+
+def claude_side(v: dict | None) -> str | None:
+    if not v or v.get("decision") != "TAKE":
+        return None
+    return {"BUY": "LONG", "SELL": "SHORT"}.get(str(v.get("side") or "").upper())
+
+
+def claude_verdict_block(v: dict | None, agent_side: str | None, error: str = "") -> dict:
+    """The CLAUDE VERDICT block after the call: text, side, agreed (None when no verdict)."""
+    if v is None:
+        return {"text": f"— {error or 'unavailable'}", "side": None, "agreed": None, "decision": None}
+    cs = claude_side(v)
+    head = f"CLAUDE: {cs or '—'} · {v['decision']}" + (f" · p_win {v['p_win']:.2f}" if v.get("p_win") is not None else "") + f" · confidence {v.get('confidence', '—')}"
+    lines = [f"**{head}**", f"\"{v.get('reason', '')}\""]
+    if v.get("evidence"):
+        lines.append("evidence: " + ", ".join(v["evidence"]))
+    agreed = (cs == agent_side)
+    lines.append("AGREES with agent ✅" if agreed else f"DISAGREES with agent ⚠️ (agent {agent_side or 'no trade'}, Claude {cs or v['decision']})")
+    return {"text": "\n".join(lines), "side": cs, "agreed": agreed, "decision": v["decision"]}
+
+
+def blocks(agent, df, res: dict, bar_t: int, price: float) -> dict:
+    """PRICE / EMA / TREND / AGENT VERDICT text blocks for the last closed bar (shared by the hit card and the /alert PREVIEW)."""
+    S = agent.S; off = agent.off; cf, cs = S.ema_cols
     ema_f, ema = ema_behaviour(S, df, res, off)
     tr_f, tr = trend_behaviour(S, agent, df, res, off, bar_t, ema["last_cross"])
     g_f, gctx = guardian_context(agent, bar_t)
-    sug = suggestion(agent, df, res, bar_t, gctx, hit_price)
-    lines = [f"**{sug['line']}**"]
-    fields = price_fields + [field("— EMA behaviour —", "​", inline=False)] + ema_f + [field("— Trend behaviour —", "​", inline=False)] + tr_f \
-        + [field("— Guardian —", "​", inline=False)] + g_f
+    sug = suggestion(agent, df, res, bar_t, gctx, price)
+    lc = ema["last_cross"]
+    ema_text = (f"EMA {S.fast} / {S.slow}: {ema['ema_fast']:.2f} / {ema['ema_slow']:.2f} · gap {ema['gap']:+.2f} ({ema['gap_trend']}, 6 bars) · "
+                f"EMA {S.fast} slope {ema['slope']:+.2f} (4 bars) · price {ema['where']}\n"
+                f"last cross: {lc['text']}\ncrosses today {tr['crosses_today']} · session {tr['session']} · ATR20 {tr['atr20']:.2f}")
+    trend_text = f"**{tr['trend']}** · EMA {S.slow} slope {tr['slow_slope']:+.2f} (10 bars) · pre-cross shoot {lc.get('shoot', 0.0):+.1f} pts"
+    d_fast = price - float(df[cf].iloc[-1]); d_slow = price - float(df[cs].iloc[-1])
+    return {"ema_text": ema_text, "trend_text": trend_text, "agent": sug, "gctx": gctx, "ema": ema, "trend": tr,
+            "dist": f"{d_fast:+.1f} pts from EMA{S.fast} · {d_slow:+.1f} pts from EMA{S.slow}"}
+
+
+def reached_card(agent, a: dict, hit_price: float, tick_time: int, bar_t: int, df, res: dict) -> dict:
+    """{key, title, lines, fields, meta, color, footer, …} for notify.ask(); the bot adds [LONG] [SHORT] [SKIP].
+    Blocks: PRICE · EMA · TREND · AGENT VERDICT · CLAUDE VERDICT (placeholder until the add-on answers)."""
+    S = agent.S; off = agent.off
+    b = blocks(agent, df, res, bar_t, hit_price); sug = b["agent"]
+    created_bar = a.get("created_bar"); bars_since = int((bar_t - created_bar) // BAR_S) if created_bar else None
+    title = f"🔔 ALERT REACHED · {a['symbol']} {a['price']:.2f}" + (f" · {a['note']}" if a.get("note") else "")
+    price_text = (f"hit **{hit_price:.2f}** · {server_str(tick_time, '%H:%M:%S')} server · {ist_str(tick_time, off, '%H:%M:%S')} IST · approach {a['side_hint']}"
+                  + (f" · set {bars_since} bars ago" if bars_since is not None else "") + f"\n{b['dist']}")
+    state, ph = claude_placeholder(agent)
+    fields = [field("PRICE", price_text, inline=False), field("EMA", b["ema_text"], inline=False), field("TREND", b["trend_text"], inline=False),
+              field("AGENT VERDICT", sug["text"], inline=False), field("CLAUDE VERDICT", ph, inline=False)]
     meta = {"kind": "alert", "alert_id": a["id"], "symbol": a["symbol"], "price": hit_price, "bar": bar_t, "mode": S.name,
             "suggested_side": sug["side"], "suggestion": sug["decision"], "reason": sug["reason"], "sl": sug["sl"],
-            "stop_pts": agent.g.pre_stop if agent.g else None, "note": a.get("note", "")}
+            "stop_pts": agent.g.pre_stop if agent.g else None, "note": a.get("note", ""), "agent_verdict": sug["line"],
+            "agent_block": sug["text"], "claude_state": state}
     colour = EVENT_COLOURS["signal_long" if sug["side"] == "LONG" else "signal_short" if sug["side"] == "SHORT" else "news"]
-    return {"key": key_for(a["symbol"], a["id"]), "title": title, "lines": lines, "fields": fields, "meta": meta, "color": colour,
-            "footer": cfooter(S.display_name, f"alert {a['id']}"), "ema": ema, "trend": tr, "guardian": gctx, "suggestion": sug}
+    return {"key": key_for(a["symbol"], a["id"]), "title": title, "lines": [f"**{sug['line']}**"], "fields": fields, "meta": meta, "color": colour,
+            "footer": cfooter(S.display_name, f"alert {a['id']}"), "ema": b["ema"], "trend": b["trend"], "guardian": b["gctx"], "suggestion": sug,
+            "claude_state": state}
+
+
+def preview_card(agent, a: dict, df, res: dict, bar_t: int, current: float) -> dict:
+    """/alert at creation: the same blocks for the current bar ('if it hit right now'), labelled PREVIEW. No Claude call."""
+    S = agent.S
+    b = blocks(agent, df, res, bar_t, current); sug = b["agent"]
+    fields = [field("PRICE · PREVIEW", f"current **{current:.2f}** · alert {a['price']:.2f} ({a['side_hint']}, {abs(a['price'] - current):.1f} pts away)\n{b['dist']}", inline=False),
+              field("EMA", b["ema_text"], inline=False), field("TREND", b["trend_text"], inline=False),
+              field("AGENT VERDICT · PREVIEW (this bar, not the hit)", sug["text"], inline=False),
+              field("CLAUDE VERDICT", "— asked only when the alert is reached", inline=False)]
+    return {"title": f"🔔 ALERT ARMED · {a['symbol']} {a['price']:.2f} · PREVIEW" + (f" · {a['note']}" if a.get("note") else ""),
+            "description": armed_reply(a, current), "fields": fields, "footer": cfooter(S.display_name, f"alert {a['id']} · preview"),
+            "agent": sug}
 
 
 # ============================================================================= stats for /report and the Saturday card
+def _bool(x):
+    return None if x is None else bool(x)
+
+
 def stats(records: list[dict]) -> dict:
-    """fired · taken (LONG/SHORT) · agreed with the bot · win/loss of the taken ones (closed rows carrying the alert_id)."""
+    """fired · taken · agreed with the agent · agreed with Claude · points of the taken ones (closed / final_points rows by alert_id)."""
     fired = [r for r in records if r.get("event") == "alert_fired"]
     dec = [r for r in records if r.get("event") == "alert_decision"]
     taken = [r for r in dec if str(r.get("side", "")).upper() in ("LONG", "SHORT")]
     skipped = [r for r in dec if str(r.get("side", "")).lower() == "skip"]
-    agreed = sum(1 for r in taken if r.get("agreed"))
+    agreed_agent = sum(1 for r in taken if _bool(r.get("agreed_agent", r.get("agreed"))))
+    with_claude = [r for r in taken if r.get("agreed_claude") is not None]
+    agreed_claude = sum(1 for r in with_claude if r.get("agreed_claude"))
     closes = {r.get("alert_id"): r for r in records if r.get("event") == "closed" and r.get("alert_id")}
     exits = {r.get("alert_id"): r for r in records if r.get("event") == "exit" and r.get("alert_id")}
+    fills = {r.get("alert_id"): r for r in records if r.get("event") == "final_points" and r.get("alert_id")}
     wins = losses = 0; pts = 0.0; graded = 0
     for r in taken:
-        c = closes.get(r.get("alert_id")); x = exits.get(r.get("alert_id"))
-        final = (c or {}).get("final_points")
-        if final is None and x is not None:
-            final = x.get("points")
+        aid = r.get("alert_id")
+        final = (fills.get(aid) or {}).get("final_points")
+        if final is None:
+            final = (closes.get(aid) or {}).get("final_points")
+        if final is None and aid in exits:
+            final = exits[aid].get("points")
         if final is None:
             continue
         graded += 1; pts += float(final)
         if float(final) > 0: wins += 1
         else: losses += 1
-    return {"fired": len(fired), "taken": len(taken), "skipped": len(skipped), "agreed": agreed, "graded": graded, "wins": wins, "losses": losses,
-            "points": round(pts, 2)}
+    return {"fired": len(fired), "taken": len(taken), "skipped": len(skipped), "agreed": agreed_agent, "agreed_agent": agreed_agent,
+            "agreed_claude": agreed_claude, "with_claude": len(with_claude), "graded": graded, "wins": wins, "losses": losses, "points": round(pts, 2)}
+
+
+def stats_table(st: dict) -> str:
+    cl = f"{st['agreed_claude']}/{st['with_claude']}" if st.get("with_claude") else "—"
+    return (f"{'fired':<7}{'taken':<7}{'agent✓':<9}{'claude✓':<9}{'pts taken':>10}\n"
+            f"{st['fired']:<7}{st['taken']:<7}{str(st['agreed_agent']) + '/' + str(st['taken']) if st['taken'] else '—':<9}{cl:<9}{st['points']:>+10.1f}")
 
 
 def stats_lines(st: dict) -> list[str]:
     if not (st["fired"] or st["taken"]):
         return []
-    agree = f"{st['agreed']}/{st['taken']}" if st["taken"] else "—"
-    return [f"\n**Alerts**", f"fired {st['fired']} · taken {st['taken']} (skipped {st['skipped']}) · agreed with the bot {agree}",
-            f"taken & closed {st['graded']}: win {st['wins']} / loss {st['losses']} · {st['points']:+.1f} pts"]
+    return ["\n**ALERTS**", "```\n" + stats_table(st) + "\n```",
+            f"skipped {st['skipped']} · taken & closed {st['graded']}: win {st['wins']} / loss {st['losses']}"]
