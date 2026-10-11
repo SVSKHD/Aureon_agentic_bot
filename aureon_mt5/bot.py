@@ -1100,6 +1100,40 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             return Reply(card=_embed("AUREON · CLAUDE USAGE", "CLI reported usage; not independently priced at model list rates.", fields=fields))
         await run(inter, "claude-status", work)
 
+    # ------------------------------------------------------------------ v2.2.0 admin controls
+    from . import ops
+
+    @tree.command(name="restart", description="Admin: stop agents cleanly and restart process; requires role")
+    @app_commands.describe(reason="Reason shown on the BACK ONLINE card")
+    async def restart_cmd(inter: discord.Interaction, reason: str = ""):
+        role_id = os.environ.get("AUREON_ADMIN_ROLE_ID", "")
+        if not ops.admin_allowed(inter.user, role_id):
+            await run(inter, "restart", lambda: Reply(content="Denied: configured administrator role required"), ephemeral=True)
+            return
+        await inter.response.send_message(f"RESTARTING · requested by {inter.user} · {reason or 'manual'}")
+        await asyncio.to_thread(ops.restart_process, agents, journal, notify, inter.user, reason)
+
+    @tree.command(name="mode", description="Admin: change EMA process mode and restart; rejects open positions")
+    @app_commands.describe(mode="ema2050 or ema5080", symbols="Comma-separated symbols; blank preserves existing", force="Override open-position gate (unsafe)")
+    async def mode_cmd(inter: discord.Interaction, mode: str, symbols: str = "", force: bool = False):
+        role_id = os.environ.get("AUREON_ADMIN_ROLE_ID", "")
+        if not ops.admin_allowed(inter.user, role_id):
+            await inter.response.send_message("Denied: configured administrator role required", ephemeral=True); return
+        if mode not in ("ema2050", "ema5080"):
+            await inter.response.send_message("Unsupported mode; use ema2050 or ema5080", ephemeral=True); return
+        if not force and ops.positions_block_mode_change(agents):
+            await inter.response.send_message("position open or position status unverified — /mode after it closes or pass force:true", ephemeral=True)
+            return
+        # .env is the deployment source of truth; never write to a different unknown path.
+        env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
+        try:
+            names = ops.write_mode(env_path, mode, symbols or None)
+        except Exception as exc:
+            await inter.response.send_message(f"MODE NOT CHANGED: {exc}", ephemeral=True); return
+        await inter.response.send_message(f"MODE CHANGE → {mode} · restarting")
+        await asyncio.to_thread(ops.restart_process, agents, journal, notify, inter.user,
+                                f"mode change to {mode}", mode, names)
+
     # ------------------------------------------------------------------ v1.10.0 Claude add-on (all off the loop via run())
     claude_wait = float(getattr(cfg, "claude_timeout", 90)) * 2 + 15      # a call may queue behind one in flight
 
