@@ -282,9 +282,11 @@ def test_saturday_hook_once_restart_safe(tmp_path):
     assert datetime.fromtimestamp(until, tz=IST).strftime("%a %H:%M") == "Sat 00:00"
 
 
-def test_saturday_hook_skips_ema2050(tmp_path):
+def test_saturday_hook_runs_for_both_modes_only(tmp_path):
     import main
-    cfg = _cfg(tmp_path); cfg.mode = "ema2050"
+    cfg = _cfg(tmp_path); cfg.mode = "ema2050"                      # v2.0.0: ema2050 is active -> the Saturday card runs for it too
+    assert main.compare_saturday_tick(cfg, {}, Journal(str(tmp_path)), Cap(), now=datetime(2026, 10, 10, 11, 0, tzinfo=IST)) == "2026-W41"
+    cfg.mode = "ema1234"
     assert main.compare_saturday_tick(cfg, {}, Journal(str(tmp_path)), Cap(), now=datetime(2026, 10, 10, 11, 0, tzinfo=IST)) is None
 
 

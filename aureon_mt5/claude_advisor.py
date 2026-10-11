@@ -10,7 +10,9 @@ Safety:
   * Fail closed: timeout / bad JSON / wrong decision / auth error / budget used / STALE → nothing acted on (v1.9.7 behaviour).
   * Actions run on the agent thread, after the guardian: TIGHTEN only through the guardian's `_move_sl` (never loosens,
     announced after MT5 confirms); CLOSE only in `manage`, only in profit, through the guardian's `_close`.
-  * ema5080 only. No account number, balance, login, webhook or token is ever put in a snapshot.
+  * v2.0.0: both modes. ema2050 is asked at the ENTER bar (confirmed cross + pullback touch) and on pullbacks in a trade only —
+    never at a raw CROSS or a MULTI CROSS. The /alert card gets the add-on verdict in review/advisory/manage (event ALERT).
+    No account number, balance, login, webhook or token is ever put in a snapshot.
 This module does not import broker.py and has no order placement (a test enforces it)."""
 from __future__ import annotations
 
@@ -22,6 +24,8 @@ import time as _time
 from collections import deque
 from datetime import datetime, timedelta
 
+import numpy as np
+
 from . import telemetry
 from .common import claude_cli
 from .common.claude_cli import Budget, IST, ist_day
@@ -31,12 +35,14 @@ from .notify import EVENT_COLOURS, field, footer as cfooter, position_fields, ti
 
 MODES = ("off", "review", "advisory", "manage")
 ADVISE_MODES = ("advisory", "manage")
-STRATEGY = "ema5080"                       # the add-on hooks into this mode only
+STRATEGY = "ema5080"                       # key prefix for the ALL-symbol cards (kept for dedupe compatibility)
+STRATEGIES = ("ema5080", "ema2050")        # v2.0.0: the add-on advises both modes
 UNAVAILABLE_BACKOFF_S = 300
 BAR_S = 300
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RULES_PATH = os.path.join(ROOT, "prompts", "claude_rules.md")
-KIND_TO_EVENT = {"P": "P", "cross": "CROSS", "reentry": "RE"}
+KIND_TO_EVENT = {"P": "P", "cross": "CROSS", "reentry": "RE", "enter": "ENTER", "pullback": "ENTER", "no-pullback": "ENTER"}
+EMA_NAMES = {"ema5080": ("EMA 50", "EMA 80"), "ema2050": ("EMA 20", "EMA 50")}
 TREND_PULLBACK = ("PULLBACK", "WEAKENING", "CHALLENGED")
 
 REVIEW_PROMPT = ("You are reviewing one trading day of Aureon, an XAUUSD M5 EMA 50/80 assistant. A human placed every trade.\n"
@@ -63,6 +69,20 @@ def build_snapshot(agent, event: str, side: str, bar_t: int, df, *, position: di
     close = float(df["close"].iloc[-1]); e50 = float(df[cf].iloc[-1]); e80 = float(df[cs].iloc[-1])
     rng = (df["high"] - df["low"]).to_numpy()
     avg_range = float(rng[-21:-1].mean()) if len(rng) > 21 else float(rng.mean()) if len(rng) else 0.0
+    atr20 = float(rng[-20:].mean()) if len(rng) else 0.0
+    f_arr = df[cf].to_numpy(); s_arr = df[cs].to_numpy(); t_arr = df["time"].to_numpy(); sgn = np.sign(f_arr - s_arr)
+    cross_bars = [k for k in range(1, len(df)) if sgn[k] != 0 and sgn[k - 1] != 0 and sgn[k] != sgn[k - 1]]
+    day_start = int(datetime.now(IST).replace(hour=0, minute=0, second=0, microsecond=0).timestamp() + off * 3600)
+    crosses_today = sum(1 for k in cross_bars if t_arr[k] >= day_start)
+    bars_since_cross = (len(df) - 1 - cross_bars[-1]) if cross_bars else None
+    confirm_state = None
+    res = getattr(agent, "last_res", None)
+    if agent.S.name == "ema2050" and res is not None and res.get("bar_states") and len(res["bar_states"]) == len(df):
+        confirm_state = res["bar_states"][-1]["confirm"]
+    s_dir = 1 if _side_word(side) == "BUY" else -1 if _side_word(side) == "SELL" else 0
+    h6 = float(df["high"].iloc[-6:].max()); l6 = float(df["low"].iloc[-6:].min())
+    swing_against = round((h6 - close) if s_dir > 0 else (close - l6) if s_dir < 0 else max(h6 - close, close - l6), 2)
+    day_pnl, trades_today = _day_stats(agent)
     last = df.iloc[-30:]
     bars = [[ist_str(int(r.time), off, "%H:%M"), round(float(r.open), 2), round(float(r.high), 2), round(float(r.low), 2),
              round(float(r.close), 2)] for r in last.itertuples()]
@@ -77,10 +97,16 @@ def build_snapshot(agent, event: str, side: str, bar_t: int, df, *, position: di
     flips = sum(1 for a, b in zip(sg[:-1], sg[1:]) if a != b)
     now = int(_time.time())
     upcoming = [r for r in (agent.news or ()) if r >= now]
+    fast_name, slow_name = EMA_NAMES.get(agent.S.name, (f"EMA {agent.S.fast}", f"EMA {agent.S.slow}"))
     snap = {
         "event": event, "symbol": agent.symbol, "mode": agent.S.name, "side": _side_word(side),
-        "bar_time_ist": ist_str(bar_t, off, "%Y-%m-%d %H:%M"), "close": round(close, 2), "ema50": round(e50, 2),
-        "ema80": round(e80, 2), "gap": round(e50 - e80, 2), "avg_range": round(avg_range, 2),
+        "ema_names": {"fast": fast_name, "slow": slow_name},
+        "bar_time_ist": ist_str(bar_t, off, "%Y-%m-%d %H:%M"), "close": round(close, 2),
+        "ema_fast": round(e50, 2), "ema_slow": round(e80, 2), "gap": round(e50 - e80, 2), "avg_range": round(avg_range, 2),
+        # v2.0.0 quantified context (both modes)
+        "crosses_today": crosses_today, "bars_since_cross": bars_since_cross, "confirm_state": confirm_state,
+        "dist_to_fast_ema_pts": round(close - e50, 2), "swing_against_last6_pts": swing_against, "atr20": round(atr20, 2),
+        "day_pnl_pts": day_pnl, "trades_today": trades_today,
         "bars_ohlc_ist": bars, "trend_state": getattr(agent, "trend_state", None),
         "whipsaw": {"ema50_side_flips": flips, "window_bars": wz_bars, "zone": flips >= wz_flips},
         "htf_context": (getattr(agent, "_htf_cache", None) or (None, None))[1],
@@ -99,12 +125,58 @@ def build_snapshot(agent, event: str, side: str, bar_t: int, df, *, position: di
             snap["track_record"] = agent._evidence_field(kind, side, bar_t)[0]["value"]
     except Exception:
         pass
+    if agent.S.name == "ema5080":
+        snap["ema50"], snap["ema80"] = snap["ema_fast"], snap["ema_slow"]        # v1.10 names kept for the 50/80 prompt
+    else:
+        snap["ema20"], snap["ema50"] = snap["ema_fast"], snap["ema_slow"]
     if position is not None:
         st = st or {}
-        snap.update({"entry": round(float(position["price_open"]), 2), "sl": float(position["sl"]) if position.get("sl") else None,
-                     "secured_level": float(st.get("secured", 0.0)), "peak": round(float(st.get("peak", 0.0)), 2),
-                     "open_profit": round(float(position["points"]), 2), "bars_held": int(st.get("bars", 0))})
+        peak = float(st.get("peak", 0.0)); pts = float(position["points"]); sl = float(position["sl"]) if position.get("sl") else None
+        long = position["direction"] == "long"
+        peak_t = st.get("peak_t")
+        snap.update({"entry": round(float(position["price_open"]), 2), "sl": sl,
+                     "secured_level": float(st.get("secured", 0.0)), "peak": round(peak, 2),
+                     "open_profit": round(pts, 2), "bars_held": int(st.get("bars", 0)),
+                     # v2.0.0
+                     "mae_so_far": round(float(st.get("mae", min(0.0, pts))), 2),
+                     "retrace_from_peak_pts": round(max(0.0, peak - pts), 2),
+                     "retrace_pct": round(100 * max(0.0, peak - pts) / peak, 1) if peak > 0 else None,
+                     "bars_since_peak": int(max(0, (bar_t - int(peak_t)) // BAR_S)) if peak_t else None,
+                     "closed_through_slow_ema": bool((close < e80) if long else (close > e80)),
+                     "dist_to_sl": round(abs(float(position.get("current", close)) - sl), 2) if sl else None})
     return snap
+
+
+def _day_stats(agent) -> tuple[float, int]:
+    """(day_pnl_pts, trades_today) for the symbol from today's journal (IST day). Never raises."""
+    try:
+        start = datetime.now(IST).replace(hour=0, minute=0, second=0, microsecond=0)
+        recs = [r for r in agent.journal.read(int(start.timestamp())) if r.get("symbol") == agent.symbol]
+        pnl = {}; seen = set()
+        for r in recs:
+            if r.get("event") == "position_seen":
+                seen.add(r.get("ticket"))
+            if r.get("event") == "exit" and r.get("points") is not None:
+                pnl[r.get("ticket")] = float(r["points"])
+            if r.get("event") == "closed" and r.get("final_points") is not None:
+                pnl[r.get("ticket")] = float(r["final_points"])
+        return round(sum(pnl.values()), 2), len(seen | set(pnl))
+    except Exception:
+        return 0.0, 0
+
+
+SNAPSHOT_KEEP = ("gap", "dist_to_fast_ema_pts", "swing_against_last6_pts", "atr20", "avg_range", "crosses_today", "bars_since_cross",
+                 "confirm_state", "session", "trend_state", "minutes_to_news", "day_pnl_pts", "trades_today", "retrace_pct",
+                 "retrace_from_peak_pts", "bars_since_peak", "mae_so_far", "closed_through_slow_ema", "dist_to_sl", "peak", "open_profit")
+
+
+def _compact(snap: dict) -> dict:
+    """The numeric/categorical snapshot fields journaled with every verdict (for the Saturday rule proposals). No bars, no prose."""
+    out = {k: snap[k] for k in SNAPSHOT_KEEP if k in snap and snap[k] is not None}
+    wz = snap.get("whipsaw") or {}
+    if wz:
+        out["whipsaw_flips"] = wz.get("ema50_side_flips"); out["whipsaw_zone"] = wz.get("zone")
+    return out
 
 
 # ============================================================================= advisor
@@ -137,7 +209,7 @@ class ClaudeAdvisor:
 
     # ------------------------------------------------------------------ who gets hooks
     def advises(self, strategy) -> bool:
-        return self.mode in ADVISE_MODES and getattr(strategy, "name", "") == STRATEGY
+        return self.mode in ADVISE_MODES and getattr(strategy, "name", "") in STRATEGIES
 
     @property
     def manage(self) -> bool:
@@ -204,6 +276,19 @@ class ClaudeAdvisor:
                               "open_profit": p["points"], "trigger": why, "model": self.cfg.claude_pullback_model,
                               "mode_name": agent.S.name, "display": agent.S.display_name})
 
+    def request_alert(self, agent, alert: dict, card: dict, df, bar_t: int) -> bool:
+        """v2.0.0: the /alert card's second line — any mode but off (review included). Uses the entry model and the daily budget;
+        a used budget skips silently (no card). Enqueue only; the poll never waits."""
+        if self.mode == "off":
+            return False
+        sug = (card.get("meta") or {}).get("suggested_side")
+        snap = build_snapshot(agent, "ALERT", sug or "", bar_t, df)
+        snap["alert"] = {"id": alert["id"], "price": alert["price"], "hit": alert.get("hit_price"), "side_hint": alert.get("side_hint"), "note": alert.get("note")}
+        snap["bot_suggestion"] = {"decision": (card.get("meta") or {}).get("suggestion"), "side": sug, "reason": (card.get("meta") or {}).get("reason")}
+        return self._enqueue({"type": "alert", "event": "ALERT", "symbol": agent.symbol, "side": sug, "bar_t": bar_t, "off": agent.off,
+                              "snapshot": snap, "card_key": card.get("key"), "agent": agent, "alert_id": alert["id"],
+                              "model": self.cfg.claude_entry_model, "mode_name": agent.S.name, "display": agent.S.display_name})
+
     def forget(self, symbol: str, ticket):
         self.fired.pop((symbol, ticket), None)
 
@@ -227,7 +312,11 @@ class ClaudeAdvisor:
         return res
 
     def prompt_for(self, snapshot: dict) -> str:
-        return self.rules.strip() + "\n\nSNAPSHOT:\n" + json.dumps(snapshot, default=str)
+        names = snapshot.get("ema_names") or EMA_NAMES.get(snapshot.get("mode", ""), ("fast EMA", "slow EMA"))
+        fast, slow = (names["fast"], names["slow"]) if isinstance(names, dict) else names
+        head = (f"MODE: {snapshot.get('mode', '?')} — fast EMA = {fast}, slow EMA = {slow}. Apply the section for this mode; "
+                f"ema_fast/ema_slow in the snapshot are {fast}/{slow}.\n\n")
+        return head + self.rules.strip() + "\n\nSNAPSHOT:\n" + json.dumps(snapshot, default=str)
 
     def process(self, job: dict):
         if job["type"] == "review":
@@ -236,6 +325,12 @@ class ClaudeAdvisor:
         if res is None:
             self._journal(job, None, latency=0.0, acted=False, stale=False, error="budget used"); return
         v = res.verdict if res.ok else None
+        if job["type"] == "alert":
+            self._journal(job, v, latency=res.latency_s, acted=False, stale=False, error=("" if v is not None else (res.error or "no verdict")))
+            if v is not None:
+                self.stats["last_verdict"] = f"{job['symbol']} ALERT {v['decision']} · {v['confidence']} · {datetime.now(IST):%H:%M} IST"
+                self._alert_line(job, v)
+            return
         if v is not None and job["type"] == "entry":
             want = _side_word(job["side"])
             if v["side"] not in (None, want):
@@ -377,9 +472,28 @@ class ClaudeAdvisor:
                              confidence=(v or {}).get("confidence"), reason=(v or {}).get("reason"),
                              tighten_to=(v or {}).get("tighten_to"), my_action=None, acted=bool(acted), stale=bool(stale),
                              bar=job.get("bar_t"), ticket=job.get("ticket"), open_profit=job.get("open_profit"),
-                             trigger=job.get("trigger"), error=error or None, note=note or None)
+                             trigger=job.get("trigger"), error=error or None, note=note or None,
+                             evidence=(v or {}).get("evidence") or [], alert_id=job.get("alert_id"),
+                             snapshot_fields=_compact(job.get("snapshot") or {}))
         except Exception as e:
             telemetry.info(f"claude journal failed: {e!r}")
+
+    def _alert_line(self, job, v):
+        """Second line on the ALERT REACHED card: 'Claude: TAKE · high · reason (evidence: ...)'. Falls back to a small card."""
+        ev = ", ".join(v.get("evidence") or [])
+        label = f"{v['decision']}" + (f" {v['side']}" if v.get("side") else "") + f" · {v['confidence']} · {v['reason']}" + (f" (evidence: {ev})" if ev else "")
+        fld = field("Claude add-on", label, inline=False)
+        hook = getattr(self.notify, "claude_edit_hook", None)
+        if hook and job.get("card_key"):
+            try:
+                if hook(job["card_key"], fld):
+                    return
+            except Exception:
+                pass
+        self.notify.send(f"{job['mode_name']}:{job['symbol']}:CLAUDE_ALERT:{job.get('alert_id')}", ctitle(job["symbol"], "CLAUDE · ALERT", job.get("side")),
+                         [f"Claude: **{label}**", "second opinion only — you decide; nothing is placed"],
+                         fields=[field("Model", job["model"]), field("Latency", f"{job.get('latency', 0):.0f} s")],
+                         color=EVENT_COLOURS["info"], footer=cfooter(job["display"], "Claude"))
 
     def _entry_card(self, job, v, stale):
         label = f"{'⌛ STALE · ' if stale else ''}{v['decision']} · {v['confidence']} · {v['reason']}"
@@ -391,7 +505,7 @@ class ClaudeAdvisor:
                     return
             except Exception:
                 pass
-        title_ev = {"P": "P PRE-CROSS", "CROSS": "CONFIRMED CROSS", "RE": "RE-ENTRY"}[job["event"]]
+        title_ev = {"P": "P PRE-CROSS", "CROSS": "CONFIRMED CROSS", "RE": "RE-ENTRY", "ENTER": "ENTER"}.get(job["event"], job["event"])
         self.notify.send(f"{job['mode_name']}:{job['symbol']}:CLAUDE_{job['event']}:{bar_key(job['bar_t'], job['off'])}",
                          ctitle(job["symbol"], f"CLAUDE · {title_ev}", job["side"]),
                          [f"Claude: **{label}**", "second opinion only — you decide; nothing is placed"],

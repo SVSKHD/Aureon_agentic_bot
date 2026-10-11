@@ -44,6 +44,8 @@ def weekly_report(cfg, agents, journal, previous: bool = False, mt5: bool = True
     L.append(f"Secure steps: {len(sec)} · locked total +{sum(float(r.get('step', 0)) for r in sec):g}")
     L.append("Auto exits: " + (", ".join(f"{k} {v}" for k, v in ex.items()) or "none"))
     L += claude_summary(recs)
+    from . import alerts as _alerts                                     # v2.0.0 alerts section
+    L += _alerts.stats_lines(_alerts.stats(recs))
     if not n and not recs:
         L.append("nothing recorded this week")
     return "\n".join(L)
@@ -68,7 +70,7 @@ def claude_summary(recs: list[dict]) -> list[str]:
     exits = {r.get("ticket"): r for r in recs if r.get("event") == "exit"}
     closed = {r.get("ticket"): r for r in recs if r.get("event") == "closed"}
     L = ["\n**Claude add-on**"]
-    entries = [r for r in cv if r.get("claude_event") in ("P", "CROSS", "RE")]
+    entries = [r for r in cv if r.get("claude_event") in ENTRY_EVENTS]
     for dec in ("TAKE", "SKIP"):
         xs = [r for r in entries if r["decision"] == dec]
         if xs:
@@ -125,7 +127,8 @@ def claude_rows_for_batch(journal, since: int, until: int | None = None) -> list
 # The compare reuses the scorecard's grading — it never grades a signal itself. This wrapper only RENAMES the scorecard's
 # per-signal fields into one shape. Every field-name assumption lives in _from_scorecard().
 GRADES = ("WIN20", "WIN10", "STOP", "FLAT", "OPEN")
-_KIND = {"p": "P", "pre": "P", "cross": "CROSS", "re": "RE", "reentry": "RE", "re-entry": "RE"}
+ENTRY_EVENTS = ("P", "CROSS", "RE", "ENTER")
+_KIND = {"p": "P", "pre": "P", "cross": "CROSS", "re": "RE", "reentry": "RE", "re-entry": "RE", "enter": "ENTER", "pullback": "ENTER", "no-pullback": "ENTER"}
 _SIDE = {"long": "LONG", "buy": "LONG", "bull": "LONG", "short": "SHORT", "sell": "SHORT", "bear": "SHORT"}
 
 

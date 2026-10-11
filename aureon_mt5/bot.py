@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from . import broker, telemetry
+from . import alerts as alerts_mod
 from .config import VERSION
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -314,7 +315,61 @@ async def respond(inter, name: str, work, *, notify=None, journal=None, ephemera
     return reply
 
 
-def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_notify=None, claude=None):
+def current_price(sym: str, ag, cfg, lock_timeout: float = 1.0) -> float | None:
+    """Live tick when MT5 is free within `lock_timeout` s, else the agent's last closed-bar close (never blocks a command)."""
+    if ag is not None and getattr(ag, "dry", False):
+        return ag.health.get("close")
+    try:
+        with broker.try_lock(lock_timeout) as got:
+            if got:
+                t = broker.tick(sym)
+                if t:
+                    return (t["bid"] + t["ask"]) / 2
+    except Exception:
+        pass
+    return ag.health.get("close") if ag is not None else None
+
+
+def alert_decision(cfg, agents, journal, alerts, item: dict, side: str, user) -> str:
+    """LONG / SHORT / SKIP on an ALERT REACHED card. Runs OFF the event loop. Journals alert_decision; places the order only when
+    AUREON_EXECUTION=1 on a demo account (or AUREON_ALLOW_LIVE=1), otherwise arms the guardian for the trade you place."""
+    m = item.get("meta", {}); sym = m.get("symbol"); aid = m.get("alert_id"); sugg = m.get("suggested_side")
+    side = side.upper()
+    if side == "SKIP":
+        journal.log("alert_decision", symbol=sym, mode=m.get("mode"), alert_id=aid, side="skip", suggested_side=sugg, agreed=(sugg is None),
+                    by=str(user), price=m.get("price"), bar=m.get("bar"))
+        if alerts is not None: alerts.decide(aid, "skip")
+        return "⏭ skipped"
+    agreed = (sugg == side)
+    journal.log("alert_decision", symbol=sym, mode=m.get("mode"), alert_id=aid, side=side, suggested_side=sugg, agreed=agreed,
+                by=str(user), price=m.get("price"), bar=m.get("bar"))
+    if alerts is not None: alerts.decide(aid, side)
+    ag = agents.get(sym); g = ag.g if ag is not None else None
+    tk = None
+    if not getattr(cfg, "dry", False):
+        try: tk = broker.tick(sym)
+        except Exception: tk = None
+    px = (tk["ask"] if side == "LONG" else tk["bid"]) if tk else m.get("price")
+    sl = ((px - g.pre_stop) if side == "LONG" else (px + g.pre_stop)) if (g is not None and px is not None) else None
+    sl_txt = f" · SL {sl:.2f} (−{g.pre_stop:g})" if sl is not None else ""
+    demo = broker.is_demo() if not getattr(cfg, "dry", False) else None
+    if cfg.execution_enabled and (demo or cfg.allow_live) and not getattr(cfg, "dry", False):
+        lots = min(float(m.get("lots") or cfg.max_lots), cfg.max_lots)
+        r = broker.place_market(sym, side, lots, sl, comment=f"aureon {aid}")
+        journal.log("order_placed", symbol=sym, mode=m.get("mode"), alert_id=aid, side=side, lots=lots, sl=sl, ok=bool(r.ok),
+                    status=r.status, retcode=r.retcode, by=str(user))
+        if r.ok:
+            if ag is not None: ag.attach_alert(aid, side)
+            return f"✅ placed {side} {lots:g} lots {sym}{sl_txt} — the guardian takes it from here"
+        if ag is not None: ag.attach_alert(aid, side)
+        return f"❌ order rejected ({r.why()}) — place it in MT5, I will manage it{sl_txt}"
+    if ag is not None: ag.attach_alert(aid, side)
+    why = ("execution off (AUREON_EXECUTION=0)" if not cfg.execution_enabled else
+           "dry run" if getattr(cfg, "dry", False) else "live account — set AUREON_ALLOW_LIVE=1 to let the button place it")
+    return f"noted — place it in MT5, I will manage it{sl_txt} · {why}"
+
+
+def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_notify=None, claude=None, alerts=None):
     try:
         import discord  # type: ignore
         from discord import app_commands  # type: ignore
@@ -407,7 +462,8 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             except Exception:
                 continue
             try:
-                em = _ask_embed(item); view = AskView(item); files = []
+                em = _ask_embed(item); files = []
+                view = AlertView(item) if (item.get("meta") or {}).get("kind") == "alert" else AskView(item)
                 if item.get("png") and os.path.exists(item["png"]):
                     fname = os.path.basename(item["png"]); em.set_image(url=f"attachment://{fname}"); files = [discord.File(item["png"], filename=fname)]
                 msg = await ch.send(embed=em, view=view, files=files)
@@ -421,6 +477,46 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
                                             fields=item.get("fields"), color=item.get("color"), footer=item.get("footer"))
                 finally:
                     notify.bot_ready = True
+
+    # ------------------------------------------------------------------ v2.0.0 ALERT REACHED: [LONG] [SHORT] [SKIP]
+    class AlertView(discord.ui.View):
+        def __init__(self, item):
+            super().__init__(timeout=cfg.ask_ttl_min * 60); self.item = item
+
+        async def _answer(self, inter, side):
+            if self.item.get("decided"):
+                await inter.response.send_message(f"already answered: {self.item['decided']}", ephemeral=True); return
+            self.item["decided"] = side
+            await inter.response.defer()
+            text = await asyncio.to_thread(alert_decision, cfg, agents, journal, alerts, self.item, side, inter.user)
+            for c in self.children: c.disabled = True
+            em = _ask_embed(self.item)
+            em.add_field(name="Decision", value=f"**{side}** · {inter.user.display_name} · {datetime.now(IST):%H:%M} IST — {text}"[:1024], inline=False)
+            em.color = GREEN if side == "LONG" else RED if side == "SHORT" else GREY
+            try:
+                await self.item["message"].edit(embed=em, view=self)
+            except Exception:
+                pass
+
+        @discord.ui.button(label="LONG", style=discord.ButtonStyle.success, emoji="🟢")
+        async def long_btn(self, inter, button): await self._answer(inter, "LONG")
+
+        @discord.ui.button(label="SHORT", style=discord.ButtonStyle.danger, emoji="🔴")
+        async def short_btn(self, inter, button): await self._answer(inter, "SHORT")
+
+        @discord.ui.button(label="SKIP", style=discord.ButtonStyle.secondary, emoji="⏭")
+        async def skip_btn(self, inter, button): await self._answer(inter, "SKIP")
+
+        async def on_timeout(self):
+            if not self.item.get("decided"):                      # expired: card edited, nothing journaled
+                self.item["decided"] = "EXPIRED"
+                for c in self.children: c.disabled = True
+                try:
+                    em = _ask_embed(self.item); em.color = GREY
+                    em.add_field(name="Decision", value=f"⌛ expired after {cfg.ask_ttl_min} min", inline=False)
+                    await self.item["message"].edit(embed=em, view=self)
+                except Exception:
+                    pass
 
     def _latest_open():
         return next((i for i in reversed(list(pending.values())) if not i.get("decided")), None)
@@ -514,6 +610,59 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             return Reply(card=card, file=path, source="live")
         await run(inter, "chart", work, timeout=20)
 
+    # ------------------------------------------------------------------ v2.0.0 price alerts
+    @tree.command(name="alert", description="Price alert: fires once when the tick reaches the level (both modes)")
+    @app_commands.describe(price="price level, e.g. 4120", symbol="default: primary symbol", note="optional note shown on the card")
+    async def alert_cmd(inter: discord.Interaction, price: float, symbol: str = "", note: str = ""):
+        user = inter.user
+        def work():
+            sym = (symbol or cfg.symbols[0]).upper(); ag = agents.get(sym)
+            if alerts is None:
+                return Reply(content="alerts store unavailable")
+            cur = current_price(sym, ag, cfg)
+            a = alerts.arm(sym, price, cur, note, getattr(user, "display_name", str(user)), getattr(ag, "last_bar", None))
+            journal.log("alert_armed", symbol=sym, mode=cfg.mode, alert_id=a["id"], price=a["price"], side_hint=a["side_hint"], note=a["note"],
+                        current=cur, by=str(user))
+            return Reply(content=alerts_mod.armed_reply(a, cur), source="live" if cur is not None else "cache")
+        await run(inter, "alert", work)
+
+    @tree.command(name="alerts", description="Armed price alerts with the distance to the current price")
+    @app_commands.describe(symbol="default: primary symbol")
+    async def alerts_cmd(inter: discord.Interaction, symbol: str = ""):
+        def work():
+            sym = (symbol or cfg.symbols[0]).upper()
+            if alerts is None:
+                return Reply(content="alerts store unavailable")
+            return Reply(content=alerts_mod.list_reply(alerts, sym, current_price(sym, agents.get(sym), cfg))[:1900])
+        await run(inter, "alerts", work)
+
+    @tree.command(name="alert-cancel", description="Cancel one price alert by id (see /alerts)")
+    @app_commands.describe(id="alert id, e.g. A3")
+    async def alert_cancel_cmd(inter: discord.Interaction, id: str):
+        user = inter.user
+        def work():
+            if alerts is None:
+                return Reply(content="alerts store unavailable")
+            a = alerts.cancel(id.strip().upper())
+            if a is None:
+                return Reply(content=f"no armed alert {id}")
+            journal.log("alert_cancelled", symbol=a["symbol"], alert_id=a["id"], price=a["price"], by=str(user))
+            return Reply(content=f"cancelled {a['id']} · {a['symbol']} {a['price']:.2f}")
+        await run(inter, "alert-cancel", work)
+
+    @tree.command(name="alert-clear", description="Cancel every armed alert for a symbol")
+    @app_commands.describe(symbol="default: primary symbol")
+    async def alert_clear_cmd(inter: discord.Interaction, symbol: str = ""):
+        user = inter.user
+        def work():
+            sym = (symbol or cfg.symbols[0]).upper()
+            if alerts is None:
+                return Reply(content="alerts store unavailable")
+            n = alerts.clear(sym)
+            journal.log("alert_cleared", symbol=sym, count=n, by=str(user))
+            return Reply(content=f"cleared {n} alert(s) for {sym}")
+        await run(inter, "alert-clear", work)
+
     # ------------------------------------------------------------------ v1.10.0 Claude add-on (all off the loop via run())
     claude_wait = float(getattr(cfg, "claude_timeout", 90)) * 2 + 15      # a call may queue behind one in flight
 
@@ -545,6 +694,30 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             text = claude.daily_review(day)
             return Reply(content=f"CLAUDE REVIEW {day or 'today'}:\n{text}"[:1900], source="live")
         await run(inter, "claude-review", work, timeout=claude_wait)
+
+    @tree.command(name="claude-rules", description="Latest CLAUDE RULE PROPOSALS (Saturday card) and their status")
+    async def claude_rules_cmd(inter: discord.Interaction):
+        def work():
+            from . import compare
+            d = compare.load_proposals(cfg.log_dir); props = d.get("proposals") or []
+            if not props:
+                return Reply(content="no rule proposals yet (made on Saturday with the COMPARE card)")
+            lines = [f"proposals · {d.get('week')} · made {d.get('made')} · rules {compare.rules_hash()}"]
+            for p in props:
+                lines.append(f"`{p['n']}` {p['line']} — {p['support']}" + (f" · ✅ approved {p['approved']}" if p.get("approved") else ""))
+            return Reply(content="\n".join(lines)[:1900])
+        await run(inter, "claude-rules", work)
+
+    @tree.command(name="claude-rules-approve", description="Append proposal <n> (dated) to claude_rules.md — nothing changes without this")
+    @app_commands.describe(n="proposal number from the CLAUDE RULE PROPOSALS card")
+    async def claude_rules_approve_cmd(inter: discord.Interaction, n: int):
+        user = inter.user
+        def work():
+            from . import compare
+            line = compare.approve_proposal(n, cfg.log_dir)
+            journal.log("claude_rule_approved", n=n, line=line, by=str(user), rules_hash=compare.rules_hash())
+            return Reply(content=f"appended to claude_rules.md:\n{line}\nrules hash now {compare.rules_hash()} · takes effect on the next Claude call")
+        await run(inter, "claude-rules-approve", work)
 
     # ------------------------------------------------------------------ v1.11.0 weekly compare (measurement only)
     def _compare_reply(days: int, breakdown: bool) -> Reply:

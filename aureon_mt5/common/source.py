@@ -52,6 +52,23 @@ def day_range(day: _date) -> dict:
             "day_end": to_epoch(day) + 86400, "warmup_from": to_epoch(prev) - 4 * 86400}
 
 
+def trading_days(from_day: _date, to_day: _date) -> list[_date]:
+    """Weekdays from `from_day` to `to_day` inclusive."""
+    out, d = [], from_day
+    while d <= to_day:
+        if d.weekday() < 5:
+            out.append(d)
+        d += timedelta(days=1)
+    return out
+
+
+def range_bounds(from_day: _date, to_day: _date) -> dict:
+    """One fetch window for a multi-day replay: warm-up before the first day, end of the last day."""
+    first, last = day_range(from_day), day_range(to_day)
+    return {"day": from_day, "prev": first["prev"], "prev_start": first["prev_start"], "day_start": first["day_start"],
+            "day_end": last["day_end"], "warmup_from": first["warmup_from"]}
+
+
 def fetch_mt5(symbol: str, timeframe: str, bars: int, rng: dict | None = None) -> Bars:
     import MetaTrader5 as mt5  # type: ignore
 
@@ -162,3 +179,22 @@ def load_all(symbol: str, source: str, bars: int, csv: str | None = None,
     else:
         m1 = synthetic_m1(symbol, span_min + 15 * 400)
     return {"M1": m1, "M5": resample(m1, "M5"), "M15": resample(m1, "M15")}, rng
+
+
+def load_range(symbol: str, source: str, from_day: _date, to_day: _date, csv: str | None = None) -> tuple[dict[str, Bars], list[dict]]:
+    """Bars for a multi-day replay (M5 only) plus one day_range() dict per trading day in [from_day, to_day]."""
+    days = [day_range(d) for d in trading_days(from_day, to_day)]
+    if not days:
+        raise ValueError("no trading days in the range")
+    rng = range_bounds(days[0]["day"], days[-1]["day"])
+    if source == "mt5":
+        return {"M5": fetch_mt5(symbol, "M5", 0, rng)}, days
+    if source == "csv":
+        if not csv:
+            raise ValueError("--csv path required with --source csv")
+        m1 = fetch_csv(csv, symbol, "M1")
+        m1.df = m1.df[(m1.df.time >= rng["warmup_from"]) & (m1.df.time < rng["day_end"])].reset_index(drop=True)
+    else:
+        end = min(rng["day_end"], int(datetime.now(timezone.utc).timestamp()) + 3 * 3600)
+        m1 = synthetic_m1(symbol, (end - rng["warmup_from"]) // 60, end_time=end)
+    return {"M5": resample(m1, "M5")}, days

@@ -196,6 +196,132 @@ def close(ticket: int, symbol: str, comment: str = "aureon") -> BrokerResult:
                         last_error="" if ok else _err(), bid=tick.bid if tick else None, ask=tick.ask if tick else None)
 
 
+def tick(symbol: str) -> dict | None:
+    """The same tick the guardian prices positions with: {bid, ask, time} (server epoch). None without MT5 / no tick."""
+    m = mt5()
+    if not m:
+        return None
+    with _lock:
+        t = m.symbol_info_tick(symbol)
+    if not t or not t.time:
+        return None
+    return {"bid": float(t.bid), "ask": float(t.ask), "time": int(t.time)}
+
+
+def account() -> dict | None:
+    """{balance, equity, currency, trade_mode: demo|contest|real, login_masked}. None without MT5. Never logged in full."""
+    m = mt5()
+    if not m:
+        return None
+    with _lock:
+        a = m.account_info()
+    if a is None:
+        return None
+    mode = {0: "demo", 1: "contest", 2: "real"}.get(int(getattr(a, "trade_mode", 2)), "real")
+    return {"balance": float(a.balance), "equity": float(getattr(a, "equity", a.balance)), "currency": str(getattr(a, "currency", "")),
+            "trade_mode": mode, "login_masked": f"***{str(getattr(a, 'login', ''))[-3:]}"}
+
+
+def is_demo() -> bool | None:
+    """True on a demo/contest account, False on real, None when unknown (no MT5)."""
+    a = account()
+    return None if a is None else (a["trade_mode"] in ("demo", "contest"))
+
+
+def place_market(symbol: str, side: str, lots: float, sl: float | None = None, comment: str = "aureon-alert") -> BrokerResult:
+    """v2.0.0 — the ONE order-placement path (used by the alert LONG/SHORT buttons when AUREON_EXECUTION=1).
+    Callers decide the policy (execution_enabled, demo/allow_live, max_lots); this only sends the request and reports the retcode."""
+    m = mt5()
+    if not m:
+        return BrokerResult(False, "NO_CONNECTION", comment="no MT5")
+    with _lock:
+        m.symbol_select(symbol, True)
+        t = m.symbol_info_tick(symbol)
+        if not t:
+            return BrokerResult(False, "BROKER_REJECTED", comment="no tick", last_error=_err())
+        is_buy = side.upper() in ("LONG", "BUY")
+        req = {"action": m.TRADE_ACTION_DEAL, "symbol": symbol, "volume": float(lots),
+               "type": m.ORDER_TYPE_BUY if is_buy else m.ORDER_TYPE_SELL, "price": t.ask if is_buy else t.bid,
+               "deviation": 30, "comment": comment[:31], "type_filling": m.ORDER_FILLING_IOC}
+        if sl is not None:
+            req["sl"] = round(float(sl), digits(symbol))
+        r = m.order_send(req)
+        if r is not None and r.retcode != m.TRADE_RETCODE_DONE:
+            req["type_filling"] = m.ORDER_FILLING_FOK; r = m.order_send(req)
+    if r is None:
+        return BrokerResult(False, "BROKER_REJECTED", comment="order_send returned None", last_error=_err(), bid=t.bid, ask=t.ask)
+    ok = r.retcode == m.TRADE_RETCODE_DONE
+    return BrokerResult(ok, "PLACED" if ok else "BROKER_REJECTED", changed=ok, retcode=r.retcode, comment=getattr(r, "comment", ""),
+                        last_error="" if ok else _err(), requested_sl=sl, bid=t.bid, ask=t.ask)
+
+
+def spread(symbol: str) -> float | None:
+    """Current ask − bid in price units (None without MT5)."""
+    t = tick(symbol)
+    return None if t is None else round(t["ask"] - t["bid"], 5)
+
+
+def lot_for_risk(symbol: str, stop_distance: float, risk_pct: float) -> dict | None:
+    """Display helper for the ask cards: lots so that `stop_distance` costs `risk_pct` % of the balance. Never sizes an order."""
+    m = mt5()
+    if not m or stop_distance <= 0:
+        return None
+    with _lock:
+        a = m.account_info(); info = m.symbol_info(symbol)
+    if a is None or info is None:
+        return None
+    contract = float(getattr(info, "trade_contract_size", 100.0) or 100.0)
+    step = float(getattr(info, "volume_step", 0.01) or 0.01); vmin = float(getattr(info, "volume_min", 0.01) or 0.01)
+    risk_money = float(a.balance) * risk_pct / 100.0
+    lots = risk_money / (stop_distance * contract)
+    lots = max(vmin, round(lots / step) * step)
+    return {"lots": round(lots, 2), "risk_pct": risk_pct, "risk_money": risk_money, "currency": str(getattr(a, "currency", "")), "stop": stop_distance}
+
+
+def bars_tf(symbol: str, timeframe: str, n: int, source: str, off: float) -> pd.DataFrame:
+    """Bars of another timeframe (M15 / H1) for the HTF context line. Synthetic fallback without MT5."""
+    m = mt5()
+    tf_map = {"M1": "TIMEFRAME_M1", "M5": "TIMEFRAME_M5", "M15": "TIMEFRAME_M15", "H1": "TIMEFRAME_H1"}
+    if source == "mt5" and m and timeframe in tf_map:
+        with _lock:
+            m.symbol_select(symbol, True)
+            rates = m.copy_rates_from_pos(symbol, getattr(m, tf_map[timeframe]), 0, n)
+        if rates is None or len(rates) == 0:
+            raise RuntimeError(f"copy_rates_from_pos({symbol}, {timeframe}) empty: {_err()}")
+        df = pd.DataFrame(rates).rename(columns={"tick_volume": "volume"})
+        df = df[["time", "open", "high", "low", "close", "volume"]].copy(); df["time"] = df["time"].astype("int64")
+        return df
+    mins = {"M1": 1, "M5": 5, "M15": 15, "H1": 60}[timeframe]
+    m1 = synthetic_m1(symbol, n * mins, end_time=now_server(off))
+    return resample(m1, timeframe).df if timeframe in ("M5", "M15") else m1.df
+
+
+def close_partial(ticket: int, symbol: str, fraction: float, comment: str = "aureon-partial") -> BrokerResult:
+    """Close `fraction` of a position (AUREON-012). requested_sl carries the closed volume for the card."""
+    m = mt5()
+    if not m:
+        return BrokerResult(False, "NO_CONNECTION", comment="no MT5")
+    with _lock:
+        pos = m.positions_get(ticket=ticket)
+        if not pos:
+            return BrokerResult(False, "POSITION_NOT_FOUND", comment="position not found")
+        p = pos[0]; tick_ = m.symbol_info_tick(symbol); info = m.symbol_info(symbol)
+        step = float(getattr(info, "volume_step", 0.01) or 0.01) if info else 0.01
+        vol = max(step, round(p.volume * fraction / step) * step)
+        if vol >= p.volume:
+            return BrokerResult(False, "BROKER_REJECTED", comment="partial volume would close the whole position")
+        is_buy = p.type == m.POSITION_TYPE_BUY
+        req = {"action": m.TRADE_ACTION_DEAL, "position": ticket, "symbol": symbol, "volume": vol,
+               "type": m.ORDER_TYPE_SELL if is_buy else m.ORDER_TYPE_BUY, "price": tick_.bid if is_buy else tick_.ask,
+               "deviation": 30, "comment": comment[:31], "type_filling": m.ORDER_FILLING_IOC}
+        r = m.order_send(req)
+    if r is None:
+        return BrokerResult(False, "BROKER_REJECTED", comment="order_send returned None", last_error=_err())
+    ok = r.retcode == m.TRADE_RETCODE_DONE
+    return BrokerResult(ok, "CLOSED" if ok else "BROKER_REJECTED", changed=ok, retcode=r.retcode, comment=getattr(r, "comment", ""),
+                        last_error="" if ok else _err(), requested_sl=vol)
+
+
 def tick_age(symbol: str, off: float) -> int | None:
     m = mt5()
     if not m:

@@ -88,11 +88,16 @@ def _panel(ax, df, crosses, tf, n, server_offset_h, highlight, rng=None, jd=None
             xi = ev.index - shift
             if 0 <= xi < base:
                 y = df["ema20"].iloc[xi]
-                if ev.label in ("WP", "F"):
+                if ev.label in ("WP", "F", "MULTI"):
                     ax.plot(xi, y, marker="x", ms=7, color=MUTED, mew=1.4, zorder=5)
-                    txt = (f"WP·{ev.reason}" if ev.label == "WP" else
-                           (f"ext {ev.reason.split()[1]} · wait pb" if "waiting" in ev.reason else f"F·{ev.reason}"))
+                    txt = {"WP": f"WP·{ev.reason}", "MULTI": "MULTI CROSS"}.get(ev.label, f"F·{ev.reason}")
                     tag(xi, y, txt, "#4a5568", ev.direction == "bear")
+                elif ev.label in ("CROSS", "CONFIRMED"):
+                    bull = ev.direction == "bull"; col = UP if bull else DOWN
+                    ax.plot(xi, y, marker="^" if bull else "v", ms=6 if ev.label == "CROSS" else 8, color=col, mec=BG, mew=0.8,
+                            zorder=5, alpha=0.6 if ev.label == "CROSS" else 1.0)
+                    if ev.label == "CONFIRMED":
+                        tag(xi, y, "CONFIRMED", col, not bull)
                 else:
                     bull = ev.label.startswith("EB")
                     col = UP if bull else DOWN
@@ -254,12 +259,14 @@ def render_png(symbol: str, analysed: dict, path: str, server_offset_h: float = 
     srv = datetime.fromtimestamp(last_t, tz=timezone.utc)
     fig.text(0.02, yin(0.42), f"{symbol}   EMA {fp_} / {sp_} cross map" + ("   ·   LEG MODE" if sm.get("leg_mode") else ""), color=TEXT, fontsize=17, weight="bold", va="center")
     sub = ("" if not rng else f"{rng['prev']:%a %d %b} context only · trading {rng['day']:%a %d %b}  ·  ") + \
-          ("M5 only — every M5 cross, trend from EMA50 slope. " if len(analysed) == 1 else "M5 execution, M15 permission. ") + "PB/PS pre-cross · EB/ES entry + grade · CB/ESC exit · WP whipsaw · F filtered (reason)"
+          ("M5 only — every M5 cross, trend from EMA50 slope. " if len(analysed) == 1 else "M5 execution, M15 permission. ") + "CROSS · CONFIRMED (3 bars + 1.5 gap) · EB/ES pullback entry · MULTI cross ignored · F no entry (reason)"
     fig.text(0.02, yin(0.72), sub,
              color=MUTED, fontsize=9, va="center")
     fr = ", ".join(f"{k} {v}" for k, v in sm["filtered_reasons"].items()) or "none"
-    fig.text(0.02, yin(0.98), f"FILTERED  {sm['trades']} trades · net {sm['net']:+.1f} · win {sm['win_rate']}% · worst dd {sm['worst_drawdown']:+.1f} · "
-                          f"hit 15: {sm['hit_target']} · best run {sm['best_run']:+.1f} · late {sm['late_entries']} · pre {sm['pre_entries']} · pullback entries {sm['pullback_entries']}/{sm['waited_for_pullback']} waited · re-entries {sm['reentries']} ({sm['reentry_net']:+.1f}) · WP {sm['whipsaws']} · spike locks {sm['spike_locks']} · news flats {sm['news_flats']} · removed {sm['filtered']} ({fr})",
+    fig.text(0.02, yin(0.98), f"RULES  {sm['trades']} trades · net {sm['net']:+.1f} · win {sm['win_rate']}% · worst dd {sm['worst_drawdown']:+.1f} · "
+                          f"hit +10: {sm['hit_target']} · best run {sm['best_run']:+.1f} · pullback {sm['pullback_entries']} · no-pullback {sm.get('no_pullback_entries', 0)} · "
+                          f"stops {sm.get('stops', 0)} · early {sm.get('early', 0)} · secured {sm.get('secured_exits', 0)} · EMA20 turns {sm.get('ema20_turns', 0)} · "
+                          f"opp. cross {sm.get('opposite_cross_exits', 0)} · day end {sm.get('day_end_exits', 0)} · multi cross {sm['whipsaws']} · news flats {sm['news_flats']} · no entry {sm['filtered']} ({fr})",
              color=TEXT, fontsize=8.5, va="center")
     fig.text(0.02, yin(1.20), f"unfiltered  {un['trades']} trades · net {un['net']:+.1f} · win {un['win_rate']}% · worst dd {un['worst_drawdown']:+.1f}"
                           f"   |   sessions (IST): Asia 05:30–12:30  London 12:30–17:30  NY 17:30–02:30   |   {'M15' if len(analysed) > 1 else 'M5'} trend now: {analysed['M5']['m15_trend_now'].upper()}",

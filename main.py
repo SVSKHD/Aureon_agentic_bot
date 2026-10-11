@@ -15,6 +15,7 @@ from datetime import date, datetime, timedelta, timezone
 
 from aureon_mt5 import broker, telemetry
 from aureon_mt5.agent import SymbolAgent
+from aureon_mt5.alerts import AlertStore
 from aureon_mt5.bot import run_bot
 from aureon_mt5.claude_advisor import ClaudeAdvisor
 from aureon_mt5 import compare
@@ -125,8 +126,8 @@ _COMPARE_RETRY_AT: dict[str, float] = {}
 
 def compare_saturday_tick(cfg, agents, journal, notify, claude=None, now: datetime | None = None, gather=None) -> str | None:
     """Saturday ≥ cfg.weekly_report_ist (10:00 IST), after the WEEKLY report: post the COMPARE card for Mon–Fri once.
-    Restart-safe: a week already in logs/compare_weekly.jsonl is skipped. ema5080 only. Measurement only."""
-    if cfg.mode != "ema5080":
+    Restart-safe: a week already in logs/compare_weekly.jsonl is skipped. Both modes (v2.0.0). Measurement only."""
+    if cfg.mode not in compare.KINDS_BY_MODE:
         return None
     now = now or datetime.now(IST)
     hh, mm = (int(x) for x in cfg.weekly_report_ist.split(":"))
@@ -140,6 +141,11 @@ def compare_saturday_tick(cfg, agents, journal, notify, claude=None, now: dateti
         c = compare.card(res, title=f"AUREON · MT5 · COMPARE · {week}")
         post_compare(notify, f"{cfg.mode}:ALL:COMPARE:{week}", c)
         compare.append_history(cfg.log_dir, week, res)
+        if claude is not None:                                   # v2.0.0: CLAUDE RULE PROPOSALS (no call, no edit; /claude-rules-approve <n>)
+            try:
+                compare.rule_proposals_tick(cfg, journal, notify, res, week, next(iter(agents.values())).S.display_name if agents else cfg.mode)
+            except Exception as e:
+                telemetry.info(f"rule proposals failed: {e!r}")
     except Exception as e:                                   # back off 30 min instead of re-grading every 30 s
         _COMPARE_RETRY_AT[week] = _time.time() + 1800
         telemetry.failure(notify, journal, title="AUREON COMPARE FAILED", key=f"{cfg.mode}:ALL:COMPARE_ERROR:{week}",
@@ -177,6 +183,7 @@ def main():
     news_line, unverified = news_status(cfg.news_file)
 
     agents: dict[str, SymbolAgent] = {}; started = _time.time()
+    alerts = AlertStore(cfg.log_dir)                                                   # v2.0.0 /alert store, shared by agents + bot
     claude = ClaudeAdvisor.create(cfg, notify, journal, health_notify=health_notify)     # None when AUREON_CLAUDE=off
     if claude is not None:
         print(f"Claude add-on: {claude.mode} · bin {cfg.claude_bin} · workdir {cfg.claude_workdir} · {cfg.claude_max_calls} calls/day")
@@ -189,7 +196,7 @@ def main():
     def start_agents():
         for s in cfg.symbols:
             if s not in agents or not agents[s].is_alive():
-                agents[s] = SymbolAgent(s, cfg, S, notify, journal, news, claude=claude); agents[s].start()
+                agents[s] = SymbolAgent(s, cfg, S, notify, journal, news, claude=claude, alerts=alerts); agents[s].start()
 
     why = "online"
     try:
@@ -221,7 +228,7 @@ def main():
                         fields=[{"name": "Enable explicitly", "value": "`--enable-silver`", "inline": True}],
                         footer="Aureon MT5")
     start_agents()
-    if cfg.bot_token: run_bot(cfg, agents, journal, notify, started, health_notify=health_notify, claude=claude)
+    if cfg.bot_token: run_bot(cfg, agents, journal, notify, started, health_notify=health_notify, claude=claude, alerts=alerts)
     else: print("no DISCORD_TOKEN — slash commands off, alerts via webhook only")
 
     was_open = broker.market_open(cfg.symbols[0], cfg.server_utc_offset, cfg.dry); report_day = None; last_update_check = 0
@@ -242,7 +249,7 @@ def main():
             was_open = is_open
             review_day = claude_review_tick(claude, cfg, review_day)
             compare_saturday_tick(cfg, agents, journal, notify, claude)
-            supervise(agents, lambda sym: SymbolAgent(sym, cfg, S, notify, journal, news, claude=claude), notify, cfg.mode)
+            supervise(agents, lambda sym: SymbolAgent(sym, cfg, S, notify, journal, news, claude=claude, alerts=alerts), notify, cfg.mode)
         except KeyboardInterrupt:
             broker.close_connection(); print("bye"); return
         except Exception as e:

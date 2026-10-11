@@ -26,15 +26,19 @@ from .common.timeutil import IST, bar_key, ist_str as ist
 from .common.news import session_of
 from .common.context_chart import context_chart
 from .strategies.ema5080.trend import find_reentries, state_of
+from . import alerts as alerts_mod
 import os
 import numpy as np
 
 
 class SymbolAgent(threading.Thread):
-    def __init__(self, symbol: str, cfg: Config, strategy: Strategy, notify: Notifier, journal: Journal, news: tuple, claude=None):
+    def __init__(self, symbol: str, cfg: Config, strategy: Strategy, notify: Notifier, journal: Journal, news: tuple, claude=None, alerts=None):
         super().__init__(daemon=True, name=f"agent-{symbol}")
-        # v1.10.0 Claude add-on: hooks only when the advisor advises this strategy (ema5080, advisory/manage). None = v1.9.x behaviour.
+        # v1.10.0 Claude add-on: hooks only when the advisor advises this strategy (advisory/manage). None = v1.9.x behaviour.
         self.claude = claude if (claude is not None and claude.advises(strategy)) else None
+        self.claude_any = claude              # v2.0.0: the advisor in ANY mode (review included) — the alert card's add-on line
+        self.alerts = alerts if alerts is not None else alerts_mod.AlertStore(cfg.log_dir)   # v2.0.0 /alert store (shared by main)
+        self.pending_alert: dict | None = None   # {"alert_id", "side"}: attach to the next position seen on this symbol
         self.claude_inbox: "queue.Queue[dict]" = queue.Queue()
         self.symbol, self.cfg, self.S, self.notify, self.journal, self.news = symbol, cfg, strategy, notify, journal, news
         self.dry = cfg.dry
@@ -45,6 +49,7 @@ class SymbolAgent(threading.Thread):
         self.off = cfg.server_utc_offset
         self.state: dict[int, dict] = journal.load_state(symbol)
         self.latest_signal: dict | None = None
+        self.last_confirmed_cross: dict | None = None   # v2.0.0 ema2050: {"bar_time", "direction"} — the guardian's exit signal
         self.last_bar: int | None = None
         self.caught_up = False            # late-start catch-up card sent once
         self.last_bar_wall: float | None = None   # wall clock of the last processed closed bar (heartbeat)
@@ -60,6 +65,7 @@ class SymbolAgent(threading.Thread):
         self.seen_re: set = set()
         self.chart_dir = os.path.join(cfg.log_dir, "charts")
         self.last_df = None               # last closed-bar frame with EMAs (for /chart)
+        self.last_res = None              # last analysis result (per-bar states for /alert suggestions)
         self.health = {"status": "starting", "last_bar": None, "last_poll": None, "errors": 0, "managed": 0,
                        "close": None, "ema_fast": None, "ema_slow": None, "offset_h": self.off, "last_signal": None,
                        "last_broker_action": None, "guardian": "ON" if g else "OFF (no profile for this mode/symbol)"}
@@ -129,6 +135,7 @@ class SymbolAgent(threading.Thread):
                 if self.g is not None:
                     self._guard(new_bar, bar_t, df, close, ef, es, sgn)
                 self._refresh_snapshot(True)
+                self._check_alerts(closed, df, bar_t)
             except Exception as e:
                 self.health["errors"] += 1; self.health["status"] = f"error: {e}"
                 telemetry.failure(self.notify, self.journal, title="AUREON AGENT ERROR", key=self.key("ERROR", f"loop-{type(e).__name__}"),
@@ -227,7 +234,7 @@ class SymbolAgent(threading.Thread):
             ci, pk = lg["start"], lg["peak_idx"]
             long = lg["side"] == "LONG"
             till_px = float(h_[pk] if long else l_[pk])
-            trend = "UP ▲ (EMA 50 crossed above 80)" if long else "DOWN ▼ (EMA 50 crossed below 80)"
+            trend = f"UP ▲ (EMA {self.S.fast} crossed above {self.S.slow})" if long else f"DOWN ▼ (EMA {self.S.fast} crossed below {self.S.slow})"
             head = f"{'🟢' if long else '🔴'} {ist(int(t[ci]), off)} IST · {sess(t[ci])}" + (" · before day start" if lg["before_day"] else "")
             status = "still running" if lg["open"] else f"leg ended {ist(int(t[lg['end']]), off)[-5:]} IST"
             fields.append(field(head,
@@ -243,7 +250,7 @@ class SymbolAgent(threading.Thread):
         png2 = context_chart(df, self.symbol, self.S.display_name, self.S.fast, self.S.slow, self.S.ema_cols, off, self.chart_dir,
                              bars=max(160, n - (legs[0]["start"] if legs else n) + 20), title_extra="legs since day start",
                              regions=legs, day_start_ts=day_start_srv)
-        self.notify.send(self.key("STARTUP_EARLIER", bar_key(bar_t, off)), ctitle(self.symbol, "EARLIER TODAY · 50/80 LEGS"),
+        self.notify.send(self.key("STARTUP_EARLIER", bar_key(bar_t, off)), ctitle(self.symbol, f"EARLIER TODAY · {self.S.fast}/{self.S.slow} LEGS"),
                          [f"{sum(not lg['before_day'] for lg in legs)} cross(es) since 00:00 IST · available move today **{total:+.1f}** · "
                           f"shaded on the chart: cross → peak of each leg"],
                          png2, fields=fields, color=EVENT_COLOURS["info"], footer=cfooter(self.S.display_name, "late-start catch-up"))
@@ -536,7 +543,7 @@ class SymbolAgent(threading.Thread):
                              color=EVENT_COLOURS["signal_long" if long else "signal_short"], footer=cfooter(self.S.display_name, "leg progress"))
         # the leg ends when the 50/80 order turns against it
         if new_bar and ((long and sgn < 0) or ((not long) and sgn > 0)) and lg["kind"] != "P":
-            self._end_leg(df, bar_t, "EMA 50/80 crossed back")
+            self._end_leg(df, bar_t, f"EMA {self.S.fast}/{self.S.slow} crossed back")
         elif new_bar and lg["kind"] == "P" and (bar_t - lg["start_t"]) // 300 > 48 and lg["best"] < step:
             self._end_leg(df, bar_t, "P never developed (4h)")
 
@@ -606,7 +613,10 @@ class SymbolAgent(threading.Thread):
     # ------------------------------------------------------------------ detection
     def _detect(self, closed, df, bar_t, close, ef, es):
         res = self.S.analyse({"M5": Bars(self.symbol, "M5", closed)}, self.symbol, self.off, self.news)["M5"]
+        self.last_res = res
         last = len(df) - 1
+        if self.S.name == "ema2050":
+            return self._detect_2050(res, df, bar_t, close, ef, es)
         for ev in res["events"]:
             if ev.index != last or not ev.label.startswith(("EB", "ES")):
                 continue
@@ -641,6 +651,125 @@ class SymbolAgent(threading.Thread):
                              footer=cfooter(self.S.display_name, f"bar {ist(bar_t, self.off)}"))
             if self.claude is not None and kind in ("P", "cross"):          # v1.10.0: enqueue only — never blocks the poll
                 self.claude.request_entry(self, kind, side, bar_t, df, card_key=ask_key)
+
+    # ------------------------------------------------------------------ v2.0.0 price alerts (every poll, on the guardian's tick)
+    def _tick(self, df) -> dict | None:
+        if self.dry:
+            px = float(df["close"].iloc[-1]); return {"bid": px, "ask": px, "time": broker.now_server(self.off)}
+        return broker.tick(self.symbol)
+
+    def _check_alerts(self, closed, df, bar_t):
+        """Fires once per alert when the tick crosses the level from the side_hint side. Stale tick (> heartbeat_stale_min) or no tick:
+        nothing fires — re-checked when fresh. Card = alerts.reached_card (EMA + trend + guardian + the mode's own SUGGEST line)."""
+        store = self.alerts
+        try:
+            if store is None or not store.armed(self.symbol):
+                return
+            tk = self._tick(df)
+            if not tk:
+                return
+            if broker.now_server(self.off) - tk["time"] > self.cfg.heartbeat_stale_min * 60:
+                return
+            for a in store.check(self.symbol, tk["bid"], tk["ask"], bar_t):
+                self.journal.log("alert_fired", symbol=self.symbol, mode=self.S.name, alert_id=a["id"], price=a["price"], hit=a["hit_price"],
+                                 side_hint=a["side_hint"], note=a.get("note"), bar=bar_t, created_t=a.get("created_t"))
+                res = self.last_res
+                if res is None:
+                    res = self.S.analyse({"M5": Bars(self.symbol, "M5", closed)}, self.symbol, self.off, self.news)["M5"]; self.last_res = res
+                card = alerts_mod.reached_card(self, a, a["hit_price"], tk["time"], bar_t, df, res)
+                png = context_chart(df, self.symbol, self.S.display_name, self.S.fast, self.S.slow, self.S.ema_cols, self.off, self.chart_dir,
+                                    bars=120, title_extra=f"alert {a['price']:.2f}")
+                self.notify.ask(card["key"], card["title"], card["lines"], png=png, fields=card["fields"], color=card["color"],
+                                footer=card["footer"], meta=card["meta"])
+                self.health["last_signal"] = f"ALERT {a['price']:.2f} @ {ist(bar_t, self.off)}"
+                cl = self.claude_any
+                if cl is not None and getattr(cl, "mode", "off") != "off" and hasattr(cl, "request_alert"):
+                    cl.request_alert(self, a, card, df, bar_t)
+        except Exception as e:
+            telemetry.failure(self.notify, self.journal, title="AUREON ALERT ERROR", key=self.key("ERROR", "alerts"), mode=self.S.name,
+                              symbol=self.symbol, action="alert check", exc=e)
+
+    def attach_alert(self, alert_id: str, side: str):
+        """A LONG/SHORT button without execution: 'place it in MT5, I will manage it' — the next position seen carries the alert id."""
+        self.pending_alert = {"alert_id": alert_id, "side": side.upper(), "t": _time.time()}
+
+    # ------------------------------------------------------------------ detection, EMA 20/50 (v2.0.0)
+    def _detect_2050(self, res, df, bar_t, close, ef, es):
+        """CROSS (unconfirmed) · CROSS CONFIRMED · MULTI CROSS (ignored) · ENTER (pullback | no-pullback) · NO ENTRY (reason).
+        Every card: cross time, confirm time, pre-cross shoot, session, EMA 20/50, bars since cross. Same dedupe/order as 50/80."""
+        last = len(df) - 1; off = self.off; g = self.g; bk = bar_key(bar_t, off)
+        names = {"asia": "Asia", "london": "London", "ny": "New York", "off": "off-hours"}
+        def info_fields(info: dict) -> list[dict]:
+            return [field("Cross", f"{ist(info['cross_time'], off)} IST"),
+                    field("Confirm", f"{ist(info['confirm_time'], off)} IST" if info.get("confirm_time") else "—"),
+                    field("Pre-cross shoot", f"{info.get('shoot', 0.0):+.1f} pts"), field("Session", names.get(info.get("session", ""), "—")),
+                    field(f"EMA {self.S.fast}", f"{info['ema20']:.2f}"), field(f"EMA {self.S.slow}", f"{info['ema50']:.2f}"),
+                    field("Bars since cross", str(info.get("bars_since_cross", 0)))]
+        for ev in res["events"]:
+            if ev.index != last:
+                continue
+            side = "LONG" if ev.direction == "bull" else "SHORT"; s = 1 if side == "LONG" else -1
+            info = dict(ev.info); colour = EVENT_COLOURS["signal_long" if side == "LONG" else "signal_short"]
+            if ev.label == "CROSS":
+                self.health["last_signal"] = f"{side} cross @ {ist(bar_t, off)}"
+                self.journal.log("cross", symbol=self.symbol, mode=self.S.name, side=side, price=close, bar=bar_t, shoot=info.get("shoot"))
+                self.notify.send(self.key(f"CROSS_{side}", bk), ctitle(self.symbol, f"CROSS {side} (unconfirmed)"),
+                                 [f"EMA {self.S.fast} crossed {'above' if s > 0 else 'below'} EMA {self.S.slow} — not a trade yet",
+                                  f"confirmed when the order holds 3 bars and the gap reaches 1.5 (within 18 bars); a flip before that = multi cross"],
+                                 fields=info_fields(info) + [field("Price", f"**{close:.2f}**")], color=EVENT_COLOURS["cross"],
+                                 footer=cfooter(self.S.display_name, f"bar {ist(bar_t, off)}"))
+            elif ev.label == "CONFIRMED":
+                self.last_confirmed_cross = {"bar_time": bar_t, "direction": side, "cross_time": info.get("cross_time")}
+                self.journal.log("cross_confirmed", symbol=self.symbol, mode=self.S.name, side=side, price=close, bar=bar_t,
+                                 cross_bar=info.get("cross_time"), shoot=info.get("shoot"))
+                self.notify.send(self.key(f"CROSS_CONFIRMED_{side}", bk), ctitle(self.symbol, "CROSS CONFIRMED", side),
+                                 [ev.reason, f"waiting for the pullback to EMA {self.S.fast} (±1.5) — up to 12 bars, never more than 5 from it"],
+                                 fields=info_fields(info) + [field("Price", f"**{close:.2f}**")], color=EVENT_COLOURS["cross"],
+                                 footer=cfooter(self.S.display_name, f"bar {ist(bar_t, off)}"))
+            elif ev.label == "MULTI":
+                self.journal.log("multi_cross", symbol=self.symbol, mode=self.S.name, side=side, bar=bar_t, cross_bar=info.get("cross_time"))
+                self.notify.send(self.key("MULTI_CROSS", bk), ctitle(self.symbol, f"MULTI CROSS (ignored) · {side}"),
+                                 [f"the {side.lower()} cross flipped back before it could confirm — no trade", ev.reason],
+                                 fields=info_fields(info), color=EVENT_COLOURS["flip"], footer=cfooter(self.S.display_name, "multi cross"))
+            elif ev.label == "WP":
+                self.notify.send(self.key(f"NO_CONFIRM_{side}", bk), ctitle(self.symbol, f"CROSS {side} NOT CONFIRMED"),
+                                 [ev.reason + " — no trade"], fields=info_fields(info), color=EVENT_COLOURS["info"],
+                                 footer=cfooter(self.S.display_name, "no confirmation"))
+            elif ev.label == "F":
+                self.journal.log("no_entry", symbol=self.symbol, mode=self.S.name, side=side, bar=bar_t, why=ev.reason)
+                self.notify.send(self.key(f"NO_ENTRY_{side}", bk), ctitle(self.symbol, f"NO ENTRY ({ev.reason.split(' (')[0]})", side),
+                                 [f"**{ev.reason}**", "still watching the pullback window" if "too far" in ev.reason or "position" in ev.reason else "this cross is skipped"],
+                                 fields=info_fields(info) + [field("Price", f"**{close:.2f}**")], color=EVENT_COLOURS["info"],
+                                 footer=cfooter(self.S.display_name, "no entry"))
+            elif ev.label in ("EB", "ES"):
+                kind = "pullback" if ev.reason == "pullback" else "no-pullback"
+                self.latest_signal = {"bar_time": bar_t, "symbol": self.symbol, "strategy": self.S.name, "kind": kind, "direction": side, "consumed": False}
+                if self.leg and self.leg["side"] != side:
+                    self._end_leg(df, bar_t, f"opposite entry {side}")
+                if not self.leg or self.leg["side"] != side:
+                    self.leg = {"side": side, "kind": kind, "start_t": bar_t, "start_i_time": bar_t, "start_px": close,
+                                "best": 0.0, "best_px": close, "best_t": bar_t, "against": 0.0, "steps_sent": 0}
+                self.health["last_signal"] = f"{side} enter ({kind}) @ {ist(bar_t, off)}"
+                self.journal.log("signal", symbol=self.symbol, mode=self.S.name, side=side, signal_kind=kind, price=close, bar=bar_t,
+                                 cross_bar=info.get("cross_time"), confirm_bar=info.get("confirm_time"), shoot=info.get("shoot"))
+                stop = (close - s * g.pre_stop) if g else None
+                fields = ([field("Side", f"**{side}**"), field("Setup", f"confirmed cross · {kind} entry"), field("Price", f"**{close:.2f}**")]
+                          + info_fields(info)
+                          + ([field("Stop", f"{stop:.2f} (−{g.pre_stop:g}) · +{g.early_at:g} seen → SL entry +{g.early_level:g}", inline=False),
+                              field("Secure", f"at {close + s * g.secure_at:.2f} (+{g.secure_at:g}) → SL +{g.secure_level:g} · then ride +{g.ride_step:g} steps · "
+                                              f"close on an EMA {self.S.fast} turn once secured · exit on the next confirmed cross", inline=False)] if g else []))
+                note = "place it — I manage it" if g else "signal only — no guardian profile for this symbol"
+                png = context_chart(df, self.symbol, self.S.display_name, self.S.fast, self.S.slow, self.S.ema_cols, off, self.chart_dir,
+                                    marker={"index": last, "side": side, "label": "ENTER", "stop": stop,
+                                            "secure": (close + s * g.secure_at) if g else None})
+                fields = fields + (self._lot_field(g.pre_stop) if g else []) + self._context_fields(df)
+                ask_key = self.key(f"ENTER_{side}", bk)
+                self.notify.ask(ask_key, ctitle(self.symbol, f"ENTER {side} ({kind})"), [note, f"**Trade {side} now?**"], png=png,
+                                meta={"symbol": self.symbol, "side": side, "kind": kind, "price": close, "bar": bar_t, "mode": self.S.name,
+                                      "sl": stop, **(self._suggested(g.pre_stop) if g else {})},
+                                fields=fields, color=colour, footer=cfooter(self.S.display_name, f"bar {ist(bar_t, off)}"))
+                if self.claude is not None:                                    # the ENTER bar only — never raw CROSS / MULTI
+                    self.claude.request_entry(self, "enter", side, bar_t, df, card_key=ask_key)
 
     # ------------------------------------------------------------------ guardian helpers
     def _locked(self, p: dict) -> float:
@@ -678,7 +807,8 @@ class SymbolAgent(threading.Thread):
         return False
 
     def _close(self, p, reason, title, key, st, journal_reason=None, bar_t=None):
-        event_name = {"p_flip": "FLIP CLOSE", "news_flat": "BANKED BEFORE NEWS", "claude_close": "CLAUDE CLOSED"}.get(journal_reason or "", None)
+        event_name = {"p_flip": "FLIP CLOSE", "news_flat": "BANKED BEFORE NEWS", "claude_close": "CLAUDE CLOSED",
+                      "opposite_cross": "OPPOSITE CROSS · CLOSED"}.get(journal_reason or "", None)
         if bar_t is not None and st.get("closing_bar") == bar_t:
             return                                      # one close attempt per bar
         st["closing_bar"] = bar_t
@@ -687,7 +817,7 @@ class SymbolAgent(threading.Thread):
             self.closed_by_aureon.add(p["ticket"])
         self.health["last_broker_action"] = f"close {r.status} {datetime.now(IST):%H:%M:%S}"
         self.journal.log("exit", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], points=p["points"],
-                         reason=journal_reason or reason, auto=bool(r.ok))
+                         reason=journal_reason or reason, auto=bool(r.ok), alert_id=st.get("alert_id"))
         if r.ok:
             self.notify.send(key, ctitle(self.symbol, event_name or ("CLOSED " + ("WIN" if p["points"] > 0 else "LOSS")), p["direction"]), [reason],
                              fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"],
@@ -713,7 +843,7 @@ class SymbolAgent(threading.Thread):
                 final, approx = self._final_points(t, st)             # v1.11.0: for the weekly compare (measurement only)
                 self.journal.log("closed", symbol=self.symbol, mode=self.S.name, ticket=t, direction=st.get("direction"),
                                  entry=st.get("entry"), secured=st.get("secured"), peak=st.get("peak"),
-                                 final_points=final, final_approx=approx)
+                                 final_points=final, final_approx=approx, alert_id=st.get("alert_id"))
                 if t not in self.closed_by_aureon:            # closed by you (or your own SL/TP): ask why, one tap
                     last = st.get("last_points", 0.0)
                     self.notify.ask(self.key("CLOSED_BY_YOU", t), ctitle(self.symbol, "CLOSED BY YOU", st.get("direction")),
@@ -727,13 +857,20 @@ class SymbolAgent(threading.Thread):
         sig = self.latest_signal
         for p in pos:
             s = 1 if p["direction"] == "long" else -1
+            alert_id = None
             if p["ticket"] not in self.state:                    # v1.11.0: first sight of a trade (compare: 'Me · TAKEN')
+                pa = self.pending_alert
+                if pa and pa["side"] == ("LONG" if s > 0 else "SHORT") and _time.time() - pa["t"] <= self.cfg.ask_ttl_min * 60:
+                    alert_id = pa["alert_id"]; self.pending_alert = None          # v2.0.0: the trade you placed for an alert
                 self.journal.log("position_seen", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"],
-                                 side="LONG" if s > 0 else "SHORT", entry=p["price_open"], open_time=p.get("time"))
+                                 side="LONG" if s > 0 else "SHORT", entry=p["price_open"], open_time=p.get("time"), alert_id=alert_id)
             st = self.state.setdefault(p["ticket"], {"symbol": self.symbol, "mode": self.S.name, "direction": p["direction"],
-                                                     "entry": p["price_open"], "peak": p["points"], "pre": sgn != s, "bars": 0,
-                                                     "news_done": False, "secured": 0.0})
+                                                     "entry": p["price_open"], "peak": p["points"], "pre": (sgn != s) if g.p_phase else False, "bars": 0,
+                                                     "news_done": False, "secured": 0.0, "alert_id": alert_id})
+            if p["points"] > st["peak"] or "peak_t" not in st:
+                st["peak_t"] = bar_t                                                   # v2.0.0: bars_since_peak for the Claude snapshot
             st["peak"] = max(st["peak"], p["points"]); st["last_points"] = p["points"]
+            st["mae"] = min(st.get("mae", 0.0), p["points"])
             if new_bar: st["bars"] += 1
             st["secured"] = max(st.get("secured", 0.0), self._locked(p))      # live SL is the truth; never lower
             tag = f"{self.symbol} #{p['ticket']} {p['direction'].upper()} @ {p['price_open']:.2f}"
@@ -755,6 +892,26 @@ class SymbolAgent(threading.Thread):
                 self._close(p, f"opposite P ({sig['direction']}) — flip", f"🔁 FLIP CLOSE — {tag}", self.key("FLIP", f"{p['ticket']}-{bar_key(bar_t, self.off)}"), st, "p_flip", bar_t)
                 continue
 
+            # 1b) v2.0.0 (ema2050): the next CONFIRMED opposite cross closes the trade (same confirm rule as the entry)
+            cc = self.last_confirmed_cross
+            if g.exit_on_confirmed_cross and new_bar and cc and cc["bar_time"] == bar_t and cc["direction"] != p["direction"].upper():
+                self._close(p, f"confirmed opposite cross ({cc['direction']}) — the leg is over", f"🔁 OPPOSITE CROSS — {tag}",
+                            self.key("OPP_CROSS", f"{p['ticket']}-{bar_key(bar_t, self.off)}"), st, "opposite_cross", bar_t)
+                continue
+
+            # 1c) v2.0.0 early lock: once +early_at has been seen, SL → entry + early_level (never loosened; skipped if already better)
+            if g.early_at is not None and st["secured"] < g.early_level and st["peak"] >= g.early_at:
+                sl = p["price_open"] + s * g.early_level
+                if self._move_sl(p, sl, f"EARLY LOCK +{g.early_level:g}"):
+                    st["secured"] = g.early_level                                              # 1. state
+                    self.journal.log("early_lock", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], level=g.early_level,
+                                     peak=st["peak"], price=p["current"])                      # 2. journal
+                    self.notify.send(self.key("EARLY_LOCK", p["ticket"]), ctitle(self.symbol, f"EARLY LOCK +{g.early_level:g}", p["direction"]),
+                                     [f"+{g.early_at:g} seen — SL moved to entry +{g.early_level:g}, next: secure at +{g.secure_at:g}"],
+                                     fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"],
+                                                            points=p["points"], sl=sl, secured=g.early_level, peak=st["peak"]),
+                                     color=EVENT_COLOURS["secured"], footer=cfooter(self.S.display_name))
+
             # 2) P phase → cross confirmed: SL to the slow EMA ± buffer (tighten only)
             if st["pre"] and sgn == s:
                 st["pre"] = False
@@ -766,7 +923,7 @@ class SymbolAgent(threading.Thread):
                                  fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"], points=p["points"], sl=sl,
                                                         extra={"Next": f"secure at {p['price_open'] + s * g.secure_at:.2f} (+{g.secure_at:g})"}),
                                  color=EVENT_COLOURS["cross"], footer=cfooter(self.S.display_name))
-            elif not st["pre"] and st["secured"] < g.secure_level and new_bar:
+            elif g.slow_ema_sl and not st["pre"] and st["secured"] < g.secure_level and new_bar:
                 self._move_sl(p, es - s * g.ema_slow_sl_buffer, "FOLLOW EMA80", quiet=True)   # same safe path: retcode, telemetry, never-loosen
 
             # 3) SECURE — first priority; announced only when confirmed
@@ -831,7 +988,7 @@ class SymbolAgent(threading.Thread):
                                          color=EVENT_COLOURS["news"], footer=cfooter(self.S.display_name, "guardian"))
                     else:
                         reason, jr = f"P timeout: {st['bars']} bars without the cross", "pre_timeout"
-                elif not st["pre"] and st["secured"] < g.secure_level and against_s:
+                elif g.slow_ema_sl and not st["pre"] and st["secured"] < g.secure_level and against_s:
                     reason, jr = f"bar closed through EMA {self.S.slow} ({es:.2f})", "ema_slow_stop"
                 if reason:
                     self._close(p, reason, f"{'✅' if p['points'] > 0 else '🛑'} CLOSED — {tag}", self.key("CLOSED", f"{p['ticket']}-{bar_key(bar_t, self.off)}"), st, jr, bar_t)

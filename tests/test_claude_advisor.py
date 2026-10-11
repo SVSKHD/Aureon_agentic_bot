@@ -285,9 +285,12 @@ def test_off_means_zero_calls(tmp_path, monkeypatch):
     assert calls == [] and ag.health["errors"] == 0
 
 
-def test_ema2050_never_hooked(rig):
+def test_ema2050_hooked_in_advise_modes_only(rig):
+    """v2.0.0: the add-on advises ema2050 too (ENTER bar + pullbacks); review mode still has no trade hooks."""
     r = rig(mode="manage", reply=ok("HOLD"), strategy="ema2050")
-    assert r.ag.claude is None
+    assert r.ag.claude is not None and r.adv.advises(r.ag.S)
+    r2 = rig(mode="review", reply=ok("HOLD"), strategy="ema2050")
+    assert r2.ag.claude is None
 
 
 def test_review_mode_has_no_trade_hooks(rig):
