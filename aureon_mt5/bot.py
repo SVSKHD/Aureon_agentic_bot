@@ -135,25 +135,49 @@ def parallel_card(agents, cfg, journal=None) -> dict:
     return _embed("AUREON · MT5 · PARALLEL STATUS", f"v{VERSION} · {len(agents)} symbol(s)", color=GREEN if all_ok else YELLOW, fields=fields)
 
 
-def agents_card(agents, cfg, started_at, monitor=None) -> dict:
-    up = _time.time() - started_at
+def agents_card(agents, cfg, started_at, monitor=None, claude=None, journal=None) -> dict:
+    """One operational block per running agent, using cached data only."""
+    from .common.timeutil import ist_str, server_str
     fields = []
     for sym, ag in agents.items():
-        h = ag.health; snap = _snap(ag)
-        checks = [
-            ("Detector", ag.is_alive() and h["status"] in ("running", "market closed")),
-            ("Guardian", ag.g is not None),
-            ("MT5", bool(snap.get("connected"))),
-            ("Journal", True), ("Telemetry", True),
-            ("Discord", bool(cfg.webhook)),
-            ("News", len(ag.news) > 0), ("Market guard", True),
+        snap = _snap(ag)
+        h = ag.health
+        pos = snap.get("positions") or []
+        state = snap.get("state") or {}
+        if pos:
+            p = pos[0]
+            st = state.get(p.get("ticket"), state.get(str(p.get("ticket")), {}))
+            phase = f"in trade: {p.get('direction','?')} · {float(p.get('points',0)):+.1f}pts · SL {p.get('sl') or '—'} · secured {st.get('secured',0)}"
+        else:
+            r = getattr(ag, "last_res", None) or {}
+            bars = r.get("bar_states") or []
+            confirm = bars[-1].get("confirm") if bars else None
+            phase = ("confirmed, waiting pullback" if getattr(ag, "last_confirmed_cross", None) or confirm == "confirmed" else
+                     f"cross seen, confirming {confirm}" if confirm else "waiting cross")
+        t = ag.last_bar
+        off = float(getattr(ag, "off", cfg.server_utc_offset))
+        bar = f"{server_str(t)} server / {ist_str(t, off)} IST" if t else "—"
+        day = snap.get("today") or {}
+        ai = claude.attachment(ag).get("state", "OFF") if claude else "OFF"
+        err = str(h.get("status", ""))
+        if "error" not in err.lower(): err = "—"
+        lines = [
+            f"Phase **{phase}**",
+            f"Last bar {bar}",
+            f"Bars today **{day.get('bars','—')}** · crosses **{day.get('crosses','—')}**",
+            f"Trades **{day.get('closed','—')}** · pnl pts **{day.get('pnl_pts','—')}**",
+            f"Guardian **{'ON' if ag.g else 'OFF'}** · Claude **{ai}**",
+            f"Thread **{'alive' if ag.is_alive() else 'DEAD'}** · uptime **{int((_time.time()-started_at)//60)}m**",
+            f"Last error {err[:150]}",
         ]
-        lines = [f"{'✅' if ok else '❌'} {name}" for name, ok in checks]
-        lines.append(f"Errors `{h['errors']}` · thread `{'alive' if ag.is_alive() else 'DEAD'}` · {age_text(ag)}")
-        fields.append(_field(f"{sym} · {ag.S.display_name}", "\n".join(lines), True))
-    fields.append(_field("Bot", _bot_line(monitor), False))
-    desc = f"Uptime **{int(up // 3600)}h {int(up % 3600 // 60)}m**"
-    return _embed("AUREON · MT5 · AGENTS", desc, color=BLUE, fields=fields)
+        fields.append(_field(f"{sym} · {ag.S.display_name}", "\n".join(lines)[:1024], False))
+    try:
+        import subprocess
+        git_hash = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, timeout=1).stdout.strip() or "—"
+    except Exception: git_hash = "—"
+    market = "OPEN" if any(_snap(a).get("market_open") for a in agents.values()) else "CLOSED"
+    return _embed("AUREON · MT5 · AGENTS", f"{len(agents)} agent(s)", color=BLUE,
+                  fields=fields[:25], footer=f"v{VERSION} · {git_hash} · market {market}")
 
 
 def symbols_card(agents, cfg) -> dict:
@@ -768,7 +792,7 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
 
     @tree.command(name="agents", description="Components and health")
     async def agents_cmd(inter: discord.Interaction):
-        await run(inter, "agents", lambda: Reply(card=agents_card(agents, cfg, started_at, monitor)))
+        await run(inter, "agents", lambda: Reply(card=agents_card(agents, cfg, started_at, monitor, claude, journal)))
 
     @tree.command(name="symbols", description="Configured symbols and mode")
     async def symbols(inter: discord.Interaction):
