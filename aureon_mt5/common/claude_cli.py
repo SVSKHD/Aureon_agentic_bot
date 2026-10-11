@@ -127,13 +127,17 @@ def parse_output(stdout: str, event: str) -> CliResult:
         return CliResult(False, error="CLI output has no result", raw=(stdout or "")[:500])
     result = outer.get("result")
     model = reported_model(outer)
+    usage = outer.get("usage") if isinstance(outer.get("usage"), dict) else {}
+    cost = outer.get("total_cost_usd")
+    try: cost = None if cost is None else float(cost)
+    except (ValueError, TypeError): cost = None
     if outer.get("is_error") or outer.get("subtype", "success") not in ("success",):
         msg = str(result or outer.get("error") or outer.get("subtype") or "error")[:200]
         return CliResult(False, error=msg, auth_error=_is_auth(msg), raw=(stdout or "")[:500])
     if not isinstance(result, str):
         return CliResult(False, error="CLI result missing", raw=(stdout or "")[:500])
     if event in ("review", "test"):
-        return CliResult(True, text=result.strip(), raw=result[:500], model=model)
+        return CliResult(True, text=result.strip(), raw=result[:500], model=model, usage=usage, total_cost_usd=cost)
     try:
         return CliResult(True, verdict=validate(extract_json(result), event), raw=result[:500], model=model)
     except Exception as e:
