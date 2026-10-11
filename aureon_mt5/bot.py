@@ -6,8 +6,8 @@ controls guardian execution.
 """
 from __future__ import annotations
 
-import asy
-import jsonncio
+import asyncio
+import json
 import os
 import threading
 import time as _time
@@ -922,7 +922,7 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             if cfg.codex_mode == "off":
                 return Reply(content="CODEX · OFF · set AUREON_CODEX=advisory and restart")
             return Reply(content=(f"CODEX · {cfg.codex_mode.upper()} · {codex_cli.version(cfg.codex_bin)} · "
-                                  f"{codex_cli.login_status(cfg.codex_bin)}\\n"
+                                  f"{codex_cli.login_status(cfg.codex_bin)}\n"
                                   f"Local calls: {codex_budget.used()}/{cfg.codex_max_calls} today"))
         await run(inter, "codex-status", work, timeout=30)
 
