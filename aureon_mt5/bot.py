@@ -1111,6 +1111,15 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             fields = []
             for span in ("today", "week", "month"):
                 x = summarize(cfg.log_dir, span)
+                now = datetime.now(IST)
+                start = {
+                    "today": now.replace(hour=0, minute=0, second=0, microsecond=0),
+                    "week": (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0),
+                    "month": now.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
+                }[span]
+                records = journal.read(int(start.timestamp()))
+                stale = sum(r.get("event") == "claude_verdict" and r.get("stale") for r in records)
+                fast_cancel = sum(r.get("event") == "claude_fast_exit_cancel" for r in records)
                 by_kind = ", ".join(f"{k}:{v}" for k, v in sorted(x["by_kind"].items())) or "none"
                 verdicts = ", ".join(f"{k}:{v}" for k, v in sorted(x["verdicts"].items())) or "none"
                 val = (f"Calls {x['calls']} · ok {x['ok']} · errors {x['errors']} · timeout {x['timeouts']}\n"
@@ -1118,7 +1127,8 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
                        f"Tokens in/out {x['input_tokens']}/{x['output_tokens']} · "
                        f"cache read/write {x['cache_read_input_tokens']}/{x['cache_creation_input_tokens']}\n"
                        f"CLI reported cost ${x['cost_usd']:.4f} · "
-                       f"avg/max {x['avg_latency']:.1f}/{x['max_latency']:.1f}s")
+                       f"avg/max {x['avg_latency']:.1f}/{x['max_latency']:.1f}s · "
+                       f"STALE {stale} · fast-exit cancels {fast_cancel}")
                 fields.append(_field(span.title(), val[:1024], False))
             return Reply(card=_embed("AUREON · CLAUDE USAGE", "CLI reported usage; not independently priced at model list rates.", fields=fields))
         await run(inter, "claude-status", work)
