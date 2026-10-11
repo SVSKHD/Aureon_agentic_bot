@@ -109,10 +109,12 @@ def greet(notify, cfg, S, why, news_line):
 def supervise(agents: dict, factory, notify, mode: str) -> list[str]:
     """Restart ONLY dead agents; the others are never touched. Returns the symbols restarted."""
     restarted = []
+    from aureon_mt5.crashes import should_restart, reason
     for sym, ag in list(agents.items()):
-        if not ag.is_alive():
+        if not ag.is_alive() and should_restart(sym):
+            why = reason(sym)
             agents[sym] = factory(sym); agents[sym].start(); restarted.append(sym)
-            notify.send(f"{mode}:{sym}:RESTART:{int(_time.time()) // 60}", f"{sym} · MT5 · AGENT RESTARTED", ["other symbols unaffected"])
+            notify.send(f"{mode}:{sym}:RESTART:{int(_time.time()) // 60}", f"{sym} · MT5 · AGENT RESTARTED", [f"reason: {why or 'thread ended'}", "other symbols unaffected"])
     return restarted
 
 
@@ -210,6 +212,10 @@ def main():
     try:
         last_msg = subprocess.run(["git", "log", "-1", "--pretty=%s"], capture_output=True, text=True, timeout=10).stdout.strip()
         last_hash = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, timeout=10).stdout.strip()
+        manual_reason = os.environ.pop("AUREON_RESTART_REASON", "")
+        if manual_reason:
+            why = f"restarted · {manual_reason}"
+            notify.card("AUREON · MT5 · BACK ONLINE", f"{manual_reason}\\nRunning `{last_hash}` · {S.display_name}")
         if os.environ.get("AUREON_AUTO_RESTARTED"):
             why = f"restarted · auto-update · {last_hash}"
             notify.card("AUREON · MT5 · BACK ONLINE", f"Auto-update restart complete.\nRunning `{last_hash}` · {last_msg}",
@@ -259,6 +265,7 @@ def main():
             compare_saturday_tick(cfg, agents, journal, notify, claude)
             supervise(agents, lambda sym: SymbolAgent(sym, cfg, S, notify, journal, news, claude=claude, alerts=alerts), notify, cfg.mode)
         except KeyboardInterrupt:
+            notify.card("AUREON · MT5 · PROCESS EXITING", "KeyboardInterrupt")
             broker.close_connection(); print("bye"); return
         except Exception as e:
             telemetry.failure(notify, journal, title="AUREON SUPERVISOR ERROR", key="supervisor", mode=cfg.mode, action="supervisor", exc=e)
