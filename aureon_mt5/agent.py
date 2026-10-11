@@ -137,9 +137,10 @@ class SymbolAgent(threading.Thread):
                 self._refresh_snapshot(True)
                 self._check_alerts(closed, df, bar_t)
             except Exception as e:
+                from .crashes import report as report_crash
                 self.health["errors"] += 1; self.health["status"] = f"error: {e}"
-                telemetry.failure(self.notify, self.journal, title="AUREON AGENT ERROR", key=self.key("ERROR", f"loop-{type(e).__name__}"),
-                                  mode=self.S.name, symbol=self.symbol, action="loop", exc=e)
+                report_crash(self, e)
+                return  # supervisor restarts this agent, unless crash guard paused it
             _time.sleep(self.cfg.poll_seconds)
 
     def chart_now(self) -> str | None:
