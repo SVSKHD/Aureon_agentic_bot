@@ -39,17 +39,25 @@ def report(cfg, agents, journal, period="week", now=None):
         start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
     elif period == "month":
         start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if now.day == 1:
+            # The 1st-of-month scheduled report covers the completed previous month.
+            now = start
+            start = (start - timedelta(days=1)).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     else:
         raise ValueError("period must be week or month")
     since, until = int(start.timestamp()), int(now.timestamp())
     result = compare.gather(cfg, agents, journal, since, until)
     stats = summarize_rows(result.rows)
-    usage = summarize(cfg.log_dir, period)
+    usage = summarize(cfg.log_dir, period, now=now - timedelta(seconds=1) if period == "month" else now)
+    pullback = result.pullback
+    by_decision = pullback.by_decision
     fields = [
         {"name": "Graded verdicts", "value": str(stats["verdicts"]), "inline": False},
         {"name": "Agreement", "value": f"detector TAKE {stats['agreement_detector_pct']}% · trader {stats['agreement_trader_pct']}%", "inline": False},
         {"name": "SKIP precision", "value": f"{stats['skip_precision']}" if stats["skip_precision"] is not None else "—", "inline": True},
         {"name": "Expectancy (pts)", "value": f"Claude TAKE {stats['take_expectancy']} · detector all {stats['detector_expectancy']}", "inline": True},
+        {"name": "TIGHTEN / CLOSE grading", "value": " · ".join(f"{k} {by_decision.get(k, {}).get('right', 0)}/{by_decision.get(k, {}).get('n', 0)} right" for k in ("TIGHTEN", "CLOSE")) + f" · {pullback.ungraded} ungraded", "inline": False},
+        {"name": "Calibration", "value": "Unavailable: journal confidence outcomes not yet matched; no synthetic score", "inline": False},
         {"name": "Usage", "value": f"{usage['calls']} calls · {usage['input_tokens']}/{usage['output_tokens']} tokens · CLI reported cost ${usage['cost_usd']:.4f}", "inline": False},
         {"name": "Top disagreements", "value": "\n".join(f"{d['symbol']} {d['bar']}: Claude {d['claude']} / trader {d['trader']} ({d['points']:+.1f}pts)" for d in stats["top_disagreements"]) or "None", "inline": False},
     ]
