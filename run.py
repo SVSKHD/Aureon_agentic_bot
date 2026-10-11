@@ -32,6 +32,24 @@ def analyse_day(S, bars_all, rng, symbol, off, news):
     return S.analyse({"M5": Bars(symbol, "M5", cut)}, symbol, off, news, display_from=rng["prev_start"], trade_from=rng["day_start"], **extra)
 
 
+def replay_range(S, symbol, source, d0, d1, csv, off, news, verbose=False, trades=False) -> list[dict]:
+    """The range replay (`--from/--to`): one analyse_day per trading day with bars. Shared by main() and tests/test_v231_parity.py."""
+    bars_all, rngs = load_range(symbol, source, d0, d1, csv)
+    days = []
+    m5_all = bars_all["M5"].df
+    for rng in rngs:
+        if not len(m5_all[(m5_all["time"] >= rng["day_start"]) & (m5_all["time"] < rng["day_end"])]):
+            continue                                                       # holiday / no bars
+        m5 = analyse_day(S, bars_all, rng, symbol, off, news)["M5"]; sm = m5["summary"]
+        days.append({"day": rng["day"], "journeys": m5["journeys"], "summary": sm, "df": m5["df"]})
+        if verbose:
+            print(f"{rng['day']:%a %d %b}: {sm['trades']} trades · net {sm['net']:+.1f} · crosses {sm.get('crosses', '—')} · confirmed {sm.get('confirmed', '—')} · multi {sm.get('whipsaws', 0)}")
+        if trades:
+            for j in m5["journeys"]:
+                print(trade_line(j, off))
+    return days
+
+
 def research_summary(days: list[dict], S, symbol: str, lot: float, point_value: float, off: float) -> str:
     """days: [{"day": date, "journeys": [...], "summary": {...}}]. Points, $ at --lot, offered/available/captured, counts, goal days,
     best/worst day, max drawdown (trade by trade, closed trades), month table."""
@@ -143,18 +161,8 @@ def main():
         d0 = date.fromisoformat(a.from_day); d1 = date.fromisoformat(a.to_day) if a.to_day else d0
         years = sorted({d0.year, d1.year})
         news = () if (a.no_nfp and not a.news) else tuple(sorted({t for y in years for t in load_news(a.news, y)}))
-        bars_all, rngs = load_range(a.symbol, a.source, d0, d1, a.csv)
-        days = []
         print(f"{S.display_name} · {a.symbol} · {d0} → {d1} · replay day by day (entries inside the server day, open trades closed at the day end)")
-        for rng in rngs:
-            if not len(bars_all["M5"].df[(bars_all["M5"].df["time"] >= rng["day_start"]) & (bars_all["M5"].df["time"] < rng["day_end"])]):
-                continue                                                       # holiday / no bars
-            m5 = analyse_day(S, bars_all, rng, a.symbol, off, news)["M5"]; sm = m5["summary"]
-            days.append({"day": rng["day"], "journeys": m5["journeys"], "summary": sm, "df": m5["df"]})
-            print(f"{rng['day']:%a %d %b}: {sm['trades']} trades · net {sm['net']:+.1f} · crosses {sm.get('crosses', '—')} · confirmed {sm.get('confirmed', '—')} · multi {sm.get('whipsaws', 0)}")
-            if a.trades:
-                for j in m5["journeys"]:
-                    print(trade_line(j, off))
+        days = replay_range(S, a.symbol, a.source, d0, d1, a.csv, off, news, verbose=True, trades=a.trades)
         if not days:
             print("no bars in that range"); sys.exit(1)
         block = research_summary(days, S, a.symbol, a.lot, pv, off)

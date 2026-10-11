@@ -9,12 +9,12 @@ Vocabulary (events):
   F          no entry at that bar (too far from EMA20 | no-entry hour | news | in position)
   WP         the cross never confirmed inside the window
 
-Entry (pullback to EMA20):
-  * touches between the cross and the confirm bar count -> enter at the confirm bar close
-  * otherwise the first touch after the confirm bar, up to confirm + pullback_window bars
-  * fallback at confirm + pullback_window only if |close − EMA20| <= max_chase and the order still holds
-  * never chase: an entry bar must close within max_chase of EMA20
-  * no entries server 21:00–23:59 nor outside entry_hours_ist (the stricter wins) · news block 60/30 min
+Entry (pullback to EMA20) — v2.3.1: exactly research/ema2050_scan.py:
+  * a touch on any bar in (cross, confirm] (from the bar AFTER the cross) -> enter at the confirm bar close ("pullback")
+  * otherwise the first touch in (confirm, confirm + pullback_window] ("pullback")
+  * else fallback at confirm + pullback_window only if |close − EMA20| <= max_chase and the order still holds ("no-pullback")
+  * max_chase applies to the fallback ONLY, never to a touch entry
+  * the only time filter: no entries server 21:00–23:59 (no IST window) · news block 60/30 min
 Exits are the GUARDIAN's (replayed here from the Guardian profile): −pre_stop stop · early lock (+early_at seen ->
 SL entry+early_level) · secure +10 -> SL +10 · ride +5 steps (2 pts air) · close on an EMA20 turn once secured ·
 exit at the next CONFIRMED opposite cross · news flat · day end. No EMA50 follow-SL. One trade per cross.
@@ -59,11 +59,11 @@ class Rules:
     confirm_window: int = 18        # ...within this many bars of the cross; any flip before -> multi cross
     touch_tol: float = 1.5          # pullback: low <= EMA20 + tol (longs) / high >= EMA20 − tol (shorts)
     pullback_window: int = 12       # first touch after the confirm bar, up to confirm + this
-    max_chase: float = 5.0          # an entry bar must close within this of EMA20 (fallback and touches alike)
+    max_chase: float = 5.0          # the FALLBACK entry must close within this of EMA20 (never applied to touch entries)
     shoot_bars: int = 40            # pre-cross shoot: bars before the cross (report only)
     min_shoot: float = 0.0          # 0 = no filter (tested: filters failed 2025)
-    no_entry_server_hours: tuple = (21.0, 24.0)   # no entries from 21:00 server to midnight
-    entry_hours_ist: tuple = (5.5, 23.0)          # and only inside this IST window (the stricter of the two wins)
+    no_entry_server_hours: tuple = (21.0, 24.0)   # no entries from 21:00 server to midnight — the only time filter
+    entry_hours_ist: tuple | None = None          # v2.3.1: no IST window (the research has none); a tuple re-enables it
     # ---- kept at the researched OFF values (tested: trend/hold/filter variants failed 2025 — do not turn on)
     reentry_max: int = 0
     skip_sessions: tuple = ()
@@ -203,10 +203,12 @@ def server_hour(ts_server: int) -> float:
 
 
 def entry_hour_block(ts_server: int, rules: Rules, server_offset_h: float) -> str | None:
-    """None when the hour allows an entry, else the reason. Server 21:00–23:59 and the IST window; the stricter wins."""
+    """None when the hour allows an entry, else the reason. Server 21:00–23:59; an IST window only if entry_hours_ist is set."""
     sh = server_hour(ts_server); lo_s, hi_s = rules.no_entry_server_hours
     if lo_s <= sh < hi_s:
         return f"no-entry hour (server {int(sh):02d}:{int((sh % 1) * 60):02d})"
+    if rules.entry_hours_ist is None:
+        return None
     ih = ist_hour(ts_server, server_offset_h); lo_i, hi_i = rules.entry_hours_ist
     if not (lo_i <= ih < hi_i):
         return f"no-entry hour (outside {lo_i:g}-{hi_i:g} IST)"
@@ -279,10 +281,10 @@ def build(df: pd.DataFrame, rules: Rules, server_offset_h: float = 3.0, trade_fr
                 "ema20": float(e20[k]), "ema50": float(e50[k]), "gap": float(gap[k]), "multi": x.multi,
                 "direction": x.direction}
 
-    def allowed(k: int, s: int, x: CrossInfo) -> str | None:
-        """None = entry allowed at bar k, else the reason."""
+    def allowed(k: int, s: int, x: CrossInfo, fallback: bool) -> str | None:
+        """None = entry allowed at bar k, else the reason. max_chase is the fallback's condition only."""
         dist = abs(close[k] - e20[k])
-        if dist > rules.max_chase:
+        if fallback and dist > rules.max_chase:
             return f"too far from EMA20 ({dist:.1f} > {rules.max_chase:g})"
         if rules.hour_filter:
             why = entry_hour_block(int(time[k]), rules, server_offset_h)
@@ -355,7 +357,7 @@ def build(df: pd.DataFrame, rules: Rules, server_offset_h: float = 3.0, trade_fr
             continue                                        # still waiting at the end of the data
         j = x.confirm_index
         events.append(CrossEvent(j, int(time[j]), d, "CONFIRMED", f"{j - i + 1} bars · gap {abs(gap[j]):.2f}", info_fields(x, j)))
-        x.touched_before_confirm = any(touch(k, s) for k in range(i, j + 1))
+        x.touched_before_confirm = any(touch(k, s) for k in range(i + 1, j + 1))      # from the bar AFTER the cross
         first = j if x.touched_before_confirm else j + 1
         last_b = min(j + rules.pullback_window, x.next_index - 1)
         for k in range(first, last_b + 1):
@@ -363,7 +365,7 @@ def build(df: pd.DataFrame, rules: Rules, server_offset_h: float = 3.0, trade_fr
             is_fallback = (k == j + rules.pullback_window) and not is_touch
             if not (is_touch or is_fallback):
                 continue
-            why = allowed(k, s, x)
+            why = allowed(k, s, x, fallback=is_fallback)
             if why is not None:
                 x.fails[k] = why
                 events.append(CrossEvent(k, int(time[k]), d, "F", why, info_fields(x, k)))

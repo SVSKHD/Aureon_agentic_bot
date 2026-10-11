@@ -30,7 +30,7 @@ from . import advisor_board, telemetry
 from .common import claude_cli
 from .common.claude_cli import Budget, IST, ist_day
 from .common.news import session_of
-from .common.timeutil import bar_key, ist_str, now_server
+from .common.timeutil import bar_key, ist_str, now_server, server_str
 from .notify import EVENT_COLOURS, field, footer as cfooter, position_fields, title as ctitle
 
 MODES = ("off", "review", "advisory", "manage")
@@ -101,7 +101,7 @@ def build_snapshot(agent, event: str, side: str, bar_t: int, df, *, position: di
     snap = {
         "event": event, "symbol": agent.symbol, "mode": agent.S.name, "side": _side_word(side),
         "ema_names": {"fast": fast_name, "slow": slow_name},
-        "bar_time_ist": ist_str(bar_t, off, "%Y-%m-%d %H:%M"), "close": round(close, 2),
+        "bar_time_ist": ist_str(bar_t, off, "%Y-%m-%d %H:%M"), "bar_time_server": server_str(bar_t, "%H:%M"), "close": round(close, 2),
         "ema_fast": round(e50, 2), "ema_slow": round(e80, 2), "gap": round(e50 - e80, 2), "avg_range": round(avg_range, 2),
         # v2.0.0 quantified context (both modes)
         "crosses_today": crosses_today, "bars_since_cross": bars_since_cross, "confirm_state": confirm_state,

@@ -99,12 +99,23 @@ def fetch_csv(path: str, symbol: str, timeframe: str) -> Bars:
     cols = {c.lower(): c for c in df.columns}
     t = df[cols["time"]]
     if not pd.api.types.is_numeric_dtype(t):
-        t = pd.to_datetime(t, utc=True).astype("int64") // 10**9
+        # resolution-independent (pandas 3 parses to datetime64[us], not [ns]); MT5 exports "2026.07.01 00:00" work too
+        t = (pd.to_datetime(t.astype(str).str.replace(r"^(\d{4})\.(\d{2})\.(\d{2})", r"\1-\2-\3", regex=True), utc=True)
+             - pd.Timestamp(0, tz="UTC")) // pd.Timedelta(seconds=1)
     df = df.rename(columns={cols[k]: k for k in cols})
     df["time"] = t
-    if "volume" not in df:
-        df["volume"] = df.get("tick_volume", 0)
-    return Bars(symbol, timeframe, _clean(df))
+    return Bars(symbol, timeframe, _clean(csv_volume(df)))
+
+
+def csv_volume(df: pd.DataFrame) -> pd.DataFrame:
+    """v2.3.1: MT5 exports carry tick_volume + real_volume (+ spread). volume = tick_volume; real_volume and spread are dropped
+    (a CSV `spread` must never reach the strategy, whose `spread` column is EMA20 − EMA50). Before this, a file with
+    tick_volume but no volume column ended up with two `volume` columns and failed."""
+    if "tick_volume" in df:
+        df["volume"] = df["tick_volume"]
+    elif "volume" not in df:
+        df["volume"] = df["real_volume"] if "real_volume" in df else 0
+    return df.drop(columns=[c for c in ("tick_volume", "real_volume", "spread") if c in df])
 
 
 def resample(bars: Bars, timeframe: str) -> Bars:

@@ -191,7 +191,8 @@ class ShadowReplay:
         r = self.adv._invoke(self.adv.prompt_for(snapshot), self.model, event)
         row = {"key": key, "bar_t": int(bar_t), "event": event, "model": self.model, "rules_hash": self.rules_h, "advisor": self.advisor,
                "verdict": r.verdict if r.ok else None, "error": "" if r.ok else r.error, "latency_s": round(r.latency_s, 1),
-               "reported_model": getattr(r, "model", ""), "asked_at": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")}
+               "reported_model": getattr(r, "model", ""), "asked_at": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
+               "snapshot": snapshot}                    # v2.3.2: what was sent, so prompt tests can re-feed it (export_snapshots)
         if not r.ok:
             self.res.errors += 1
         self.cache[key] = row; append_cache(self.path, row)
@@ -442,6 +443,20 @@ def write_combined(out_dir: str, mode: str, symbol: str, text: str) -> str:
     return path
 
 
+def export_snapshots(cache_file: str, out_path: str, *, event: str = "ENTER", month: str | None = None) -> int:
+    """v2.3.2: write the cached snapshots (one per bar, latest row wins) as JSONL for tests/test_v232_prompt_rules.py.
+    month = "2026-07" keeps that server month only. Returns how many were written."""
+    rows = [r for r in load_cache(cache_file).values() if r.get("event") == event and isinstance(r.get("snapshot"), dict)]
+    if month:
+        rows = [r for r in rows if datetime.fromtimestamp(int(r["bar_t"]), tz=timezone.utc).strftime("%Y-%m") == month]
+    by_bar = {int(r["bar_t"]): r["snapshot"] for r in rows}
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        for bar in sorted(by_bar):
+            f.write(json.dumps({"bar_t": bar, "snapshot": by_bar[bar]}, default=str) + "\n")
+    return len(by_bar)
+
+
 class _Quiet:
     """A Notifier stand-in: the shadow advisor never posts."""
     def send(self, *a, **k): return True
@@ -450,3 +465,12 @@ class _Quiet:
     def edit_card(self, *a, **k): return False
     claude_edit_hook = None
     card_edit_hook = None
+
+
+if __name__ == "__main__":                     # python -m aureon_mt5.claude_replay export <cache.jsonl> <out.jsonl> [YYYY-MM]
+    import sys
+    if len(sys.argv) >= 4 and sys.argv[1] == "export":
+        n = export_snapshots(sys.argv[2], sys.argv[3], month=sys.argv[4] if len(sys.argv) > 4 else None)
+        print(f"{n} snapshots → {sys.argv[3]}")
+    else:
+        print("usage: python -m aureon_mt5.claude_replay export <cache.jsonl> <out.jsonl> [YYYY-MM]")

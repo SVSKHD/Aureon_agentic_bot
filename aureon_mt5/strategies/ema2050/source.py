@@ -78,16 +78,10 @@ def fetch_mt5(symbol: str, timeframe: str, bars: int, rng: dict | None = None) -
 
 # --------------------------------------------------------------------------- CSV
 def fetch_csv(path: str, symbol: str, timeframe: str) -> Bars:
-    df = pd.read_csv(path)
-    cols = {c.lower(): c for c in df.columns}
-    t = df[cols["time"]]
-    if not pd.api.types.is_numeric_dtype(t):
-        t = pd.to_datetime(t, utc=True).astype("int64") // 10**9
-    df = df.rename(columns={cols[k]: k for k in cols})
-    df["time"] = t
-    if "volume" not in df:
-        df["volume"] = df.get("tick_volume", 0)
-    return Bars(symbol, timeframe, _clean(df))
+    """One CSV reader for every mode (v2.3.1): common.source.fetch_csv."""
+    from ...common.source import fetch_csv as _common_fetch_csv
+    b = _common_fetch_csv(path, symbol, timeframe)
+    return Bars(symbol, timeframe, b.df)
 
 
 def resample(bars: Bars, timeframe: str) -> Bars:

@@ -1,4 +1,4 @@
-# Aureon MT5 v2.3.0
+# Aureon MT5 v2.3.2
 
 You place the trade. Aureon detects (per selected EMA mode), fires a Discord gunshot, then manages what you placed:
 protect → secure +10 → ride in +5 steps → close on the fast-EMA turn → news safeguard. Reports and slash commands.
@@ -29,8 +29,9 @@ protected (SL never loosened) but receive no strategy rules; a `⚠️ MODE MISM
 ## EMA 20/50 (v2.0.0 — see strategies/ema2050/journeys.py Rules / GUARDIANS; researched Jul–Oct 2026 + Jun–Dec 2025 out of sample)
 cross = sign change of EMA20 − EMA50 on a closed bar · **confirmed** when the order has held ≥ 3 bars AND |gap| ≥ 1.5 pts, within 18 bars
 (first bar that satisfies both); a flip before that = **multi cross**, no trade · **entry = pullback**: price touches EMA20 within 1.5
-(touches between cross and confirm → enter at the confirm bar; else the first touch after confirm, up to confirm+12; fallback at confirm+12
-only if |close − EMA20| ≤ 5 and the order holds; never chase beyond 5) · no entries server 21:00–23:59 nor outside 05:30–23:00 IST ·
+(v2.3.1, = research/ema2050_scan.py: a touch on any bar after the cross up to the confirm bar → enter at the confirm bar close; else the
+first touch in (confirm, confirm+12]; else a fallback at confirm+12 only if |close − EMA20| ≤ 5 and the order holds — the 5-point cap
+applies to the fallback only) · the only time filter: no entries server 21:00–23:59 (no IST window) ·
 news block 60/30 (NFP auto + `news_blackout.txt`) · one trade per cross · pre-cross shoot (40 bars) reported, not filtered.
 Not added (tested, failed 2025): trend/hold/slope/EMA200/re-entry/extension filters.
 
