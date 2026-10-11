@@ -139,6 +139,8 @@ def agents_card(agents, cfg, started_at, monitor=None, claude=None, journal=None
     """One operational block per running agent, using cached data only."""
     from .common.timeutil import ist_str, server_str
     fields = []
+    midnight = datetime.now(IST).replace(hour=0, minute=0, second=0, microsecond=0)
+    records = journal.read(int(midnight.timestamp())) if journal is not None else []
     for sym, ag in agents.items():
         snap = _snap(ag)
         h = ag.health
@@ -158,14 +160,35 @@ def agents_card(agents, cfg, started_at, monitor=None, claude=None, journal=None
         off = float(getattr(ag, "off", cfg.server_utc_offset))
         bar = f"{server_str(t)} server / {ist_str(t, off)} IST" if t else "—"
         day = snap.get("today") or {}
+        bars_today = 0
+        crosses_today = 0
+        df = getattr(ag, "last_df", None)
+        if df is not None and not df.empty:
+            start_srv = int(midnight.timestamp() + off * 3600)
+            recent = df[df["time"] >= start_srv]
+            bars_today = len(recent)
+            if bars_today >= 2:
+                fast, slow = ag.S.ema_cols
+                delta = recent[fast].to_numpy() - recent[slow].to_numpy()
+                crosses_today = sum(delta[i-1] * delta[i] < 0 for i in range(1, len(delta)))
+        own = [r for r in records if r.get("symbol") == sym]
+        trade_ids = {str(r.get("ticket")) for r in own if r.get("ticket") is not None
+                     and r.get("event") in ("position_seen", "exit", "closed")}
+        pnl_by_ticket = {}
+        for rec in own:
+            if rec.get("event") == "exit" and rec.get("points") is not None:
+                pnl_by_ticket[str(rec.get("ticket"))] = float(rec["points"])
+            if rec.get("event") == "closed" and rec.get("final_points") is not None:
+                pnl_by_ticket[str(rec.get("ticket"))] = float(rec["final_points"])
+        pnl = sum(pnl_by_ticket.values())
         ai = claude.attachment(ag).get("state", "OFF") if claude else "OFF"
         err = str(h.get("status", ""))
         if "error" not in err.lower(): err = "—"
         lines = [
             f"Phase **{phase}**",
             f"Last bar {bar}",
-            f"Bars today **{day.get('bars','—')}** · crosses **{day.get('crosses','—')}**",
-            f"Trades **{day.get('closed','—')}** · pnl pts **{day.get('pnl_pts','—')}**",
+            f"Bars today **{bars_today}** · crosses **{crosses_today}**",
+            f"Trades **{len(trade_ids)}** · pnl pts **{pnl:+.1f}**",
             f"Guardian **{'ON' if ag.g else 'OFF'}** · Claude **{ai}**",
             f"Thread **{'alive' if ag.is_alive() else 'DEAD'}** · uptime **{int((_time.time()-started_at)//60)}m**",
             f"Last error {err[:150]}",
