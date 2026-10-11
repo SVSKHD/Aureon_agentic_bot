@@ -2,6 +2,16 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.2.0 — 2026-10-11 (operational diagnostics and control; draft)
+- /agents: per-symbol phase, M5 bar server/IST, day counters, guardian, Claude, thread status and uptime; no MT5 reads in slash commands.
+- /commands grouped live directory; command descriptions clarify automatic work versus operator actions.
+- Admin /restart [reason] and /mode (ema2050|ema5080) [symbols] [force], safe .env rewrite, agent stop/join and re-exec; requires AUREON_ADMIN_ROLE_ID.
+- Crash cards and journal agent_crash, bounded supervisor restart with three-strike pause in 10 minutes; process exit diagnostics.
+- Claude usage JSONL accounting with token and cost metadata, status periods, and graded report endpoint; scheduled weekly/monthly report history.
+- Voice scope documented in docs/VOICE_SCOPE.md; NOT IMPLEMENTED.
+- This draft requires Windows/MT5 staging, unit tests, Discord command sync, and restart testing before merging.
+- Strategy rules changed: **NO**. ema5080 strategy files: **UNTOUCHED**.
+
 ## v2.1.0 — 2026-10-11  (run.py --claude shadow replay)
 - `run.py --claude entry|entry+pullback [--claude-max N=60] [--claude-sleep S=2] [--claude-model id] [--claude-refresh]` for both modes.
   Without `--claude` nothing changes. For every ENTER bar the replay produced (ema2050 ENTER; ema5080 P / CROSS / RE) — and, with
