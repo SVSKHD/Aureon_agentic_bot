@@ -96,3 +96,23 @@ def test_report_graded_math():
     assert x["take_expectancy"] == 8
     assert x["detector_expectancy"] == pytest.approx(7 / 3, rel=0.01)
     assert x["agreement_trader_pct"] == pytest.approx(66.7)
+
+
+def test_commands_inventory_covers_every_registered_command():
+    from aureon_mt5.bot import command_directory
+    commands = [
+        SimpleNamespace(name="status", description="Read status"),
+        SimpleNamespace(name="take", description="Accept pending ask"),
+        SimpleNamespace(name="codex-status", description="Codex CLI health"),
+        SimpleNamespace(name="restart", description="Admin restart"),
+    ]
+    tree = SimpleNamespace(get_commands=lambda: commands)
+    groups = {
+        "Monitoring": {"status": "Automatic read-only"},
+        "Trading": {"take": "Operator chooses"},
+        "Control": {"restart": "Admin only"},
+    }
+    rendered = command_directory(tree, groups)
+    names = {line.split(" — ", 1)[0].lstrip("/") for lines in rendered.values() for line in lines}
+    assert names == {command.name for command in tree.get_commands()}
+    assert any("Codex CLI health" in line for line in rendered["Other installed"])
