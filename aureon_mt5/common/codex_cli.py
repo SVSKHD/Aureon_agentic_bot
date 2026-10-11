@@ -54,7 +54,7 @@ def call(prompt, *, event="ALERT", binary="codex", workdir=None, timeout=90, mod
             schema = Path(d) / "verdict.schema.json"
             output = Path(d) / "last-message.json"
             schema.write_text(json.dumps(VERDICT_SCHEMA), encoding="utf-8")
-            cmd = [executable(binary), "exec", "--sandbox", "read-only",
+            cmd = [executable(binary), "exec", "--sandbox", "read-only", "--skip-git-repo-check",
                    "--output-schema", str(schema), "--output-last-message", str(output)]
             if model:
                 cmd.extend(["--model", model])
