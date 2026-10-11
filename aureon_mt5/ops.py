@@ -2,6 +2,7 @@
 from __future__ import annotations
 import os
 import sys
+import time
 import threading
 from pathlib import Path
 from dotenv import set_key
@@ -14,7 +15,7 @@ def positions_block_mode_change(agents):
     """Fail closed: an unreadable/absent snapshot cannot prove flat exposure."""
     for symbol, agent in agents.items():
         snap = getattr(agent, "snapshot", None) or {}
-        if not snap.get("at"): return True
+        if not snap.get("at") or abs(time.time() - float(snap["at"])) > 30: return True
         if snap.get("positions"): return True
         if not snap.get("connected", False): return True
     return False
