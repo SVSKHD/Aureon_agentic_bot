@@ -46,12 +46,13 @@ def restart_process(agents, journal, notify, user, reason="", mode=None, symbols
     args = list(argv if argv is not None else sys.argv)
     # The process CLI overrides .env, so eliminate old --mode/--symbols flags.
     if mode:
+        strip_flags = ("--mode", "--symbols") if symbols is not None else ("--mode",)
         out = []; i = 0
         while i < len(args):
             item = args[i]
-            if item in ("--mode", "--symbols"):
+            if item in strip_flags:
                 i += 2; continue
-            if item.startswith("--mode=") or item.startswith("--symbols="):
+            if any(item.startswith(flag + "=") for flag in strip_flags):
                 i += 1; continue
             out.append(item); i += 1
         args = out + ["--mode", mode]
