@@ -229,6 +229,18 @@ def main():
 
     notify = Notifier(cfg.webhook); journal = Journal(cfg.log_dir); telemetry.setup(cfg.log_dir)
     health_notify = Notifier(cfg.health_webhook) if cfg.health_webhook else notify
+    def process_excepthook(typ, value, tb):
+        import traceback
+        trace = "\\n".join("".join(traceback.format_exception(typ, value, tb)).splitlines()[-15:])
+        try:
+            journal.log("process_exit", reason=f"{typ.__name__}: {value}", trace=trace)
+            health_notify.card("AUREON · MT5 · PROCESS EXITING",
+                               f"{typ.__name__}: {str(value)[:180]}\\n```\\n{trace[-1500:]}\\n```")
+        except Exception:
+            pass
+        sys.__excepthook__(typ, value, tb)
+    sys.excepthook = process_excepthook
+
     if not cfg.dry:
         if not broker.connect():
             print("MT5 not available — is the terminal open and logged in? (use --dry for a pipe test)"); sys.exit(1)
