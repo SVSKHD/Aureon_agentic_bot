@@ -148,7 +148,9 @@ def test_pullback_variant_asks_once_per_pullback_and_applies_close_only_to_filte
     assert [r["points"] for r in sr.res.rows] == [j.result for j in res["journeys"]]          # the replayed trades are untouched
     first = sr.res.rows[0]
     assert first["filtered_points"] is not None and first["filtered_points"] != first["points"]  # CLOSE in profit applied to the filtered column only
-    assert sr.res.pullbacks and sr.res.pullbacks[0]["claude"] == "CLOSE" and sr.res.pullbacks[0]["points_at"] > 0
+    pbs = [p for p in sr.res.pullbacks if p["entry_t"] == first["bar_t"]]
+    assert pbs[0]["claude"] == "CLOSE" and pbs[0]["points_at"] == 0.0                        # first pullback at +0: CLOSE refused (not in profit)
+    assert any(p["claude"] == "CLOSE" and p["points_at"] > 0 for p in pbs) and first["filtered_points"] == 10.0   # applied at +10
     sc = sr.score()
     assert sc["metrics"]["detector"].total == round(sum(j.result for j in res["journeys"]), 2)
     others = sum((r["points"] if r["filtered_points"] is None else r["filtered_points"]) for r in sr.res.rows[1:])
