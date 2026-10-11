@@ -111,6 +111,19 @@ class Notifier:
         self.ask_queue: "_q.Queue[dict]" = _q.Queue()   # consumed by the bot (TAKE / SKIP buttons)
         self.bot_ready = False                          # set by bot.py when it can post interactive asks
         self.claude_edit_hook = None                    # v1.10.0: set by bot.py — adds the Claude field to a posted ask card
+        self.card_edit_hook = None                      # v2.0.2: set by bot.py — upserts named fields on a posted ask card (alerts)
+
+    def edit_card(self, key: str, updates: dict) -> bool:
+        """Replace / add fields by name on the card posted under `key` (bot only). False when there is no such card
+        (webhook mode, expired) — the caller then posts a follow-up card instead. Never raises."""
+        hook = self.card_edit_hook
+        if hook is None:
+            return False
+        try:
+            return bool(hook(key, dict(updates)))
+        except Exception as e:
+            print("  (card edit failed:", e, ")")
+            return False
 
     # ------------------------------------------------------------------ embed
     def make_embed(self, title: str, description: str = "", *, fields: list[dict] | None = None, color: int | None = None,

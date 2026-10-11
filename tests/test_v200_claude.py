@@ -129,14 +129,17 @@ def test_alert_add_on_line_in_review_mode_edits_card(rig):
     r = rig(mode="review", reply=ok2("TAKE", side="BUY", reason="pullback at EMA 20", evidence=["confirm_state", "dist_to_fast_ema_pts"]))
     assert r.ag.claude is None and r.ag.claude_any is r.adv                   # review: no trade hooks, but the alert line
     edits = []
-    r.n.claude_edit_hook = lambda key, fld: edits.append((key, fld)) or True
+    r.n.card_edit_hook = lambda key, upd: edits.append((key, upd)) or True
     _fire_alert(r, _bull(n=12, touch_at=(11,)))
     job = r.adv.q.get_nowait()
     assert job["type"] == "alert" and job["event"] == "ALERT" and job["card_key"] == "alert:XAUUSD:A1" and job["snapshot"]["alert"]["id"] == "A1"
-    assert job["snapshot"]["bot_suggestion"]["side"] == "LONG"
+    assert job["snapshot"]["agent_verdict"]["side"] == "LONG" and job["snapshot"]["event"] == "alert" and job["agent_side"] == "LONG"
     r.adv.process(job)
     assert r.cli.calls[0]["model"] == r.cfg.claude_entry_model and r.cli.calls[0]["event"] == "ALERT"
-    assert edits and edits[0][0] == "alert:XAUUSD:A1" and "TAKE BUY" in edits[0][1]["value"] and "evidence: confirm_state" in edits[0][1]["value"]
+    assert edits and edits[0][0] == "alert:XAUUSD:A1"
+    blk = edits[0][1]["CLAUDE VERDICT"]
+    assert "CLAUDE: LONG · TAKE" in blk and "evidence: confirm_state" in blk and "AGREES with agent ✅" in blk
+    assert r.store.get("A1")["claude_side"] == "LONG" and r.store.get("A1")["claude_agreed"] is True
     v = verdicts(r.j)[-1]
     assert v["claude_event"] == "ALERT" and v["alert_id"] == "A1" and v["evidence"] == ["confirm_state", "dist_to_fast_ema_pts"]
 
@@ -144,9 +147,8 @@ def test_alert_add_on_line_in_review_mode_edits_card(rig):
 def test_alert_add_on_skips_silently_when_budget_used(rig):
     r = rig(mode="advisory", reply=ok2("TAKE"), max_calls=0)
     _fire_alert(r, _bull(n=12, touch_at=(11,)))
-    job = r.adv.q.get_nowait(); r.adv.process(job)
-    assert r.cli.calls == [] and not any("CLAUDE · ALERT" in t for t in r.n.titles)
-    assert verdicts(r.j)[-1]["error"] == "budget used"
+    assert any("ALERT REACHED" in t for t in r.n.titles) and "— budget used" in " ".join(r.n.bodies)
+    assert r.adv.q.empty() and r.cli.calls == [] and not any("ALERT VERDICT" in t for t in r.n.titles)      # no job, no call, no card
 
 
 def test_alert_add_on_off_mode_makes_no_call(tmp_path, monkeypatch):

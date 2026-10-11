@@ -506,10 +506,10 @@ def card(res: CompareResult, *, title: str = "AUREON · MT5 · COMPARE", mode_di
     fields.append({"name": "Pullbacks (Claude vs guardian)", "value": pbt, "inline": False})
     fields.append({"name": "Excluded", "value": f"OPEN {det.open} · UNGRADED {det.ungraded} · no verdict {len(res.groups['no_verdict'])}", "inline": False})
     al = res.alerts or {}
-    if al.get("fired") or al.get("taken"):                               # v2.0.0 alerts section
-        agree = f"{al['agreed']}/{al['taken']}" if al["taken"] else "—"
-        fields.append({"name": "Alerts", "value": (f"fired {al['fired']} · taken {al['taken']} (skipped {al['skipped']}) · agreed with the bot {agree}\n"
-                                                   f"taken & closed {al['graded']}: win {al['wins']} / loss {al['losses']} · {al['points']:+.1f} pts"), "inline": False})
+    if al.get("fired") or al.get("taken"):                               # v2.0.2 ALERTS table: fired · taken · agent✓ · claude✓ · pts taken
+        from . import alerts as _alerts
+        fields.append({"name": "ALERTS", "value": "```\n" + _alerts.stats_table(al) + "\n```" +
+                       f"skipped {al['skipped']} · taken & closed {al['graded']}: win {al['wins']} / loss {al['losses']}", "inline": False})
     tl = trend_line(res.history, res)
     if tl:
         fields.append({"name": "Expectancy · last 4 weeks", "value": tl[:1024], "inline": False})
