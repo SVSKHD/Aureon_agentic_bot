@@ -207,3 +207,7 @@ snapshot fields. The prompt is mode-aware (first line names the fast/slow EMA; `
 placeholder until `research/claude_rules_v2.md` is supplied). Saturday, after the COMPARE card: **CLAUDE RULE PROPOSALS** — wrong calls and their
 snapshot fields → up to 3 proposed rule lines with the supporting count (`logs/claude_rule_proposals.json`). `/claude-rules` lists them;
 `/claude-rules-approve <n>` appends the line, dated, to `claude_rules.md`. Nothing changes without approval.
+
+
+## v2.2.0 operations (staging)
+See `STATE.md`. Voice commands are **NOT IMPLEMENTED**; planned intents and safety controls: `docs/VOICE_SCOPE.md`. Existing trading strategy rules are unchanged. Do not operate deployment from unreviewed branches.
