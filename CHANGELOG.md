@@ -2,6 +2,21 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.2.2 — 2026-10-11  (PATCH: server-authoritative auto-update)
+- `common/updater.update_to_origin`: when origin/master moved, the checkout ends exactly at origin/master or is left untouched.
+  Modified tracked files → `git diff HEAD` saved to `logs/local_changes_<hash>_<ts>.patch` (no patch on disk → nothing discarded), then
+  `git reset --hard origin/master`; a clean tree uses `git pull --ff-only`, a non-ff pull falls back to the reset.
+- `main.check_for_updates`: `UPDATE · LOCAL EDITS DISCARDED · <files> · patch saved <path>` (once, the tree is clean afterwards), then
+  RESTARTING → `execv` only after `HEAD == origin/master`. Any git failure (no network, fetch/reset error) → `UPDATE FAILED` at most once
+  per hour, the current build keeps running. Replaces the v2.2.1 "UPDATE SKIPPED" behaviour.
+- `/restart` and `/mode` run the same update before stopping agents; a failed update aborts the restart (`RESTART ABORTED`, agents keep
+  running, journal `manual_restart_aborted`).
+- `news_blackout.txt` is no longer tracked (added to `.gitignore`; template `news_blackout.example.txt`). The updater restores `.env` and
+  `news_blackout.txt` byte-for-byte after an update; at start-up a missing `news_blackout.txt` is copied from the example (never overwritten).
+- `/git-history`: status adds `· N local edits (discarded on next update)` next to `behind by N`.
+- 12 new tests on real temporary git repos (245 in this repository).
+- Strategy rules changed: NO.
+
 ## v2.2.1 — 2026-10-11  (PATCH: fixes only)
 - `CliResult` gains `usage: dict | None` and `total_cost_usd: float | None`. `claude_cli.parse_output` already passed them, so every Claude
   verdict call raised `TypeError` (44 tests red). `claude_usage.append` reads them with `getattr` defaults.

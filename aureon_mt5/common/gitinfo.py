@@ -91,6 +91,10 @@ def history(n: int = 10, cwd: str | None = None, run=subprocess.run, fetch_timeo
             status = "origin/master unknown"
     else:
         status = f"fetch failed — showing local ({ferr[:60]})" if ferr else "fetch failed — showing local"
+    ok_s, dirty = _git(["status", "--porcelain", "--untracked-files=no"], 10, cwd, run)
+    n_dirty = len([l for l in dirty.splitlines() if l.strip()]) if ok_s else 0
+    if n_dirty:          # v2.2.2: the next auto-update saves these as a patch and resets to origin/master
+        status += f" · {n_dirty} local edit{'s' if n_dirty != 1 else ''} (discarded on next update)"
     ok_l, log = _git(["log", "master", "--merges", "--date=iso-local", f"-n{n}", f"--format={LOG_FORMAT}"], 10, cwd, run)
     merges = [m for m in (parse_log_line(l) for l in (log.splitlines() if ok_l else [])) if m]
     ok_t, tags = _git(["tag", "--sort=-creatordate", "--format=%(refname:short)|%(creatordate:iso)"], 10, cwd, run)

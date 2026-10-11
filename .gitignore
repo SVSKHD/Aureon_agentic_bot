@@ -5,6 +5,8 @@ out/
 guardian_state.json
 # secrets
 .env
+# server-local calendar (template: news_blackout.example.txt) — auto-update must never overwrite it
+news_blackout.txt
 # python
 __pycache__/
 *.pyc
