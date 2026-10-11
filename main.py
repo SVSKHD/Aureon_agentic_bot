@@ -79,7 +79,7 @@ def greet(notify, cfg, S, why, news_line):
     gv = git_version() if "git_version" in globals() else ""
     try:
         from aureon_mt5.common import gitinfo
-        gv = (gv or subprocess.run(["git", "describe", "--tags", "--always"], capture_output=True, text=True, timeout=10).stdout.strip())
+        gv = (gv or subprocess.run(["git", "describe", "--tags", "--always"], capture_output=True, text=True, timeout=10, cwd=gitinfo.ROOT).stdout.strip())
         md = gitinfo.head_merge_date()
         if md:
             gv = f"{gv} · merged {md}" if gv else f"merged {md}"      # v2.0.2: the merge date of HEAD on the banner
