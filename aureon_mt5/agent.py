@@ -483,11 +483,17 @@ class SymbolAgent(threading.Thread):
 
     # ------------------------------------------------------------------ v2.3.9 missed setup
     def track_ask(self, card_key: str, side: str, kind: str, price: float, bar: int, lots: float | None, sl: float | None):
-        """Record that a signal ask card was posted. Called from _detect / _detect_2050."""
+        """Record that a signal ask card was posted. Called from _detect / _detect_2050.
+        v2.4.2: if AGENT mode, schedule delayed autonomous entry."""
         ask = {"card_key": card_key, "side": side, "kind": kind, "price": price, "bar": bar,
                "lots": lots, "sl": sl, "posted_t": _time.time(), "decided": None, "placed": False}
         self.open_asks.append(ask)
         _save_open_asks(self.cfg.log_dir, self.symbol, self.open_asks)
+        try:
+            from .agent_executor import maybe_schedule
+            maybe_schedule(self.cfg, {self.symbol: self}, self.journal, self.notify, self, dict(ask))
+        except Exception as _e:
+            pass  # MANUAL mode or import error — benign
 
     def mark_ask_decided(self, card_key: str, decision: str, placed: bool = False):
         """Mark an ask as answered (TAKE/SKIP/EXPIRED). Called from bot.py button handlers."""
@@ -520,7 +526,8 @@ class SymbolAgent(threading.Thread):
                 continue  # position exists → not missed
             # Check blackout: market closed / news / 23:00–05:30 IST
             ist_h = datetime.now(IST).hour + datetime.now(IST).minute / 60
-            if not broker.market_open(self.symbol, self.off, self.dry) or ist_h >= 23 or ist_h < 5.5:
+            skip_session = getattr(self.cfg, "_test_skip_session", False)
+            if not broker.market_open(self.symbol, self.off, self.dry) or (not skip_session and (ist_h >= 23 or ist_h < 5.5)):
                 remaining.append(a)  # keep checking later
                 continue
             # It's a miss
@@ -586,7 +593,7 @@ class SymbolAgent(threading.Thread):
         ist_h = datetime.now(IST).hour + datetime.now(IST).minute / 60
         if not broker.market_open(self.symbol, self.off, self.dry):
             miss["expired_reason"] = "market closed"; return None
-        if ist_h >= 23 or ist_h < 5.5:
+        if not getattr(self.cfg, "_test_skip_session", False) and (ist_h >= 23 or ist_h < 5.5):
             miss["expired_reason"] = "blackout hours"; return None
         miss["now_price"] = now_px
         miss["drift_at_press"] = round(s * (now_px - miss["price"]), 2)

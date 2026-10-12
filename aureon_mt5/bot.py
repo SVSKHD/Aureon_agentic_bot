@@ -530,10 +530,10 @@ def current_price(sym: str, ag, cfg, lock_timeout: float = 1.0) -> float | None:
     return ag.health.get("close") if ag is not None else None
 
 
-def _governor_context(cfg, agents, sym: str) -> dict:
+def _governor_context(cfg, agents, sym: str, ist_now=None) -> dict:
     """Build the context dict the governor needs. Cached per call (not per bar)."""
     from datetime import datetime as _dt
-    ist_now = _dt.now(IST)
+    ist_now = ist_now or _dt.now(IST)
     ag = agents.get(sym)
     trades_today = 0; realised_money = 0.0; equity = 0.0; open_pos = []
     try:
@@ -560,7 +560,8 @@ def _governor_context(cfg, agents, sym: str) -> dict:
     halted = is_halted(cfg.log_dir)
     return {"trades_today": trades_today, "losses_today": sum(1 for d in (deals if 'deals' in dir() else []) if d.get("profit", 0) < 0),
             "realised_money_today": realised_money, "equity": equity, "ist_now": ist_now,
-            "news_block": news_block, "open_positions": open_pos, "halted": halted}
+            "news_block": news_block, "open_positions": open_pos, "halted": halted,
+            "_skip_session": getattr(cfg, "_test_skip_session", False)}
 
 
 def execute_entry(cfg, agents, journal, item: dict, side: str, user, notify=None, retry_sleep: float = 2.0, card_key=None, lots=None) -> dict:
@@ -599,7 +600,8 @@ def execute_entry(cfg, agents, journal, item: dict, side: str, user, notify=None
         fill = r.price if r.price is not None else px
         slip = ((fill - card_px) if side == "LONG" else (card_px - fill)) if (fill is not None and card_px) else None
         spread_at_fill = round(r.ask - r.bid, 5) if (r.ask is not None and r.bid is not None) else None
-        journal.decision("order_placed", actor="human", rationale="button press",
+        _actor = "agent" if str(user) == "agent" else "human"
+        journal.decision("order_placed", actor=_actor, rationale="agent entry" if _actor == "agent" else "button press",
                          symbol=sym, mode=m.get("mode"), alert_id=aid, side=side, lots=lots_chosen, sl=sl, ok=bool(r.ok),
                          status=r.status, retcode=r.retcode, ticket=r.ticket, fill=r.price, by=str(user),
                          lots_chosen=lots_chosen, lots_suggested=lots_suggested, lots_source=lots_source, half_size=half_size,

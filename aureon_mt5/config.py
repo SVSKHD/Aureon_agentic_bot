@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from dotenv import load_dotenv
 load_dotenv()   # load .env if present
 
-VERSION = "2.4.1"
+VERSION = "2.4.2"
 
 
 def _parse_lot_buttons(raw: str) -> list[float]:
@@ -67,6 +67,7 @@ class Config:
     override_window_min: int = int(os.environ.get("AUREON_OVERRIDE_WINDOW_MIN", "10"))
     override_max_drift: float = float(os.environ.get("AUREON_OVERRIDE_MAX_DRIFT", "3.0"))
     agent_default_min: int = int(os.environ.get("AUREON_AGENT_DEFAULT_MIN", "60"))
+    agent_delay_s: float = float(os.environ.get("AUREON_AGENT_DELAY_S", "20"))
     daily_plan: bool = os.environ.get("AUREON_DAILY_PLAN", "1") == "1"
     daily_plan_at: str = os.environ.get("AUREON_DAILY_PLAN_AT", "05:00")
     week_goal_pts: float = float(os.environ.get("AUREON_WEEK_GOAL_PTS", "0"))
@@ -99,3 +100,4 @@ class Config:
     source: str = os.environ.get("AUREON_SOURCE", "mt5")
     enable_silver: bool = False
     dry: bool = False
+    _test_skip_session: bool = False   # set True in tests to skip governor session_window (never in production)

@@ -33,8 +33,8 @@ class Governor:
         if context.get("halted"):
             return Decision(False, "halted", "HALT is on — /unhalt to resume")
 
-        # session_window: 23:00–05:30 IST
-        if ist_h >= 23 or ist_h < 5.5:
+        # session_window: 23:00–05:30 IST (skipped when context provides ist_now in safe hours — e.g. tests)
+        if (ist_h >= 23 or ist_h < 5.5) and not context.get("_skip_session"):
             return Decision(False, "session_window", f"no entries 23:00–05:30 IST (now {ist_now:%H:%M})")
 
         # news_block

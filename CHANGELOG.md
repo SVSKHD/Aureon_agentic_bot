@@ -2,6 +2,20 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.4.2 — 2026-10-12  (PATCH: AGENT entry executor)
+- **Autonomous entry in AGENT mode**: when a symbol is in AGENT mode and a confirmed entry signal posts its ask
+  (ENTER / RE-ENTRY / P / CROSS), after `AUREON_AGENT_DELAY_S` (default 20 s, gives the human first refusal) and
+  if the ask is still unanswered: `execute_entry(actor="agent")` — the SAME path as buttons: governor, HALT, demo/live gate,
+  order → confirm → guardian state → journal → Discord. Card Decision edited `🤖 AGENT TOOK LONG 0.85 lots`.
+- **Sizing**: the card's risk-based suggestion (equity × risk_pct / stop, streak/chop half applied), capped by max_lots.
+- **Human wins**: a SKIP before the delay → agent does nothing; a button press → human wins (double-tap guard + `decided` flag).
+- **Journal**: `agent_entry` event with `actor="agent"`, `rationale="rule: <signal kind> confirmed"`, `p_win` from advisor if present.
+  `order_placed` uses `actor="agent"` when placed by the agent.
+- **Missed-setup detector**: skips asks the agent took (`placed=True` in mark_ask_decided).
+- `AUREON_AGENT_DELAY_S=20`. `agent_executor.py`: `schedule_agent_entry` / `maybe_schedule`.
+  `track_ask` calls `maybe_schedule` if in AGENT mode.
+- Strategy rules changed: NO.
+
 ## v2.4.1 — 2026-10-12  (PATCH: control-mode state machine)
 - **`aureon_mt5/control.py`** (pure): transitions MANUAL→AGENT (`/agent-on [symbol] [minutes]`, default `AUREON_AGENT_DEFAULT_MIN=60`),
   AGENT→MANUAL (`/manual`, timeout, HALT, governor daily-loss-cap hit, MT5 disconnect > 5 min). Every transition: guardian_state saved,
