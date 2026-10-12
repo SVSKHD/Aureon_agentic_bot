@@ -1135,6 +1135,14 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
                 return Reply(content=f"watchdog: error reading state — {e}")
         await run(inter, "watchdog", work)
 
+    @tree.command(name="plan", description="Show today's daily plan (news, sessions, yesterday, chop, governor)")
+    async def plan_cmd(inter: discord.Interaction):
+        def work():
+            from .daily_plan import plan_card
+            card = plan_card(cfg, agents, journal)
+            return Reply(card=card)
+        await run(inter, "plan", work)
+
     @tree.command(name="halt", description="Kill switch: close all positions and block all entries")
     @app_commands.describe(reason="Reason for the halt")
     async def halt_cmd(inter: discord.Interaction, reason: str = ""):

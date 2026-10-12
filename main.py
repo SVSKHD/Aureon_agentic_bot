@@ -394,6 +394,8 @@ def main():
             claude_report_tick(cfg, agents, journal, notify)
             supervise(agents, make_agent, notify, cfg.mode)
             wd.tick()
+            from aureon_mt5.daily_plan import tick as plan_tick
+            plan_tick(cfg, agents, journal, notify)
         except KeyboardInterrupt:
             notify.card("AUREON · MT5 · PROCESS EXITING", "KeyboardInterrupt")
             broker.close_connection(); print("bye"); return

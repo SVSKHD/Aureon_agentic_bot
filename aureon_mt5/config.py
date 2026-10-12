@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from dotenv import load_dotenv
 load_dotenv()   # load .env if present
 
-VERSION = "2.3.14"
+VERSION = "2.3.15"
 
 
 def _parse_lot_buttons(raw: str) -> list[float]:
@@ -66,6 +66,9 @@ class Config:
     missed_grace_min: int = int(os.environ.get("AUREON_MISSED_GRACE_MIN", "5"))
     override_window_min: int = int(os.environ.get("AUREON_OVERRIDE_WINDOW_MIN", "10"))
     override_max_drift: float = float(os.environ.get("AUREON_OVERRIDE_MAX_DRIFT", "3.0"))
+    daily_plan: bool = os.environ.get("AUREON_DAILY_PLAN", "1") == "1"
+    daily_plan_at: str = os.environ.get("AUREON_DAILY_PLAN_AT", "05:00")
+    week_goal_pts: float = float(os.environ.get("AUREON_WEEK_GOAL_PTS", "0"))
     # your manual SL rules: if you placed an SL wider than the guardian's P-phase stop, the guardian does not close at −pre_stop
     respect_manual_sl: bool = os.environ.get("AUREON_RESPECT_MANUAL_SL", "1") == "1"
     # Codex read-only advisor (Discord on-demand; never blocks signals or guardian)

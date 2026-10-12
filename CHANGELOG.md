@@ -2,6 +2,15 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.3.15 — 2026-10-12  (PATCH: daily plan card 05:00 IST)
+- **`aureon_mt5/daily_plan.py`**: at 05:00 IST every weekday (Mon–Fri), one card `🗓 DAILY PLAN · Tue 13 Oct` with:
+  News (today's high-impact events + entry blocks), Sessions (IST windows), Yesterday (net pts, trades, win/loss),
+  Week to date vs goal (`AUREON_WEEK_GOAL_PTS`, default 0 = hidden), Chop flag, Governor state + HALT.
+- Dedupe key `plan:<date>` (restart-safe). `/plan` posts on demand. Journal `daily_plan`.
+- Runs from the supervisor thread. Skips weekends.
+- `AUREON_DAILY_PLAN=1` (default on), `AUREON_DAILY_PLAN_AT=05:00`, `AUREON_WEEK_GOAL_PTS=0`.
+- Strategy rules changed: NO.
+
 ## v2.3.14 — 2026-10-12  (PATCH: spread + slippage in replay and reports)
 - **Live signals**: every `signal` journal event records `spread_pts` from the live tick at the signal bar.
 - **Live orders**: `order_placed` journal event gains `slippage_pts` (fill − card price in trade direction; positive = worse),
