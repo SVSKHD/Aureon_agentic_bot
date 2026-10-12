@@ -376,28 +376,32 @@ class SymbolAgent(threading.Thread):
         return w
 
     def _daily_limit(self) -> str | None:
-        """AUREON-007 (advisory): today's closed losses from MT5 history across symbols."""
+        """v2.3.12: governor state (single source of truth). Replaces the old advisory-only text."""
         today = datetime.now(IST).date()
         cache = getattr(self, "_limit_cache", None)
         if cache is not None and cache[0] == (today, self.last_bar):
             return cache[1]
         msg = None
         try:
+            from .governor import Governor
+            gov = Governor(self.cfg)
             start = datetime.now(IST).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
             deals = broker.closed_deals(None, start, datetime.now(timezone.utc) + timedelta(minutes=1))
-            net = sum(d["profit"] for d in deals); losses = sum(1 for d in deals if d["profit"] < 0)
+            trades = len(deals); losses = sum(1 for d in deals if d["profit"] < 0)
+            net = sum(d["profit"] for d in deals)
             acc = broker.account()
-            loss_lim = (acc["balance"] * self.cfg.daily_loss_limit_pct / 100) if acc else None
-            if losses >= self.cfg.daily_max_losses:
-                msg = f"⛔ {losses} losing trades today (limit {self.cfg.daily_max_losses}) — I'd sit out"
-            elif loss_lim and net <= -loss_lim:
-                msg = f"⛔ day P&L {net:,.0f} (limit −{loss_lim:,.0f}, {self.cfg.daily_loss_limit_pct:g}%) — I'd sit out"
+            equity = acc["balance"] if acc else 0.0
+            ctx = {"trades_today": trades, "losses_today": losses, "realised_money_today": net, "equity": equity,
+                   "ist_now": datetime.now(IST), "news_block": False, "open_positions": []}
+            dec = gov.check(self.symbol, "LONG", 0.1, ctx)
+            if not dec.allowed:
+                msg = f"⛔ governor: {dec.rule} · {dec.detail}"
+                self.notify.send(self.key("LIMIT", str(today)), ctitle(self.symbol, "GOVERNOR LIMIT"),
+                                 [msg, "entries blocked by the governor"],
+                                 color=EVENT_COLOURS.get("error", 0xED4245), footer=cfooter(self.S.display_name, "governor"))
         except Exception:
             msg = None
         self._limit_cache = ((today, self.last_bar), msg)
-        if msg:
-            self.notify.send(self.key("LIMIT", str(today)), ctitle(self.symbol, "DAILY LIMIT REACHED"), [msg, "signals continue — nothing is blocked"],
-                             color=EVENT_COLOURS["error"], footer=cfooter(self.S.display_name, "risk"))
         return msg
 
     def _refresh_evidence(self):

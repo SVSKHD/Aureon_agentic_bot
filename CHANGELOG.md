@@ -2,6 +2,20 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.3.12 — 2026-10-12  (PATCH: enforced risk governor)
+- **`aureon_mt5/governor.py`** (pure): `Governor(cfg).check(symbol, side, lots, context) -> Decision(allowed, rule, detail)`.
+  Rules (each env-configurable, each with a stable name):
+  `session_window` (23:00–05:30 IST), `news_block`, `max_trades_day` (AUREON_MAX_TRADES_DAY=4),
+  `daily_loss_cap` (AUREON_DAILY_LOSS_CAP_PCT=2.0% of equity), `loss_multiple` (2x per-trade risk, AUREON_LOSS_MULTIPLE=2.0),
+  `one_position_per_direction`. Counts from broker.closed_deals for the current server day.
+- **Enforced in `execute_entry`**: every button, `/take`, `/override` passes through `Governor.check()` BEFORE `broker.place_market`.
+  Blocked → no order, no attach_alert; returns `⛔ BLOCKED · <rule> · <detail>`, journals `governor_block`.
+  No override flag — the governor is not bypassable.
+- **`/status`**: shows `governor: 1/4 trades · loss 0.6%/2.0% · OK`.
+- **`/governor`**: lists every rule with its current value and limit.
+- **`_daily_limit`** in agent.py replaced with the governor's state (single source of truth).
+- Strategy rules changed: NO (entry gating only).
+
 ## v2.3.11 — 2026-10-12  (PATCH: lot buttons — finish alert cards)
 - ALREADY DONE: AskView lot buttons (v2.3.7), lot_button_spec, execute_entry lots param, /take lots, ORDER PLACED Size field,
   compare sizing groups.

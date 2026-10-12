@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from dotenv import load_dotenv
 load_dotenv()   # load .env if present
 
-VERSION = "2.3.11"
+VERSION = "2.3.12"
 
 
 def _parse_lot_buttons(raw: str) -> list[float]:
@@ -38,9 +38,11 @@ class Config:
     heartbeat_stale_min: int = 15  # AUREON-004: red card if no closed bar processed for this long while the market is open
     daily_report_ist: str = "23:00"   # AUREON-003
     calendar_feed: bool = os.environ.get("AUREON_CALENDAR", "1") != "0"   # AUREON-006
-    # AUREON-007 daily limits (advisory: cards say 'sit out', nothing is blocked)
+    # AUREON-007 daily limits — enforced by the governor (v2.3.12)
     daily_loss_limit_pct: float = float(os.environ.get("AUREON_DAILY_LOSS_PCT", "2.0"))
     daily_max_losses: int = int(os.environ.get("AUREON_DAILY_MAX_LOSSES", "3"))
+    max_trades_day: int = int(os.environ.get("AUREON_MAX_TRADES_DAY", "4"))
+    loss_multiple: float = float(os.environ.get("AUREON_LOSS_MULTIPLE", "2.0"))
     # AUREON-009 spread / volatility warning
     spread_warn: dict = field(default_factory=lambda: {"XAU": 0.50, "XAG": 0.05})
     vol_spike_mult: float = 3.0

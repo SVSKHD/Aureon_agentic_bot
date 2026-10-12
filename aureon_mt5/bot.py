@@ -114,6 +114,13 @@ def status_card(sym: str, ag, cfg, journal=None, monitor=None, claude=None, code
         fields.append(_field("Execution", f"on · buttons {'/'.join(f'{v:g}' for v in cfg.lot_buttons)} · max {cfg.max_lots:g} · {demo_s}"))
     else:
         fields.append(_field("Execution", "off"))
+    try:
+        from .governor import Governor
+        _gov = Governor(cfg)
+        _gov_ctx = {"trades_today": 0, "realised_money_today": 0, "equity": 0}  # lightweight default for /status
+        fields.append(_field("Governor", _gov.status(_gov_ctx)))
+    except Exception:
+        pass
     fields += [
         _field("Claude", claude_status_word(ag, claude)),                          # v2.0.1
         _field("Codex", claude_status_word(ag, codex)),                            # v2.3.0 (shown only, never applied)
@@ -506,10 +513,41 @@ def current_price(sym: str, ag, cfg, lock_timeout: float = 1.0) -> float | None:
     return ag.health.get("close") if ag is not None else None
 
 
+def _governor_context(cfg, agents, sym: str) -> dict:
+    """Build the context dict the governor needs. Cached per call (not per bar)."""
+    from datetime import datetime as _dt
+    ist_now = _dt.now(IST)
+    ag = agents.get(sym)
+    trades_today = 0; realised_money = 0.0; equity = 0.0; open_pos = []
+    try:
+        if not getattr(cfg, "dry", False):
+            start = ist_now.replace(hour=0, minute=0, second=0, microsecond=0)
+            from datetime import timezone as _tz
+            deals = broker.closed_deals(None, start.astimezone(_tz.utc), _dt.now(_tz.utc) + timedelta(minutes=1))
+            trades_today = len(deals)
+            realised_money = sum(d["profit"] for d in deals)
+            acc = broker.account()
+            equity = acc["balance"] if acc else 0.0
+            open_pos = [{"symbol": p["symbol"], "direction": p["direction"]} for p in (broker.positions(sym) or [])]
+    except Exception:
+        pass
+    news_block = False
+    if ag is not None:
+        try:
+            import time as _t
+            tu = int(_t.time())
+            news_block = any(r - 60 * 60 <= tu < r + 30 * 60 for r in (ag.news or ()))
+        except Exception:
+            pass
+    return {"trades_today": trades_today, "losses_today": sum(1 for d in (deals if 'deals' in dir() else []) if d.get("profit", 0) < 0),
+            "realised_money_today": realised_money, "equity": equity, "ist_now": ist_now,
+            "news_block": news_block, "open_positions": open_pos}
+
+
 def execute_entry(cfg, agents, journal, item: dict, side: str, user, notify=None, retry_sleep: float = 2.0, card_key=None, lots=None) -> dict:
-    """Core execution: tick → SL from g.pre_stop → place_market when cfg.execution_enabled and (demo or allow_live) and not dry →
-    journal order_placed → ag.attach_alert → ORDER PLACED card, else arm guardian and return WHY it did not place.
+    """Core execution: governor check → tick → SL → place_market when allowed.
     Returns {"line", "text", "ok", "ticket", "placed", "lots"}."""
+    from .governor import Governor
     m = item.get("meta", {}); sym = m.get("symbol"); aid = m.get("alert_id") or card_key
     side = side.upper()
     ag = agents.get(sym); g = ag.g if ag is not None else None
@@ -527,6 +565,14 @@ def execute_entry(cfg, agents, journal, item: dict, side: str, user, notify=None
     lots_chosen = min(float(lots), cfg.max_lots) if lots is not None else min(float(lots_suggested or cfg.max_lots), cfg.max_lots)
     sugg_txt = f" (suggested {lots_suggested:g}★)" if lots_suggested is not None else ""
     half_size = bool(m.get("half_size") or m.get("chop"))
+    # v2.3.12: governor check BEFORE any order
+    gov = Governor(cfg)
+    ctx = _governor_context(cfg, agents, sym)
+    dec = gov.check(sym, side, lots_chosen, ctx)
+    if not dec.allowed:
+        journal.log("governor_block", symbol=sym, side=side, lots=lots_chosen, rule=dec.rule, detail=dec.detail, by=str(user))
+        return {"line": f"⛔ BLOCKED · {dec.rule} · {dec.detail}", "text": f"⛔ {dec.detail}",
+                "ok": False, "ticket": None, "placed": False, "lots": lots_chosen}
     if cfg.execution_enabled and (demo or cfg.allow_live) and not getattr(cfg, "dry", False):
         r = broker.place_market(sym, side, lots_chosen, sl, comment=f"aureon {aid}", retry_sleep=retry_sleep)
         journal.log("order_placed", symbol=sym, mode=m.get("mode"), alert_id=aid, side=side, lots=lots_chosen, sl=sl, ok=bool(r.ok),
@@ -1076,6 +1122,20 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             except Exception as e:
                 return Reply(content=f"watchdog: error reading state — {e}")
         await run(inter, "watchdog", work)
+
+    @tree.command(name="governor", description="Show risk governor rules and current values")
+    async def governor_cmd(inter: discord.Interaction):
+        def work():
+            from .governor import Governor
+            gov = Governor(cfg)
+            ctx = _governor_context(cfg, agents, cfg.symbols[0])
+            rules = gov.rules_table(ctx)
+            lines = []
+            for r in rules:
+                icon = "🟢" if r["ok"] else "🔴"
+                lines.append(f"{icon} **{r['rule']}** · {r['value']} / {r['limit']}")
+            return Reply(content="**Risk Governor:**\n" + "\n".join(lines))
+        await run(inter, "governor", work)
 
     @client.event
     async def on_ready():

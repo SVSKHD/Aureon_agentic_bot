@@ -1,4 +1,4 @@
-# Aureon MT5 v2.3.11
+# Aureon MT5 v2.3.12
 
 You place the trade. Aureon detects (per selected EMA mode), fires a Discord gunshot, then manages what you placed:
 protect → secure +10 → ride in +5 steps → close on the fast-EMA turn → news safeguard. Reports and slash commands.
