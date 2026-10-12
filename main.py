@@ -397,9 +397,11 @@ def main():
             from aureon_mt5.daily_plan import tick as plan_tick
             plan_tick(cfg, agents, journal, notify)
             from aureon_mt5.control import check_auto_transitions
+            from aureon_mt5.schedule import tick as schedule_tick
             for _sym in cfg.symbols:
                 try:
                     check_auto_transitions(journal, notify, _sym, agents, cfg)
+                    schedule_tick(cfg.log_dir, journal, notify, _sym, agents, cfg)
                 except Exception:
                     pass
         except KeyboardInterrupt:

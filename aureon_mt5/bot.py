@@ -1181,6 +1181,28 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             return Reply(content=f"🧑 MANUAL · {sym}")
         await run(inter, "manual", work)
 
+    @tree.command(name="agent-schedule", description="Manage scheduled AGENT windows")
+    @app_commands.describe(action="add / list / remove", symbol="Symbol", time_range="HH:MM-HH:MM (IST)", days="Mon-Fri or Mon,Wed,Fri", schedule_id="ID to remove")
+    async def agent_schedule_cmd(inter: discord.Interaction, action: str = "list", symbol: str = "", time_range: str = "", days: str = "Mon-Fri", schedule_id: int = 0):
+        def work():
+            from . import schedule as sched
+            sym = symbol.strip().upper() or cfg.symbols[0]
+            if action == "add" and time_range:
+                result = sched.add(cfg.log_dir, sym, time_range, days)
+                if isinstance(result, str):
+                    return Reply(content=f"error: {result}")
+                return Reply(content=f"schedule added: {sched.format_schedule(result)}")
+            elif action == "remove" and schedule_id:
+                if sched.remove(cfg.log_dir, schedule_id):
+                    return Reply(content=f"schedule #{schedule_id} removed")
+                return Reply(content=f"schedule #{schedule_id} not found")
+            else:
+                schedules = sched.list_schedules(cfg.log_dir, sym if symbol else None)
+                if not schedules:
+                    return Reply(content="no schedules")
+                return Reply(content="**Schedules:**\n" + "\n".join(sched.format_schedule(s) for s in schedules))
+        await run(inter, "agent-schedule", work)
+
     @tree.command(name="plan", description="Show today's daily plan (news, sessions, yesterday, chop, governor)")
     async def plan_cmd(inter: discord.Interaction):
         def work():

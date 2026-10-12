@@ -2,6 +2,17 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.4.3 — 2026-10-12  (PATCH: scheduled AGENT windows)
+- **`aureon_mt5/schedule.py`**: `/agent-schedule add <symbol> HH:MM-HH:MM [days=Mon-Fri]`, `list`, `remove <id>`.
+  Stored in `logs/agent_schedule.json`. Windows inside 23:00–05:30 IST rejected at creation. Overlaps merge
+  (the later window extends the AGENT until). Today-only windows cleaned up at end of day.
+- **Scheduler**: `tick()` from the supervisor loop. At window start → MANUAL→AGENT (reason "schedule <id>", until = window end).
+  At window end → AGENT→MANUAL. HALT suspends all windows. Restart mid-window: if now is inside a window, enter AGENT
+  with remaining time.
+- **`/manual`** during a window: ends the window for today only (the agent entry from the schedule won't re-trigger until
+  the scheduler sees the window has passed).
+- Strategy rules changed: NO.
+
 ## v2.4.2 — 2026-10-12  (PATCH: AGENT entry executor)
 - **Autonomous entry in AGENT mode**: when a symbol is in AGENT mode and a confirmed entry signal posts its ask
   (ENTER / RE-ENTRY / P / CROSS), after `AUREON_AGENT_DELAY_S` (default 20 s, gives the human first refusal) and
