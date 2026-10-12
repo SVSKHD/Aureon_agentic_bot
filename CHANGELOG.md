@@ -2,6 +2,21 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.3.10 — 2026-10-12  (PATCH: Discord watchdog on by default)
+- **Watchdog** (`aureon_mt5/watchdog.py`): `Watchdog.tick()` called every ~30 s from the main/supervisor thread. Per symbol:
+  `STALE:<SYMBOL>` (market open, no new M5 bar > `heartbeat_stale_min` min), `dead:<SYMBOL>` (agent thread not alive).
+  Global: `mt5` (broker disconnected). When MT5 is down, per-symbol STALE cards are suppressed (root cause). STALE never fires
+  while market is closed. Hysteresis: open after 2 consecutive failing checks, clear after 2 passing. ONE red card on open, no
+  repeats, ONE green RECOVERED card on clear with duration. Journal `watchdog_open`/`watchdog_clear`.
+- **Persistence** (`logs/watchdog.json`): open incidents survive restart — no re-post of the open card, RECOVERED still posted;
+  incidents already clear at startup get one RECOVERED "cleared while Aureon was down".
+- **Heartbeat**: one grey `💓 Aureon alive` card per `AUREON_HEARTBEAT_HOURS` (default 4) slot aligned to IST (00, 04, 08…).
+  Dedupe key so restarts don't double-post. Skipped on a quiet weekend (market closed, no incidents).
+- **Config**: `watchdog_ping` renamed to `supabase_ping` (env `AUREON_SUPABASE_PING`, had zero readers).
+  `AUREON_WATCHDOG=1` (default on), `AUREON_HEARTBEAT_HOURS=4`.
+- `/watchdog` command lists open incidents; `watchdog_status()` helper for /status.
+- Strategy rules changed: NO.
+
 ## v2.3.9 — 2026-10-12  (MINOR: missed setup detection + /override)
 - **Missed setup detection** (`agent.py`): `track_ask` records every signal ask card (ENTER / P / CROSS / RE). Every poll,
   `_check_misses` fires after the grace window (`AUREON_MISSED_GRACE_MIN`, default 5 min) if no position appeared in that direction.

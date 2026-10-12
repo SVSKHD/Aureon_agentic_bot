@@ -123,6 +123,17 @@ def status_card(sym: str, ag, cfg, journal=None, monitor=None, claude=None, code
                   footer=f"{S.display_name} · {datetime.now(IST):%H:%M} IST")
 
 
+def watchdog_status(wd) -> str:
+    """One-line watchdog status for /status."""
+    if wd is None:
+        return "off"
+    inc = wd.open_incidents()
+    nxt = wd.next_heartbeat_ist()
+    if inc:
+        return f"on · next heartbeat {nxt} · open incidents: {', '.join(i['key'] + ' ' + str(i['duration_min']) + 'm' for i in inc)}"
+    return f"on · next heartbeat {nxt} · open incidents: none"
+
+
 def parallel_card(agents, cfg, journal=None) -> dict:
     fields = []
     all_ok = True
@@ -1027,6 +1038,30 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             ag.consume_miss(miss["card_key"])
             return Reply(content=f"⏭ miss ignored · {miss['side']} {sym} · {miss['kind']}")
         await run(inter, "ignore-miss", work)
+
+    @tree.command(name="watchdog", description="Show open watchdog incidents and their durations")
+    async def watchdog_cmd(inter: discord.Interaction):
+        def work():
+            import json as _json
+            path = os.path.join(cfg.log_dir, "watchdog.json")
+            try:
+                with open(path, encoding="utf-8") as f:
+                    data = _json.load(f)
+                incidents = data.get("incidents", {})
+                now = _time.time()
+                open_inc = [(k, v) for k, v in incidents.items() if v.get("open")]
+                if not open_inc:
+                    return Reply(content="watchdog: no open incidents")
+                lines = []
+                for k, v in open_inc:
+                    dur = int((now - (v.get("open_t") or now)) // 60)
+                    lines.append(f"**{k}** · open {dur} min")
+                return Reply(content="**Open incidents:**\n" + "\n".join(lines))
+            except FileNotFoundError:
+                return Reply(content="watchdog: no state file yet (first tick hasn't run)")
+            except Exception as e:
+                return Reply(content=f"watchdog: error reading state — {e}")
+        await run(inter, "watchdog", work)
 
     @client.event
     async def on_ready():

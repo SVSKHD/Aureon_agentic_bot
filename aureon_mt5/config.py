@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from dotenv import load_dotenv
 load_dotenv()   # load .env if present
 
-VERSION = "2.3.9"
+VERSION = "2.3.10"
 
 
 def _parse_lot_buttons(raw: str) -> list[float]:
@@ -56,7 +56,9 @@ class Config:
     # Supabase write policy — "weekly" (default, free plan): ONE batch every Saturday (+ monthly roll-up on the first Saturday);
     # "realtime": also push signals/decisions as they happen and sync nightly. Reports are always computed locally on demand.
     supabase_mode: str = os.environ.get("AUREON_SUPABASE_MODE", "weekly")
-    watchdog_ping: bool = os.environ.get("AUREON_WATCHDOG", "0") == "1"     # minute heartbeat to Supabase — off on the free plan
+    supabase_ping: bool = os.environ.get("AUREON_SUPABASE_PING", "0") == "1"   # minute heartbeat to Supabase — off on the free plan
+    watchdog: bool = os.environ.get("AUREON_WATCHDOG", "1") == "1"
+    heartbeat_hours: float = float(os.environ.get("AUREON_HEARTBEAT_HOURS", "4"))
     streak_half_after: int = int(os.environ.get("AUREON_STREAK_HALF_AFTER", "0"))
     chop_crosses: int = int(os.environ.get("AUREON_CHOP_CROSSES", "5"))
     missed_grace_min: int = int(os.environ.get("AUREON_MISSED_GRACE_MIN", "5"))

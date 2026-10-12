@@ -369,6 +369,9 @@ def main():
     if cfg.bot_token: run_bot(cfg, agents, journal, notify, started, health_notify=health_notify, claude=claude, alerts=alerts, codex=codex)
     else: print("no DISCORD_TOKEN — slash commands off, alerts via webhook only")
 
+    from aureon_mt5.watchdog import Watchdog
+    wd = Watchdog(health_notify or notify, journal, cfg, agents)
+
     was_open = broker.market_open(cfg.symbols[0], cfg.server_utc_offset, cfg.dry); report_day = None; last_update_check = 0
     review_day = None; codex_review_day = None
     while True:
@@ -390,6 +393,7 @@ def main():
             compare_saturday_tick(cfg, agents, journal, notify, claude, codex=codex)
             claude_report_tick(cfg, agents, journal, notify)
             supervise(agents, make_agent, notify, cfg.mode)
+            wd.tick()
         except KeyboardInterrupt:
             notify.card("AUREON · MT5 · PROCESS EXITING", "KeyboardInterrupt")
             broker.close_connection(); print("bye"); return
