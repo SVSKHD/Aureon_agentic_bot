@@ -23,6 +23,10 @@ class Journal:
         with self._lock, open(self.path, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, default=str) + "\n")
 
+    def decision(self, event: str, *, actor: str = "human", rationale: str = "", p_win: float | None = None, **fields):
+        """v2.4.0: log a decision-type event with actor/rationale/p_win filled."""
+        self.log(event, actor=actor, rationale=rationale, p_win=p_win, **fields)
+
     def read(self, since: int, until: int | None = None) -> list[dict]:
         if not os.path.exists(self.path):
             return []
@@ -62,6 +66,25 @@ class Journal:
         with _state_lock:
             allst = self._load_all()
             allst[symbol] = {str(k): v for k, v in state.items()}
+            tmp = self.state_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(allst, f)
+            os.replace(tmp, self.state_path)
+
+    # ---- v2.4.0 control mode: {symbol: {mode, since, by, until}} in guardian_state.json top-level "control"
+    def load_control(self, symbol: str) -> dict:
+        """Load control_mode for a symbol. Default MANUAL."""
+        with _state_lock:
+            ctrl = self._load_all().get("control", {}).get(symbol.upper(), {})
+        return ctrl if ctrl.get("mode") else {"mode": "MANUAL", "since": None, "by": None, "until": None}
+
+    def save_control(self, symbol: str, mode: str, by: str = "", until: float | None = None):
+        """Save control_mode for a symbol."""
+        import time as _t
+        with _state_lock:
+            allst = self._load_all()
+            ctrl = allst.setdefault("control", {})
+            ctrl[symbol.upper()] = {"mode": mode.upper(), "since": int(_t.time()), "by": str(by)[:64], "until": until}
             tmp = self.state_path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(allst, f)

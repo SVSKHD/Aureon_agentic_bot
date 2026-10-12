@@ -2,6 +2,20 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.4.0 — 2026-10-12  (MINOR: agentic foundation)
+- **`docs/AGENTIC_SPEC.md`**: control modes MANUAL (default) and AGENT; /override semantics (one-shot, not a mode flip);
+  NON-OVERRIDABLE invariants table (SL never loosened, governor, session window, news, HALT, demo-only, max lots) with the
+  file/function that enforces each.
+- **`control_mode`** per symbol in `guardian_state.json` (top-level `"control": {SYMBOL: {mode, since, by, until}}`).
+  Default MANUAL. `journal.load_control(symbol)` / `journal.save_control(symbol, mode, by, until)`.
+  Loaded at start, saved atomically, restart-safe. Not yet switchable (v2.4.1 adds commands).
+- **Journal `actor` field**: `journal.decision(event, actor=, rationale=, p_win=, ...)` helper. Migrated call sites:
+  `decision`, `alert_decision`, `order_placed`, `governor_block`, `halt`, `unhalt`. Actor values: `"human"` (button),
+  `"agent"` (v2.4.2+), `"model"` (future), `"system"` (guardian/detector). Old journals load with actor inferred from
+  event type (button events → human, system events → system).
+- No behaviour change for MANUAL users.
+- Strategy rules changed: NO.
+
 ## v2.3.16 — 2026-10-12  (PATCH: voice command scope)
 - **`aureon_mt5/voice.py`**: deterministic keyword/grammar intent parser (`parse_intent(transcript) -> ParsedIntent`).
   Intents: status, alerts, plan (read-only, execute immediately), take, skip, alert, halt, unhalt, override

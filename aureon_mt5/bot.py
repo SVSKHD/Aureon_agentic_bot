@@ -579,7 +579,8 @@ def execute_entry(cfg, agents, journal, item: dict, side: str, user, notify=None
     ctx = _governor_context(cfg, agents, sym)
     dec = gov.check(sym, side, lots_chosen, ctx)
     if not dec.allowed:
-        journal.log("governor_block", symbol=sym, side=side, lots=lots_chosen, rule=dec.rule, detail=dec.detail, by=str(user))
+        journal.decision("governor_block", actor="system", rationale=f"{dec.rule}: {dec.detail}",
+                         symbol=sym, side=side, lots=lots_chosen, rule=dec.rule, detail=dec.detail, by=str(user))
         return {"line": f"⛔ BLOCKED · {dec.rule} · {dec.detail}", "text": f"⛔ {dec.detail}",
                 "ok": False, "ticket": None, "placed": False, "lots": lots_chosen}
     if cfg.execution_enabled and (demo or cfg.allow_live) and not getattr(cfg, "dry", False):
@@ -588,10 +589,11 @@ def execute_entry(cfg, agents, journal, item: dict, side: str, user, notify=None
         fill = r.price if r.price is not None else px
         slip = ((fill - card_px) if side == "LONG" else (card_px - fill)) if (fill is not None and card_px) else None
         spread_at_fill = round(r.ask - r.bid, 5) if (r.ask is not None and r.bid is not None) else None
-        journal.log("order_placed", symbol=sym, mode=m.get("mode"), alert_id=aid, side=side, lots=lots_chosen, sl=sl, ok=bool(r.ok),
-                    status=r.status, retcode=r.retcode, ticket=r.ticket, fill=r.price, by=str(user),
-                    lots_chosen=lots_chosen, lots_suggested=lots_suggested, lots_source=lots_source, half_size=half_size,
-                    slippage_pts=round(slip, 2) if slip is not None else None, spread_pts=spread_at_fill, card_price=card_px)
+        journal.decision("order_placed", actor="human", rationale="button press",
+                         symbol=sym, mode=m.get("mode"), alert_id=aid, side=side, lots=lots_chosen, sl=sl, ok=bool(r.ok),
+                         status=r.status, retcode=r.retcode, ticket=r.ticket, fill=r.price, by=str(user),
+                         lots_chosen=lots_chosen, lots_suggested=lots_suggested, lots_source=lots_source, half_size=half_size,
+                         slippage_pts=round(slip, 2) if slip is not None else None, spread_pts=spread_at_fill, card_price=card_px)
         if ag is not None: ag.attach_alert(aid, side, card_key=card_key)
         if r.ok:
             spread = spread_at_fill
@@ -636,13 +638,15 @@ def alert_decision(cfg, agents, journal, alerts, item: dict, side: str, user, no
                   claude_verdict=claude_verdict, claude_side=claude_side, by=str(user), price=m.get("price"), bar=m.get("bar"),
                   lots_chosen=lots, lots_suggested=lots_suggested)
     if side == "SKIP":
-        journal.log("alert_decision", side="skip", agreed=(sugg is None), agreed_agent=(sugg is None),
-                    agreed_claude=(None if claude_verdict is None else claude_side is None), **common)
+        journal.decision("alert_decision", actor="human", rationale="SKIP via button",
+                         side="skip", agreed=(sugg is None), agreed_agent=(sugg is None),
+                         agreed_claude=(None if claude_verdict is None else claude_side is None), **common)
         if alerts is not None: alerts.decide(aid, "skip")
         return {"line": "SKIPPED", "text": "⏭ skipped", "ok": True, "ticket": None, "placed": False, "lots": None}
     agreed = (sugg == side)
-    journal.log("alert_decision", side=side, agreed=agreed, agreed_agent=agreed,
-                agreed_claude=(None if claude_verdict is None else (claude_side == side)), **common)
+    journal.decision("alert_decision", actor="human", rationale=f"{side} via button",
+                     side=side, agreed=agreed, agreed_agent=agreed,
+                     agreed_claude=(None if claude_verdict is None else (claude_side == side)), **common)
     if alerts is not None: alerts.decide(aid, side)
     return execute_entry(cfg, agents, journal, item, side, user, notify=notify, retry_sleep=retry_sleep, lots=lots)
 
@@ -652,9 +656,10 @@ def ask_decision(cfg, agents, journal, item: dict, decision: str, user, notify=N
     Returns {"line", "text", "ok", "ticket", "placed", "lots"}."""
     m = item.get("meta", {})
     lots_suggested = float(m["lots"]) if m.get("lots") is not None else None
-    journal.log("decision", symbol=m.get("symbol"), mode=m.get("mode"), side=m.get("side"), signal_kind=m.get("kind"),
-                price=m.get("price"), bar=m.get("bar"), decision=decision, by=str(user),
-                lots_chosen=lots, lots_suggested=lots_suggested)
+    journal.decision("decision", actor="human", rationale=f"{decision} via button",
+                     symbol=m.get("symbol"), mode=m.get("mode"), side=m.get("side"), signal_kind=m.get("kind"),
+                     price=m.get("price"), bar=m.get("bar"), decision=decision, by=str(user),
+                     lots_chosen=lots, lots_suggested=lots_suggested)
     item["decided"] = decision
     if decision == "SKIP":
         return {"line": "SKIPPED", "text": "⏭ skipped", "ok": True, "ticket": None, "placed": False, "lots": None}
@@ -1152,7 +1157,7 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             if halt_mod.is_halted(cfg.log_dir):
                 return Reply(content="already halted — /unhalt confirm:UNHALT to resume")
             halt_mod.set_halt(cfg.log_dir, str(user), reason)
-            journal.log("halt", by=str(user), reason=reason or "manual")
+            journal.decision("halt", actor="human", rationale=reason or "manual", by=str(user), reason=reason or "manual")
             if cfg.dry or not cfg.execution_enabled:
                 # Dry mode: report what would be closed
                 pos_lines = []
@@ -1179,7 +1184,7 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             if confirm.strip() != "UNHALT":
                 return Reply(content="type `/unhalt confirm:UNHALT` (exact) to resume")
             prev = halt_mod.clear_halt(cfg.log_dir)
-            journal.log("unhalt", by=str(user))
+            journal.decision("unhalt", actor="human", rationale="manual unhalt", by=str(user))
             notify.card("✅ UNHALT", f"Resumed by {user}", footer=f"{datetime.now(IST):%H:%M} IST")
             return Reply(content="✅ unhalted — entries allowed again")
         await run(inter, "unhalt", work)
