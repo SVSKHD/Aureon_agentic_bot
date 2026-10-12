@@ -396,6 +396,12 @@ def main():
             wd.tick()
             from aureon_mt5.daily_plan import tick as plan_tick
             plan_tick(cfg, agents, journal, notify)
+            from aureon_mt5.control import check_auto_transitions
+            for _sym in cfg.symbols:
+                try:
+                    check_auto_transitions(journal, notify, _sym, agents, cfg)
+                except Exception:
+                    pass
         except KeyboardInterrupt:
             notify.card("AUREON · MT5 · PROCESS EXITING", "KeyboardInterrupt")
             broker.close_connection(); print("bye"); return

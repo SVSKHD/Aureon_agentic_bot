@@ -2,6 +2,18 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.4.1 — 2026-10-12  (PATCH: control-mode state machine)
+- **`aureon_mt5/control.py`** (pure): transitions MANUAL→AGENT (`/agent-on [symbol] [minutes]`, default `AUREON_AGENT_DEFAULT_MIN=60`),
+  AGENT→MANUAL (`/manual`, timeout, HALT, governor daily-loss-cap hit, MT5 disconnect > 5 min). Every transition: guardian_state saved,
+  journal `control_mode` {from, to, by, reason, until}, one card.
+- **`/agent-on`** and **`/manual`** commands in bot.py.
+- **`/status`**, **`/parallel-status`**: show mode per symbol with time left (`🤖 AGENT (42m left)` / `🧑 MANUAL`).
+- **Auto-transitions**: `check_auto_transitions()` called every supervisor loop iteration for each symbol.
+  AGENT→MANUAL forced by: timeout (`until` expired), HALT active, governor `daily_loss_cap` hit, MT5 disconnect incident > 5 min.
+- **`/override`** remains a one-shot agent action — does NOT flip the mode (documented in AGENTIC_SPEC.md).
+- Still NO autonomous entry in this version — AGENT mode only changes labels and arms the state. v2.4.2 adds the executor.
+- Strategy rules changed: NO.
+
 ## v2.4.0 — 2026-10-12  (MINOR: agentic foundation)
 - **`docs/AGENTIC_SPEC.md`**: control modes MANUAL (default) and AGENT; /override semantics (one-shot, not a mode flip);
   NON-OVERRIDABLE invariants table (SL never loosened, governor, session window, news, HALT, demo-only, max lots) with the

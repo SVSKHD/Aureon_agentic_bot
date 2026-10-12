@@ -122,6 +122,11 @@ def status_card(sym: str, ag, cfg, journal=None, monitor=None, claude=None, code
     else:
         fields.append(_field("Execution", "off"))
     try:
+        from .control import mode_label
+        fields.append(_field("Control", mode_label(journal, sym) if journal else "—"))
+    except Exception:
+        pass
+    try:
         from .governor import Governor
         _gov = Governor(cfg)
         _gov_ctx = {"trades_today": 0, "realised_money_today": 0, "equity": 0}  # lightweight default for /status
@@ -164,7 +169,12 @@ def parallel_card(agents, cfg, journal=None) -> dict:
         icon = "🟢" if healthy else ("🟡" if ag.is_alive() else "🔴")
         px = f"{h['close']:.2f}" if h.get("close") is not None else "—"
         chop_tag = f" · 🌀 CHOP" if h.get("chop") else ""
-        value = (f"{icon} **{h['status'].upper()}** · {ag.S.display_name} · {age_text(ag)}{chop_tag}\n"
+        try:
+            from .control import mode_label as _ml
+            mode_tag = f" · {_ml(journal, sym)}" if journal else ""
+        except Exception:
+            mode_tag = ""
+        value = (f"{icon} **{h['status'].upper()}** · {ag.S.display_name} · {age_text(ag)}{chop_tag}{mode_tag}\n"
                  f"Price `{px}` · {ptxt}\n"
                  f"Signal `{h.get('last_signal') or '—'}` · Errors `{h.get('errors', 0)}`")
         fields.append(_field(sym, value, False))
@@ -1139,6 +1149,35 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             except Exception as e:
                 return Reply(content=f"watchdog: error reading state — {e}")
         await run(inter, "watchdog", work)
+
+    @tree.command(name="agent-on", description="Switch a symbol to AGENT mode for N minutes")
+    @app_commands.describe(symbol="Symbol (default: first)", minutes="Duration in minutes (default: AUREON_AGENT_DEFAULT_MIN)")
+    async def agent_on_cmd(inter: discord.Interaction, symbol: str = "", minutes: int | None = None):
+        user = inter.user
+        def work():
+            from .control import current_mode, to_agent
+            sym = (symbol.strip().upper() or cfg.symbols[0])
+            ctrl = current_mode(journal, sym)
+            if ctrl["mode"] == "AGENT":
+                return Reply(content=f"{sym} already in AGENT mode")
+            mins = minutes if minutes is not None else cfg.agent_default_min
+            to_agent(journal, notify, sym, str(user), mins)
+            return Reply(content=f"🤖 AGENT ON · {sym} · {mins} min")
+        await run(inter, "agent-on", work)
+
+    @tree.command(name="manual", description="Switch a symbol back to MANUAL mode")
+    @app_commands.describe(symbol="Symbol (default: first)")
+    async def manual_cmd(inter: discord.Interaction, symbol: str = ""):
+        user = inter.user
+        def work():
+            from .control import current_mode, to_manual
+            sym = (symbol.strip().upper() or cfg.symbols[0])
+            ctrl = current_mode(journal, sym)
+            if ctrl["mode"] == "MANUAL":
+                return Reply(content=f"{sym} already in MANUAL mode")
+            to_manual(journal, notify, sym, str(user), "/manual command")
+            return Reply(content=f"🧑 MANUAL · {sym}")
+        await run(inter, "manual", work)
 
     @tree.command(name="plan", description="Show today's daily plan (news, sessions, yesterday, chop, governor)")
     async def plan_cmd(inter: discord.Interaction):
