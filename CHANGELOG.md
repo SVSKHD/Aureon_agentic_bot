@@ -2,6 +2,14 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.4.4 — 2026-10-13  (PATCH: override / AGENT dry-run harness)
+- **`scripts/rehearse.py`**: scripted rehearsal against fake MT5 + console notifier. Scenarios: missed → /override placed,
+  override refused (drift), AGENT window → agent takes, HALT mid-trade, governor blocks. Pass/fail table.
+- **`tests/test_v244_transitions.py`**: parametrised pytest coverage for EVERY control-mode transition (to_agent, to_manual,
+  timeout, HALT, disconnect, restart preserve/drop) and EVERY governor rule rejection (session_window, news_block, max_trades_day,
+  daily_loss_cap, one_position_per_direction, halted) with edge cases. Rehearse script runs as a test.
+- Strategy rules changed: NO.
+
 ## v2.4.3 — 2026-10-12  (PATCH: scheduled AGENT windows)
 - **`aureon_mt5/schedule.py`**: `/agent-schedule add <symbol> HH:MM-HH:MM [days=Mon-Fri]`, `list`, `remove <id>`.
   Stored in `logs/agent_schedule.json`. Windows inside 23:00–05:30 IST rejected at creation. Overlaps merge
