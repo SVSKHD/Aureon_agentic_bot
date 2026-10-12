@@ -7,7 +7,7 @@ You receive one JSON snapshot. Reply with ONE JSON object only, no prose, no cod
 
 The first line of every prompt names the MODE and what the fast / slow EMA are. ema_fast / ema_slow in the snapshot are those
 two lines. Apply the section for that mode only. These are the bot's own rules — never invent a threshold that is not here.
-(Placeholder until research/claude_rules_v2.md is supplied; approved proposals are appended below, dated.)
+Approved proposals are appended below, dated.
 
 Common fields: gap (fast − slow, pts) · dist_to_fast_ema_pts (close − fast) · swing_against_last6_pts · atr20 · crosses_today ·
 bars_since_cross · confirm_state · minutes_to_news · session · bar_time_server (HH:MM) · trend_state · day_pnl_pts · trades_today.
@@ -31,8 +31,11 @@ For a SKIP, "evidence" lists the field(s) of the cited reason.
 
 - Guardian (for pullbacks): stop −12 · +3 seen → SL +1 · +10 → SL +10 · ride +5 steps · close on an EMA 20 turn once secured ·
   exit on the next confirmed opposite cross. No EMA 50 follow-stop.
-- pullback in a trade: HOLD while open_profit > −6 and not closed_through_slow_ema; TIGHTEN (tighter than sl, below price) when
-  retrace_pct >= 60 and bars_since_peak >= 3; CLOSE only if open_profit > 0 and closed_through_slow_ema.
+- pullback in a trade: HOLD while not closed_through_slow_ema — a retrace, even 60–80% of the progress so far, is normal on
+  this timeframe (measured: a leg retraces a median 78% before its best point). TIGHTEN (tighter than sl) only when
+  closed_through_slow_ema is true, or when gap has narrowed toward 0 for 3+ consecutive bars (an opposite cross forming).
+  CLOSE only if secured_level > 0 and retrace_from_peak_pts >= 15 and bars_since_peak >= 12. Never CLOSE in loss;
+  never propose tighten_to looser than sl.
 
 == MODE ema5080 (fast = EMA 50, slow = EMA 80) ==
 - Good entries: lines separating in the trade direction, EMA 80 sloping with the trade, price near EMA 50 (|dist_to_fast_ema_pts| <= 2 × avg_range),

@@ -174,7 +174,7 @@ def test_buttons_journal_and_no_order_when_execution_disabled(rig):
     item = {"meta": {"kind": "alert", "alert_id": "A1", "symbol": "XAUUSD", "price": 3999.9, "bar": 1, "mode": "ema2050", "suggested_side": "LONG"}}
     text = bot.alert_decision(r.cfg, {"XAUUSD": r.ag}, r.j, r.store, item, "LONG", "tester")["text"]
     assert text.startswith("noted — place it in MT5, I will manage it") and "SL 3988.80" in text      # ask 4000.8 − 12
-    assert r.fake.orders == [] and r.ag.pending_alert == {"alert_id": "A1", "side": "LONG", "t": pytest.approx(time.time(), abs=5)}
+    assert r.fake.orders == [] and r.ag.pending_alert == {"alert_id": "A1", "side": "LONG", "t": pytest.approx(time.time(), abs=5), "card_key": None}
     d = [x for x in r.j.read(0) if x["event"] == "alert_decision"][-1]
     assert (d["alert_id"], d["side"], d["suggested_side"], d["agreed"]) == ("A1", "LONG", "LONG", True)
     text = bot.alert_decision(r.cfg, {"XAUUSD": r.ag}, r.j, r.store, item, "SHORT", "tester")["text"]

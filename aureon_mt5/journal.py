@@ -66,3 +66,30 @@ class Journal:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(allst, f)
             os.replace(tmp, self.state_path)
+
+    def rebuild_state_for_ticket(self, ticket: int) -> tuple[dict | None, str]:
+        """Reconstruct guardian state for a ticket from journal events. Returns (state_dict, source).
+        source: "journal" if events found, "none" if not."""
+        recs = self.read(0)
+        ticket_recs = [r for r in recs if r.get("ticket") == ticket or r.get("ticket") == str(ticket)]
+        if not ticket_recs:
+            return None, "none"
+        seen = next((r for r in ticket_recs if r["event"] == "position_seen"), None)
+        if seen is None:
+            return None, "none"
+        secured_levels = [float(r.get("level", 0)) for r in ticket_recs if r["event"] == "secured"]
+        peaks = [float(r.get("peak", 0)) for r in ticket_recs if r.get("peak") is not None]
+        has_post_cross = any(r["event"] in ("cross_confirmed", "secured", "early_lock") for r in ticket_recs)
+        st = {
+            "symbol": seen.get("symbol"),
+            "mode": seen.get("mode"),
+            "direction": "long" if seen.get("side", "").upper() == "LONG" else "short",
+            "entry": seen.get("entry"),
+            "peak": max(peaks) if peaks else 0.0,
+            "pre": not has_post_cross,
+            "bars": 0,
+            "news_done": any(r["event"] == "news_flat" for r in ticket_recs),
+            "secured": max(secured_levels) if secured_levels else 0.0,
+            "alert_id": seen.get("alert_id"),
+        }
+        return st, "journal"
