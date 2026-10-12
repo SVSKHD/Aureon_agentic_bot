@@ -2,6 +2,35 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.3.9 — 2026-10-12  (MINOR: missed setup detection + /override)
+- **Missed setup detection** (`agent.py`): `track_ask` records every signal ask card (ENTER / P / CROSS / RE). Every poll,
+  `_check_misses` fires after the grace window (`AUREON_MISSED_GRACE_MIN`, default 5 min) if no position appeared in that direction.
+  Not missed when: SKIP answered, order placed, position already existed, ask expired, market closed / news / 23:00–05:30 IST.
+  A TAKE press that armed the guardian but no ticket appeared IS missed ("TAKE pressed, no ticket"). ONE `SETUP MISSED · LONG` card
+  per ask with drift, suggested lots, SL, minutes since signal. Journal `setup_missed`. Open asks persisted in `logs/pending.json`.
+- **`/override [symbol] [lots]`**: places the order at the current price via `execute_entry` within the override window
+  (`AUREON_OVERRIDE_WINDOW_MIN`, default 10 min) AND drift against trade <= `AUREON_OVERRIDE_MAX_DRIFT` (default 3.0 pts) AND
+  price above SL AND no blackout. Same demo/live gate. Journal `override` with `lots_source="override"`.
+  `/ignore-miss` journals `override_ignored` and removes the miss.
+- **Compare** (`compare.py`): `Row.missed`/`Row.overridden`; `groups()` adds `missed`/`overridden`/`missed_not_overridden`;
+  card shows "Missed: N · overridden K (win%/pts) · let go M (win%/pts)" when any.
+- Strategy rules changed: NO.
+
+## v2.3.8 — 2026-10-12  (PATCH: chop-day window fix + restart duplicate)
+- **FIX chop-day hour window**: MT5 bar `time` is already the broker server clock encoded as a UTC epoch (`server_str` uses `tz=utc`).
+  The old `chop.py` applied `off` on top, shifting the 00:00–11:00 server window to ≈21:30–08:30 (live) or 21:00–08:00 (replay),
+  missing 09:00–10:59 server crosses and counting previous-evening ones. Fixed: `server_day_start(bar_t) = bar_t - bar_t % 86400`;
+  `count_morning_crosses` is now a pure numpy-vectorised function of the frame with no `datetime.now()` and `off` is ignored (kept
+  for signature compat). The old tests couldn't catch it because `_choppy_frame` imported `_server_day_start` from the module under test.
+  New tests use independent `_server_epoch` / `_frame_from_flips` helpers and assert correct behaviour for crosses at 09:00–10:40,
+  previous-evening crosses, the 11:00 boundary, and day-label roll at midnight.
+- **FIX repeat CHOP DAY card after /restart**: `Notifier.sent` (dedupe set) is in memory, so a restart on a chop day re-posted the
+  card and re-journaled `chop_day`. Added `_chop_day_journaled(day)` that checks the journal for an existing `chop_day` event for this
+  symbol and day (last 2 days). When chop is newly true but the journal already has the event, the card and journal line are suppressed;
+  the flag itself (`self.chop`, `health["chop"]`) is still rebuilt from bars. New test: two agents on the same journal → exactly one
+  CHOP DAY card and one journal line; second agent still has `chop=True`.
+- Strategy rules changed: NO.
+
 ## v2.3.7 — 2026-10-12  (PATCH: lot-size buttons on entry cards)
 - **Lot-size buttons** when `AUREON_EXECUTION=1`: Confirm/ENTER cards (AskView) show `[0.5] [1.0] [1.5] [SKIP]`; ALERT cards
   (AlertView) show per-side rows `LONG 0.5/1.0/1.5` and/or `SHORT 0.5/1.0/1.5` (one side row when `suggested_side` is set).

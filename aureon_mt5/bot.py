@@ -818,8 +818,12 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             self.item["decided"] = decision
             await inter.response.defer()
             r = await asyncio.to_thread(ask_decision, cfg, agents, journal, self.item, decision, inter.user, notify, lots=lots)
-            for c in self.children: c.disabled = True
+            # v2.3.9: mark ask decided for miss tracking
             m = self.item.get("meta", {})
+            ag = agents.get(m.get("symbol"))
+            if ag is not None:
+                ag.mark_ask_decided(self.item.get("key", ""), decision, placed=r.get("placed", False))
+            for c in self.children: c.disabled = True
             sugg = float(m.get("lots") or cfg.max_lots)
             if decision == "TAKE":
                 lot_txt = f" {r.get('lots', ''):g} lots (suggested {sugg:g})" if r.get("lots") else ""
@@ -979,6 +983,50 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             _decide(item, "SKIP", user)
             return Reply(content=f"⏭ skipped {item['meta'].get('side')} {item['meta'].get('symbol')}")
         await run(inter, "skip", work)
+
+    @tree.command(name="override", description="Override a missed setup — places the order at the current price")
+    @app_commands.describe(symbol="Symbol (default: first)", lots="Lot size")
+    async def override_cmd(inter: discord.Interaction, symbol: str = "", lots: float | None = None):
+        user = inter.user
+        def work():
+            sym = (symbol.strip().upper() or cfg.symbols[0])
+            ag = agents.get(sym)
+            if ag is None:
+                return Reply(content=f"no agent for {sym}")
+            miss = ag.check_override()
+            if miss is None:
+                reason = ""
+                if ag.open_misses:
+                    reason = ag.open_misses[-1].get("expired_reason", "expired")
+                return Reply(content=f"no overridable miss for {sym}" + (f" ({reason})" if reason else ""))
+            # Build an item for execute_entry
+            item = {"meta": {"symbol": sym, "side": miss["side"], "kind": miss["kind"], "price": miss.get("now_price", miss["price"]),
+                             "bar": miss["bar"], "mode": ag.S.name, "sl": miss.get("sl"),
+                             "lots": miss.get("lots"), "chop": ag._is_chop(), "alert_id": miss.get("card_key")},
+                    "key": miss["card_key"]}
+            r = execute_entry(cfg, agents, journal, item, miss["side"], user, notify=notify, lots=lots, card_key=miss["card_key"])
+            journal.log("override", symbol=sym, card_key=miss["card_key"], side=miss["side"], lots=r.get("lots"),
+                        by=str(user), drift_at_press=miss.get("drift_at_press"), placed=r.get("placed"), ticket=r.get("ticket"),
+                        lots_source="override")
+            ag.consume_miss(miss["card_key"])
+            notify.edit_card(miss["card_key"], {"Decision": f"⚡ **OVERRIDE {r['line']}** · {user.display_name if hasattr(user, 'display_name') else user} · {datetime.now(IST):%H:%M} IST"[:1024]})
+            return Reply(content=f"⚡ {r['line']} — {r['text']}")
+        await run(inter, "override", work)
+
+    @tree.command(name="ignore-miss", description="Ignore a missed setup (no action taken)")
+    @app_commands.describe(symbol="Symbol (default: first)")
+    async def ignore_miss_cmd(inter: discord.Interaction, symbol: str = ""):
+        user = inter.user
+        def work():
+            sym = (symbol.strip().upper() or cfg.symbols[0])
+            ag = agents.get(sym)
+            if ag is None or not ag.open_misses:
+                return Reply(content=f"no open miss for {sym}")
+            miss = ag.open_misses[-1]
+            journal.log("override_ignored", symbol=sym, card_key=miss["card_key"], side=miss["side"], by=str(user))
+            ag.consume_miss(miss["card_key"])
+            return Reply(content=f"⏭ miss ignored · {miss['side']} {sym} · {miss['kind']}")
+        await run(inter, "ignore-miss", work)
 
     @client.event
     async def on_ready():

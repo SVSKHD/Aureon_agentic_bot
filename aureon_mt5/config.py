@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from dotenv import load_dotenv
 load_dotenv()   # load .env if present
 
-VERSION = "2.3.7"
+VERSION = "2.3.9"
 
 
 def _parse_lot_buttons(raw: str) -> list[float]:
@@ -59,6 +59,9 @@ class Config:
     watchdog_ping: bool = os.environ.get("AUREON_WATCHDOG", "0") == "1"     # minute heartbeat to Supabase — off on the free plan
     streak_half_after: int = int(os.environ.get("AUREON_STREAK_HALF_AFTER", "0"))
     chop_crosses: int = int(os.environ.get("AUREON_CHOP_CROSSES", "5"))
+    missed_grace_min: int = int(os.environ.get("AUREON_MISSED_GRACE_MIN", "5"))
+    override_window_min: int = int(os.environ.get("AUREON_OVERRIDE_WINDOW_MIN", "10"))
+    override_max_drift: float = float(os.environ.get("AUREON_OVERRIDE_MAX_DRIFT", "3.0"))
     # your manual SL rules: if you placed an SL wider than the guardian's P-phase stop, the guardian does not close at −pre_stop
     respect_manual_sl: bool = os.environ.get("AUREON_RESPECT_MANUAL_SL", "1") == "1"
     # Codex read-only advisor (Discord on-demand; never blocks signals or guardian)
