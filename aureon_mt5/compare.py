@@ -51,7 +51,10 @@ class Row:
     claude: str | None = None     # TAKE | SKIP | None (= no verdict)
     me: str = "SKIPPED"           # TAKEN | SKIPPED
     me_via: str = ""              # button | mt5
-    codex: str | None = None      # v2.3.0: TAKE | SKIP | None (last: Row(...) is built positionally)
+    codex: str | None = None      # v2.3.0: TAKE | SKIP | None
+    chop: bool = False             # v2.3.5: chop-day flag from the signal journal record
+    lots_chosen: float | None = None    # v2.3.7: button lot size
+    lots_suggested: float | None = None # v2.3.7: risk-based suggested size
 
 
 def _ev(v: dict, source: str = "claude"):
@@ -77,7 +80,7 @@ def build_rows(records: list[dict], graded: list, since: int, until: int, off: f
     decisions = {}
     for d in records:
         if d.get("event") == "decision" and d.get("decision") in ("TAKE", "SKIP", "EXPIRED"):
-            decisions[(d.get("symbol"), d.get("bar"))] = d["decision"]
+            decisions[(d.get("symbol"), d.get("bar"))] = d
     rows, seen = [], set()
     for s in sorted(sigs, key=lambda r: r["bar"]):
         kind = KINDS_BY_MODE[s.get("mode", STRATEGY)][s["signal_kind"]]; side = str(s.get("side", "")).upper()
@@ -86,6 +89,7 @@ def build_rows(records: list[dict], graded: list, since: int, until: int, off: f
             continue
         seen.add(key)
         row = Row(s.get("symbol"), kind, side, int(s["bar"]), SESSIONS.get(session_of(int(s["bar"]), off), "Off-hours"))
+        row.chop = bool(s.get("chop"))
         g = grades.get(key)
         if g is not None:
             row.grade = g.grade; row.money = g.money
@@ -99,7 +103,13 @@ def build_rows(records: list[dict], graded: list, since: int, until: int, off: f
             v = verdicts[src].get((row.symbol, kind, row.bar))
             if v is not None and _valid_entry_verdict(v, src):
                 setattr(row, src, v["decision"])
-        if decisions.get((row.symbol, row.bar)) == "TAKE":
+        dec_rec = decisions.get((row.symbol, row.bar))
+        if isinstance(dec_rec, dict):
+            if dec_rec.get("decision") == "TAKE":
+                row.me, row.me_via = "TAKEN", "button"
+            row.lots_chosen = dec_rec.get("lots_chosen")
+            row.lots_suggested = dec_rec.get("lots_suggested")
+        elif dec_rec == "TAKE":
             row.me, row.me_via = "TAKEN", "button"
         rows.append(row)
     # trades seen in MT5: assign each to the most recent same-side signal whose window contains its open time
@@ -169,6 +179,14 @@ def groups(rows: list[Row]) -> dict[str, list[Row]]:
         "both": [r for r in rows if r.claude is not None and r.codex is not None],
         "split": [r for r in rows if r.claude is not None and r.codex is not None and r.claude != r.codex],
         "both_take": [r for r in rows if r.claude == "TAKE" and r.codex == "TAKE"],
+        # v2.3.5 chop-day groups
+        "chop": [r for r in rows if r.chop],
+        "clear": [r for r in rows if not r.chop],
+        "chop_me_taken": [r for r in rows if r.chop and r.me == "TAKEN"],
+        "clear_me_taken": [r for r in rows if not r.chop and r.me == "TAKEN"],
+        # v2.3.7 sizing groups
+        "sized_up": [r for r in rows if r.lots_chosen is not None and r.lots_suggested is not None and r.lots_chosen > r.lots_suggested],
+        "sized_down": [r for r in rows if r.lots_chosen is not None and r.lots_suggested is not None and r.lots_chosen < r.lots_suggested],
     }
 
 
@@ -585,6 +603,26 @@ def card(res: CompareResult, *, title: str = "AUREON · MT5 · COMPARE", mode_di
         if cpb.by_decision:
             cpbt += "\n" + " · ".join(f"{k} {v['right']}/{v['n']}" for k, v in sorted(cpb.by_decision.items()))
         fields.append({"name": "Pullbacks (Codex vs guardian · shown only)", "value": cpbt, "inline": False})
+    chop_rows = res.groups.get("chop", [])
+    clear_rows = res.groups.get("clear", [])
+    if chop_rows:
+        cm = metrics(chop_rows); clm = metrics(clear_rows)
+        chop_taken = res.groups.get("chop_me_taken", [])
+        chop_line = f"**Chop-flagged entries:** {cm.n} graded (taken {len(chop_taken)})"
+        if cm.n:
+            chop_line += f" · win {cm.win_rate:.0%} · avg {cm.expectancy:+.1f} pts"
+        chop_line += f"\n**Clear days:** {clm.n} graded"
+        if clm.n:
+            chop_line += f" · win {clm.win_rate:.0%} · avg {clm.expectancy:+.1f} pts"
+        fields.append({"name": "Chop vs Clear", "value": chop_line, "inline": False})
+    sized_rows = [r for r in res.rows if r.lots_chosen is not None and r.lots_suggested is not None]
+    if sized_rows:
+        up = len(res.groups.get("sized_up", []))
+        down = len(res.groups.get("sized_down", []))
+        same = len(sized_rows) - up - down
+        ratios = [r.lots_chosen / r.lots_suggested for r in sized_rows if r.lots_suggested]
+        avg_ratio = sum(ratios) / len(ratios) if ratios else 1.0
+        fields.append({"name": "Sizing", "value": f"up {up} · down {down} · as suggested {same} · avg chosen/suggested ratio {avg_ratio:.2f}", "inline": False})
     fields.append({"name": "Excluded", "value": f"OPEN {det.open} · UNGRADED {det.ungraded} · no verdict {len(res.groups['no_verdict'])}"
                    + (f" · no Codex verdict {len(res.groups['codex_no_verdict'])}" if any(r.codex for r in res.rows) else ""), "inline": False})
     al = res.alerts or {}

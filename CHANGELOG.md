@@ -2,6 +2,73 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.3.7 — 2026-10-12  (PATCH: lot-size buttons on entry cards)
+- **Lot-size buttons** when `AUREON_EXECUTION=1`: Confirm/ENTER cards (AskView) show `[0.5] [1.0] [1.5] [SKIP]`; ALERT cards
+  (AlertView) show per-side rows `LONG 0.5/1.0/1.5` and/or `SHORT 0.5/1.0/1.5` (one side row when `suggested_side` is set).
+  `AUREON_LOT_BUTTONS=0.5,1.0,1.5` (up to 5 values, > 0, sorted, dedupe). The button nearest `meta["lots"]` (the risk-based
+  suggested size, already halved by streak/chop) is marked with `★`. Buttons above `max_lots` render disabled with label
+  `1.5 (>max)`. When execution is off, today's TAKE/LONG/SHORT/SKIP buttons are unchanged.
+- **`execute_entry(…, lots=None)`**: when lots is given, uses `min(lots, max_lots)` instead of suggested. Journals `order_placed`
+  with `lots_chosen`, `lots_suggested`, `lots_source` ("button"/"card"), `half_size`. ORDER PLACED card has a `Size` field.
+  Return dict gains `"lots"`. `ask_decision` and `alert_decision` pass `lots` through and journal it in `decision`/`alert_decision`.
+- **`/take lots=<float>`**: optional lots argument.
+- **`/status`**: shows `exec: on · buttons 0.5/1.0/1.5 · max 2.0 · demo` or `exec: off`.
+- **Compare**: `Row.lots_chosen`/`lots_suggested`; `groups()` adds `sized_up`/`sized_down`; card shows "Sizing: up N · down N ·
+  as suggested N · avg chosen/suggested ratio" when any row has sizing data.
+- `lot_button_spec(cfg, meta)`: pure testable helper returning button descriptors.
+- Strategy rules changed: NO.
+
+## v2.3.6 — 2026-10-12  (PATCH: restart-safe guardian resume)
+- **Immediate state save** after every critical guardian mutation (early lock, cross confirmed, secure, ride step) — not just at
+  poll end. A crash mid-poll no longer loses the last step.
+- **Journal reconstruction fallback**: when a live position's ticket is NOT in `guardian_state.json`, rebuild state from journal
+  events (`position_seen`, `secured`, `early_lock`, etc.): `secured` = max over journaled levels, `peak` = max, `pre` = False
+  if any post-cross event, `alert_id` from `position_seen`. Then apply "live SL is the truth". Journal `state_rebuilt` with
+  source `journal` or `none` (no events found → fresh PROTECT).
+- **RESUMED card**: on (re)start, when positions are present, one card per symbol lists each ticket: direction, entry, current pts,
+  phase (PROTECT / EARLY / SECURED / RIDING), SL, and the source (state file / journal / none). Includes armed alerts count.
+- **Pending TAKE survives restart**: `attach_alert` writes to `logs/pending.json` (atomic); loaded in `SymbolAgent.__init__`;
+  cleared when consumed or expired. A position appearing after restart within the TTL gets the alert_id and ATTACHED card.
+- **Alert gap detection**: `AlertStore.check()` stores `last_tick` per symbol (throttled: on change > 0.5 pt). If the price
+  crossed the level while Aureon was down (last known tick on one side, current on the other), fires with `gap_note`.
+- **`/restart`** lists what will be resumed (open tickets with phase, armed alerts, pending TAKEs) before restarting. `/restart`
+  is allowed with open positions since resume is now safe.
+- Strategy rules changed: NO.
+
+## v2.3.5 — 2026-10-12  (PATCH: deterministic chop-day flag)
+- **Chop-day detection** (`common/chop.py`, pure function): `count_morning_crosses(df, fast_col, slow_col, off)` counts EMA fast/slow
+  sign-change crosses on the current server day before 11:00 server (same cross-counting as `claude_advisor.build_snapshot`).
+  `chop_state(…, threshold)` returns `{"chop", "crosses", "day", "threshold"}`. Works in dry mode and in replay.
+- **Agent chop flag** (`agent.py`): `self.chop` recomputed once per closed bar; sticky per server day (once CHOP, stays for the day).
+  `health["chop"]` set. When chop first becomes True: one CHOP DAY card (dedupe per day), journal `chop_day` event.
+- **ENTER cards** (both ema2050 and ema5080): on a chop day, a `⚠️ Chop day` field is added (N crosses before 11:00 — half size
+  suggested); `_risk_lots()` halves the risk (same mechanism as streak half, combined: halve once, not twice); the Size line appends
+  `**half size** (chop day)` or `(chop day · N losses in a row)` when both bind. Ask meta includes `chop` and `chop_crosses`.
+- **Signal journal**: `chop` and `chop_crosses` added to every `signal` event.
+- **`/status`**: per-symbol line shows `🌀 CHOP (N crosses <11:00)` when active.
+- **`/agents`**: per-agent line appends `· CHOP`.  `/parallel-status`: same token.
+- **Compare** (`compare.py`): `Row.chop` field (default False, read from journal). `groups()` adds `chop`, `clear`, `chop_me_taken`,
+  `clear_me_taken`. `/compare` card and Saturday COMPARE card show "Chop-flagged entries: N (taken K) · win% / avg pts" vs "Clear days"
+  when any row is flagged.
+- `AUREON_CHOP_CROSSES=5` (default); `config.py` `chop_crosses`.
+- Strategy rules changed: NO (this is a size/warning overlay — entries are not blocked).
+
+## v2.3.4 — 2026-10-12  (PATCH: Confirm card TAKE places orders + streak half size)
+- **Confirm card [TAKE] button and `/take` now execute through the same path as the alert [LONG]/[SHORT] buttons**: `execute_entry`
+  (extracted from `alert_decision`) does tick → SL from `g.pre_stop` → `place_market` when `AUREON_EXECUTION=1` on demo (or
+  `AUREON_ALLOW_LIVE=1`), else arms the guardian and says why it did not place. `ask_decision` journals the `decision` event and
+  delegates to `execute_entry`. `AskView._answer` defers, calls `ask_decision` in a thread, and edits the Decision field with the
+  result (green on success, red on reject); if the edit fails, a followup is sent ephemeral. `/take` does the same via `ask_decision`
+  + `notify.edit_card`. `alert_decision` also delegates to `execute_entry` (no duplicated placement code). All return dicts now
+  include `"placed": True|False`.
+- `attach_alert(alert_id, side, card_key=None)`: stores `card_key` in `pending_alert`. In `_guard`, when a first-seen position
+  consumes `pending_alert`, the ATTACHED edit goes to `card_key` (the Confirm card) or falls back to `alerts_mod.key_for(…)`.
+- **Streak half size**: `AUREON_STREAK_HALF_AFTER=0` (default off). When the count of consecutive losing closed deals >= threshold,
+  `_risk_lots` uses `risk_pct / 2` for lot sizing. `_streak_n()` (cached per bar) counts the streak; `_half_size()` tests threshold.
+  `_suggested` and `_lot_field` use `_risk_lots`; the Size line appends ` · **half size** (N losses in a row)` when active.
+  The streak card says "half size applied to the next one" when the threshold is met. `AUREON_MAX_LOTS` still caps.
+- Strategy rules changed: NO.
+
 ## v2.3.3 — 2026-10-11  (PATCH: Claude rules wording + shadow report fixes)
 - `prompts/advisor_rules.md` (alias `claude_rules.md`), ema2050 section: the four operator paragraphs verbatim (detector already validated
   confirmation and the EMA20 touch · no ATR rule, swing matters only >= 8 · crosses_today >= 5 only before 11:00 server · default TAKE,

@@ -106,6 +106,15 @@ def status_card(sym: str, ag, cfg, journal=None, monitor=None, claude=None, code
         _field("Secured today", f"+{today['secured']:g}"),
         _field("Last signal", h.get("last_signal") or "—"),
         _field("Last broker action", h.get("last_broker_action") or "—"),
+    ]
+    if h.get("chop"):
+        fields.append(_field("Chop", f"🌀 {h['chop']}"))
+    if cfg.execution_enabled:
+        demo_s = "demo" if (broker.is_demo() if not cfg.dry else None) else ("live" if cfg.allow_live else "live (blocked)")
+        fields.append(_field("Execution", f"on · buttons {'/'.join(f'{v:g}' for v in cfg.lot_buttons)} · max {cfg.max_lots:g} · {demo_s}"))
+    else:
+        fields.append(_field("Execution", "off"))
+    fields += [
         _field("Claude", claude_status_word(ag, claude)),                          # v2.0.1
         _field("Codex", claude_status_word(ag, codex)),                            # v2.3.0 (shown only, never applied)
         _field("Bot", _bot_line(monitor), False),
@@ -129,7 +138,8 @@ def parallel_card(agents, cfg, journal=None) -> dict:
         all_ok &= healthy
         icon = "🟢" if healthy else ("🟡" if ag.is_alive() else "🔴")
         px = f"{h['close']:.2f}" if h.get("close") is not None else "—"
-        value = (f"{icon} **{h['status'].upper()}** · {ag.S.display_name} · {age_text(ag)}\n"
+        chop_tag = f" · 🌀 CHOP" if h.get("chop") else ""
+        value = (f"{icon} **{h['status'].upper()}** · {ag.S.display_name} · {age_text(ag)}{chop_tag}\n"
                  f"Price `{px}` · {ptxt}\n"
                  f"Signal `{h.get('last_signal') or '—'}` · Errors `{h.get('errors', 0)}`")
         fields.append(_field(sym, value, False))
@@ -212,7 +222,7 @@ def agents_card(agents, cfg, started_at, monitor=None, claude=None, journal=None
             f"Last bar {bar}",
             f"Bars today **{bars_today}** · crosses **{crosses_today}**",
             f"Trades **{len(trade_ids)}** · pnl pts **{pnl:+.1f}**",
-            f"Guardian **{'ON' if ag.g else 'OFF'}** · Claude **{ai}**",
+            f"Guardian **{'ON' if ag.g else 'OFF'}** · Claude **{ai}**" + (f" · CHOP" if h.get("chop") else ""),
             f"Thread **{'alive' if ag.is_alive() else 'DEAD'}** · uptime **{int((_time.time()-getattr(ag, 'started_wall', started_at))//60)}m**",
             f"Last error {err[:150]}",
         ]
@@ -485,26 +495,12 @@ def current_price(sym: str, ag, cfg, lock_timeout: float = 1.0) -> float | None:
     return ag.health.get("close") if ag is not None else None
 
 
-def alert_decision(cfg, agents, journal, alerts, item: dict, side: str, user, notify=None, retry_sleep: float = 2.0) -> dict:
-    """LONG / SHORT / SKIP on an ALERT REACHED card. Runs OFF the event loop. Journals alert_decision (agent_verdict, claude_verdict,
-    agreed_agent, agreed_claude); places the order only when AUREON_EXECUTION=1 on a demo account (or AUREON_ALLOW_LIVE=1), otherwise
-    arms the guardian for the trade you place. Returns {"line": <edited into the card>, "text": <detail>, "ok", "ticket"}."""
-    m = item.get("meta", {}); sym = m.get("symbol"); aid = m.get("alert_id"); sugg = m.get("suggested_side")
+def execute_entry(cfg, agents, journal, item: dict, side: str, user, notify=None, retry_sleep: float = 2.0, card_key=None, lots=None) -> dict:
+    """Core execution: tick → SL from g.pre_stop → place_market when cfg.execution_enabled and (demo or allow_live) and not dry →
+    journal order_placed → ag.attach_alert → ORDER PLACED card, else arm guardian and return WHY it did not place.
+    Returns {"line", "text", "ok", "ticket", "placed", "lots"}."""
+    m = item.get("meta", {}); sym = m.get("symbol"); aid = m.get("alert_id") or card_key
     side = side.upper()
-    a = alerts.get(aid) if (alerts is not None and aid) else None
-    claude_side = (a or {}).get("claude_side"); claude_verdict = (a or {}).get("claude_verdict")
-    agent_verdict = m.get("agent_verdict") or (m.get("suggestion") or "—")
-    common = dict(symbol=sym, mode=m.get("mode"), alert_id=aid, suggested_side=sugg, agent_verdict=agent_verdict,
-                  claude_verdict=claude_verdict, claude_side=claude_side, by=str(user), price=m.get("price"), bar=m.get("bar"))
-    if side == "SKIP":
-        journal.log("alert_decision", side="skip", agreed=(sugg is None), agreed_agent=(sugg is None),
-                    agreed_claude=(None if claude_verdict is None else claude_side is None), **common)
-        if alerts is not None: alerts.decide(aid, "skip")
-        return {"line": "SKIPPED", "text": "⏭ skipped", "ok": True, "ticket": None}
-    agreed = (sugg == side)
-    journal.log("alert_decision", side=side, agreed=agreed, agreed_agent=agreed,
-                agreed_claude=(None if claude_verdict is None else (claude_side == side)), **common)
-    if alerts is not None: alerts.decide(aid, side)
     ag = agents.get(sym); g = ag.g if ag is not None else None
     tk = None
     if not getattr(cfg, "dry", False):
@@ -515,34 +511,105 @@ def alert_decision(cfg, agents, journal, alerts, item: dict, side: str, user, no
     sl_txt = f" · SL {sl:.2f} (−{g.pre_stop:g})" if sl is not None else ""
     demo = broker.is_demo() if not getattr(cfg, "dry", False) else None
     n = notify if notify is not None else (ag.notify if ag is not None else None)
+    lots_suggested = float(m.get("lots") or cfg.max_lots)
+    lots_source = "button" if lots is not None else "card"
+    lots_chosen = min(float(lots), cfg.max_lots) if lots is not None else min(lots_suggested, cfg.max_lots)
+    half_size = bool(m.get("half_size") or m.get("chop"))
     if cfg.execution_enabled and (demo or cfg.allow_live) and not getattr(cfg, "dry", False):
-        lots = min(float(m.get("lots") or cfg.max_lots), cfg.max_lots)
-        r = broker.place_market(sym, side, lots, sl, comment=f"aureon {aid}", retry_sleep=retry_sleep)
-        journal.log("order_placed", symbol=sym, mode=m.get("mode"), alert_id=aid, side=side, lots=lots, sl=sl, ok=bool(r.ok),
-                    status=r.status, retcode=r.retcode, ticket=r.ticket, fill=r.price, by=str(user))
-        if ag is not None: ag.attach_alert(aid, side)
+        r = broker.place_market(sym, side, lots_chosen, sl, comment=f"aureon {aid}", retry_sleep=retry_sleep)
+        journal.log("order_placed", symbol=sym, mode=m.get("mode"), alert_id=aid, side=side, lots=lots_chosen, sl=sl, ok=bool(r.ok),
+                    status=r.status, retcode=r.retcode, ticket=r.ticket, fill=r.price, by=str(user),
+                    lots_chosen=lots_chosen, lots_suggested=lots_suggested, lots_source=lots_source, half_size=half_size)
+        if ag is not None: ag.attach_alert(aid, side, card_key=card_key)
         if r.ok:
             card_px = float(m.get("price") or px or 0.0); fill = r.price if r.price is not None else px
             slip = ((fill - card_px) if side == "LONG" else (card_px - fill)) if (fill is not None and card_px) else None
             spread = (r.ask - r.bid) if (r.ask is not None and r.bid is not None) else None
+            size_field = f"{lots_chosen:g} lots ({lots_source}) · suggested {lots_suggested:g} · half size: {'yes' if half_size else 'no'}"
+            capped = lots is not None and float(lots) > cfg.max_lots
+            if capped:
+                size_field += f" · capped at max {cfg.max_lots:g}"
+            order_fields = [_field("Ticket", f"#{r.ticket}" if r.ticket else "—"), _field("Side", side), _field("Lots", f"{lots_chosen:g}"),
+                            _field("Fill", f"{fill:.2f}" if fill is not None else "—"),
+                            _field("Slippage vs card", f"{slip:+.2f}" if slip is not None else "—"),
+                            _field("SL as set", f"{sl:.2f}" if sl is not None else "—"),
+                            _field("Spread at fill", f"{spread:.2f}" if spread is not None else "—"),
+                            _field("Size", size_field),
+                            _field("Time", f"{datetime.now(IST):%H:%M:%S} IST")]
             if n is not None:
-                n.send(f"alert:{sym}:{aid}:ORDER", f"{sym} · MT5 · ORDER PLACED · {side}", [f"alert {aid} · {lots:g} lots at market — the guardian takes it from here"],
-                       fields=[_field("Ticket", f"#{r.ticket}" if r.ticket else "—"), _field("Side", side), _field("Lots", f"{lots:g}"),
-                               _field("Fill", f"{fill:.2f}" if fill is not None else "—"),
-                               _field("Slippage vs card", f"{slip:+.2f}" if slip is not None else "—"),
-                               _field("SL as set", f"{sl:.2f}" if sl is not None else "—"),
-                               _field("Spread at fill", f"{spread:.2f}" if spread is not None else "—"),
-                               _field("Time", f"{datetime.now(IST):%H:%M:%S} IST")],
-                       color=GREEN, footer=f"{ag.S.display_name if ag else cfg.mode} · alert {aid}")
-            return {"line": f"TAKEN {side} · ticket {r.ticket or '—'} · filled {fill:.2f}" if fill is not None else f"TAKEN {side} · ticket {r.ticket or '—'}",
-                    "text": f"✅ placed {side} {lots:g} lots {sym}{sl_txt}", "ok": True, "ticket": r.ticket}
+                n.send(f"alert:{sym}:{aid}:ORDER", f"{sym} · MT5 · ORDER PLACED · {side}", [f"alert {aid} · {lots_chosen:g} lots at market — the guardian takes it from here"],
+                       fields=order_fields, color=GREEN, footer=f"{ag.S.display_name if ag else cfg.mode} · alert {aid}")
+            line = f"TAKEN {side} {lots_chosen:g} lots · ticket {r.ticket or '—'} · filled {fill:.2f}" if fill is not None else f"TAKEN {side} {lots_chosen:g} lots · ticket {r.ticket or '—'}"
+            if capped:
+                line += f" (capped at max {cfg.max_lots:g})"
+            return {"line": line, "text": f"✅ placed {side} {lots_chosen:g} lots {sym}{sl_txt}", "ok": True, "ticket": r.ticket, "placed": True, "lots": lots_chosen}
         return {"line": f"TAKEN {side} · ❌ order rejected ({r.status} {r.retcode or ''} {r.comment}) · place it in MT5, I will manage it{sl_txt}".strip(),
-                "text": f"❌ order rejected ({r.why()}) — place it in MT5, I will manage it{sl_txt}", "ok": False, "ticket": None}
-    if ag is not None: ag.attach_alert(aid, side)
+                "text": f"❌ order rejected ({r.why()}) — place it in MT5, I will manage it{sl_txt}", "ok": False, "ticket": None, "placed": False, "lots": lots_chosen}
+    if ag is not None: ag.attach_alert(aid, side, card_key=card_key)
     why = ("execution off (AUREON_EXECUTION=0)" if not cfg.execution_enabled else
            "dry run" if getattr(cfg, "dry", False) else "live account — set AUREON_ALLOW_LIVE=1 to let the button place it")
     return {"line": f"TAKEN {side} · waiting for your ticket…{sl_txt} (guardian will set it)",
-            "text": f"noted — place it in MT5, I will manage it{sl_txt} · {why}", "ok": True, "ticket": None}
+            "text": f"noted — place it in MT5, I will manage it{sl_txt} · {why}", "ok": True, "ticket": None, "placed": False, "lots": lots_chosen}
+
+
+def alert_decision(cfg, agents, journal, alerts, item: dict, side: str, user, notify=None, retry_sleep: float = 2.0, lots=None) -> dict:
+    """LONG / SHORT / SKIP on an ALERT REACHED card. Runs OFF the event loop. Journals alert_decision; delegates to execute_entry.
+    Returns {"line", "text", "ok", "ticket", "placed", "lots"}."""
+    m = item.get("meta", {}); sym = m.get("symbol"); aid = m.get("alert_id"); sugg = m.get("suggested_side")
+    side = side.upper()
+    lots_suggested = float(m.get("lots") or cfg.max_lots)
+    a = alerts.get(aid) if (alerts is not None and aid) else None
+    claude_side = (a or {}).get("claude_side"); claude_verdict = (a or {}).get("claude_verdict")
+    agent_verdict = m.get("agent_verdict") or (m.get("suggestion") or "—")
+    common = dict(symbol=sym, mode=m.get("mode"), alert_id=aid, suggested_side=sugg, agent_verdict=agent_verdict,
+                  claude_verdict=claude_verdict, claude_side=claude_side, by=str(user), price=m.get("price"), bar=m.get("bar"),
+                  lots_chosen=lots, lots_suggested=lots_suggested)
+    if side == "SKIP":
+        journal.log("alert_decision", side="skip", agreed=(sugg is None), agreed_agent=(sugg is None),
+                    agreed_claude=(None if claude_verdict is None else claude_side is None), **common)
+        if alerts is not None: alerts.decide(aid, "skip")
+        return {"line": "SKIPPED", "text": "⏭ skipped", "ok": True, "ticket": None, "placed": False, "lots": None}
+    agreed = (sugg == side)
+    journal.log("alert_decision", side=side, agreed=agreed, agreed_agent=agreed,
+                agreed_claude=(None if claude_verdict is None else (claude_side == side)), **common)
+    if alerts is not None: alerts.decide(aid, side)
+    return execute_entry(cfg, agents, journal, item, side, user, notify=notify, retry_sleep=retry_sleep, lots=lots)
+
+
+def ask_decision(cfg, agents, journal, item: dict, decision: str, user, notify=None, retry_sleep: float = 2.0, lots=None) -> dict:
+    """TAKE / SKIP on a Confirm card (signal ask). Journals the decision event; TAKE delegates to execute_entry.
+    Returns {"line", "text", "ok", "ticket", "placed", "lots"}."""
+    m = item.get("meta", {})
+    lots_suggested = float(m.get("lots") or cfg.max_lots)
+    journal.log("decision", symbol=m.get("symbol"), mode=m.get("mode"), side=m.get("side"), signal_kind=m.get("kind"),
+                price=m.get("price"), bar=m.get("bar"), decision=decision, by=str(user),
+                lots_chosen=lots, lots_suggested=lots_suggested)
+    item["decided"] = decision
+    if decision == "SKIP":
+        return {"line": "SKIPPED", "text": "⏭ skipped", "ok": True, "ticket": None, "placed": False, "lots": None}
+    return execute_entry(cfg, agents, journal, item, m.get("side", "LONG"), user, notify=notify,
+                         retry_sleep=retry_sleep, card_key=item.get("key"), lots=lots)
+
+
+def lot_button_spec(cfg, meta: dict) -> list[dict]:
+    """v2.3.7: build the lot button descriptors for ENTER / ALERT cards when execution is on.
+    Returns [{"label", "value", "disabled", "star"}] — max 5 buttons. The ★ goes on the button nearest meta["lots"]."""
+    if not cfg.execution_enabled:
+        return []
+    suggested = float(meta.get("lots") or cfg.max_lots)
+    out = []
+    best_dist = None; best_idx = None
+    for v in cfg.lot_buttons:
+        disabled = v > cfg.max_lots
+        label = f"{v:g}" if not disabled else f"{v:g} (>max)"
+        out.append({"label": label, "value": v, "disabled": disabled, "star": False})
+        d = abs(v - suggested)
+        if not disabled and (best_dist is None or d < best_dist):
+            best_dist = d; best_idx = len(out) - 1
+    if best_idx is not None:
+        out[best_idx]["star"] = True
+        out[best_idx]["label"] += "★"
+    return out
 
 
 # ----------------------------------------------------------------------------- v2.0.2 command sync + /pull-history (pure helpers, testable)
@@ -714,28 +781,63 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
     class AskView(discord.ui.View):
         def __init__(self, item):
             super().__init__(timeout=cfg.ask_ttl_min * 60); self.item = item
+            btns = lot_button_spec(cfg, item.get("meta") or {})
+            if btns:
+                # execution on: lot-size buttons instead of TAKE
+                for b in btns:
+                    btn = discord.ui.Button(label=b["label"], custom_id=f"take:{b['value']}", disabled=b["disabled"],
+                                            style=discord.ButtonStyle.success)
+                    btn.callback = self._make_lot_cb(b["value"])
+                    self.add_item(btn)
+                skip_btn = discord.ui.Button(label="SKIP", custom_id="skip", style=discord.ButtonStyle.secondary, emoji="⏭")
+                skip_btn.callback = self._make_skip_cb()
+                self.add_item(skip_btn)
+            else:
+                take_btn = discord.ui.Button(label="TAKE", custom_id="take", style=discord.ButtonStyle.success, emoji="✅")
+                take_btn.callback = self._make_take_cb()
+                self.add_item(take_btn)
+                skip_btn = discord.ui.Button(label="SKIP", custom_id="skip", style=discord.ButtonStyle.secondary, emoji="⏭")
+                skip_btn.callback = self._make_skip_cb()
+                self.add_item(skip_btn)
 
-        async def _answer(self, inter, decision):
+        def _make_lot_cb(self, lot_val):
+            async def cb(inter): await self._answer(inter, "TAKE", lots=lot_val)
+            return cb
+
+        def _make_take_cb(self):
+            async def cb(inter): await self._answer(inter, "TAKE")
+            return cb
+
+        def _make_skip_cb(self):
+            async def cb(inter): await self._answer(inter, "SKIP")
+            return cb
+
+        async def _answer(self, inter, decision, lots=None):
             if self.item.get("decided"):
                 await inter.response.send_message(f"already answered: {self.item['decided']}", ephemeral=True); return
-            _decide(self.item, decision, inter.user)
+            self.item["decided"] = decision
+            await inter.response.defer()
+            r = await asyncio.to_thread(ask_decision, cfg, agents, journal, self.item, decision, inter.user, notify, lots=lots)
             for c in self.children: c.disabled = True
-            em = _ask_embed(self.item)
             m = self.item.get("meta", {})
+            sugg = float(m.get("lots") or cfg.max_lots)
             if decision == "TAKE":
-                em.add_field(name="Decision", value=f"✅ **TAKING {m.get('side')}** · {inter.user.display_name} · {datetime.now(IST):%H:%M} IST — "
-                                                    f"place it in MT5; I'll start managing the moment the ticket appears", inline=False)
-                em.color = GREEN
+                lot_txt = f" {r.get('lots', ''):g} lots (suggested {sugg:g})" if r.get("lots") else ""
+                dec_value = f"✅ **{r['line']}** · {inter.user.display_name} · {datetime.now(IST):%H:%M} IST — {r['text']}"
+                dec_color = GREEN if r.get("ok") else RED
             else:
-                em.add_field(name="Decision", value=f"⏭ skipped · {inter.user.display_name} · {datetime.now(IST):%H:%M} IST", inline=False)
-                em.color = GREY
-            await inter.response.edit_message(embed=em, view=self)
-
-        @discord.ui.button(label="TAKE", style=discord.ButtonStyle.success, emoji="✅")
-        async def take(self, inter, button): await self._answer(inter, "TAKE")
-
-        @discord.ui.button(label="SKIP", style=discord.ButtonStyle.secondary, emoji="⏭")
-        async def skip(self, inter, button): await self._answer(inter, "SKIP")
+                dec_value = f"⏭ skipped · {inter.user.display_name} · {datetime.now(IST):%H:%M} IST"
+                dec_color = GREY
+            self.item["fields"] = [f for f in (self.item.get("fields") or []) if f.get("name") != "Decision"] + \
+                [{"name": "Decision", "value": dec_value[:1024], "inline": False}]
+            em = _ask_embed(self.item); em.color = dec_color
+            try:
+                await self.item["message"].edit(embed=em, view=self)
+            except Exception:
+                try:
+                    await inter.followup.send(content=dec_value[:2000], ephemeral=True)
+                except Exception:
+                    pass
 
         async def on_timeout(self):
             if not self.item.get("decided"):
@@ -785,15 +887,52 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
     class AlertView(discord.ui.View):
         def __init__(self, item):
             super().__init__(timeout=cfg.ask_ttl_min * 60); self.item = item
+            btns = lot_button_spec(cfg, item.get("meta") or {})
+            sugg_side = (item.get("meta") or {}).get("suggested_side")
+            if btns:
+                # execution on: size buttons per side
+                sides = [sugg_side] if sugg_side else ["LONG", "SHORT"]
+                for side in sides:
+                    style = discord.ButtonStyle.success if side == "LONG" else discord.ButtonStyle.danger
+                    for b in btns:
+                        btn = discord.ui.Button(label=f"{side} {b['label']}", custom_id=f"{side.lower()}:{b['value']}", disabled=b["disabled"],
+                                                style=style, row=0 if side == sides[0] else 1)
+                        btn.callback = self._make_lot_cb(side, b["value"])
+                        self.add_item(btn)
+                skip_btn = discord.ui.Button(label="SKIP", custom_id="skip", style=discord.ButtonStyle.secondary, emoji="⏭",
+                                             row=len(sides))
+                skip_btn.callback = self._make_skip_cb()
+                self.add_item(skip_btn)
+            else:
+                long_btn = discord.ui.Button(label="LONG", custom_id="long", style=discord.ButtonStyle.success, emoji="🟢")
+                long_btn.callback = self._make_side_cb("LONG")
+                self.add_item(long_btn)
+                short_btn = discord.ui.Button(label="SHORT", custom_id="short", style=discord.ButtonStyle.danger, emoji="🔴")
+                short_btn.callback = self._make_side_cb("SHORT")
+                self.add_item(short_btn)
+                skip_btn = discord.ui.Button(label="SKIP", custom_id="skip", style=discord.ButtonStyle.secondary, emoji="⏭")
+                skip_btn.callback = self._make_skip_cb()
+                self.add_item(skip_btn)
 
-        async def _answer(self, inter, side):
+        def _make_lot_cb(self, side, lot_val):
+            async def cb(inter): await self._answer(inter, side, lots=lot_val)
+            return cb
+
+        def _make_side_cb(self, side):
+            async def cb(inter): await self._answer(inter, side)
+            return cb
+
+        def _make_skip_cb(self):
+            async def cb(inter): await self._answer(inter, "SKIP")
+            return cb
+
+        async def _answer(self, inter, side, lots=None):
             if self.item.get("decided"):
                 await inter.response.send_message(f"already answered: {self.item['decided']}", ephemeral=True); return
             self.item["decided"] = side
             await inter.response.defer()
-            r = await asyncio.to_thread(alert_decision, cfg, agents, journal, alerts, self.item, side, inter.user, notify)
+            r = await asyncio.to_thread(alert_decision, cfg, agents, journal, alerts, self.item, side, inter.user, notify, lots=lots)
             for c in self.children: c.disabled = True
-            # the decision lives in the card's fields (not only an ephemeral reply) so the history is readable later
             self.item["fields"] = [f for f in (self.item.get("fields") or []) if f.get("name") != "Decision"] + \
                 [{"name": "Decision", "value": f"**{r['line']}** · {inter.user.display_name} · {datetime.now(IST):%H:%M} IST — {r['text']}"[:1024], "inline": False}]
             em = _ask_embed(self.item)
@@ -802,15 +941,6 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
                 await self.item["message"].edit(embed=em, view=self)
             except Exception:
                 pass
-
-        @discord.ui.button(label="LONG", style=discord.ButtonStyle.success, emoji="🟢")
-        async def long_btn(self, inter, button): await self._answer(inter, "LONG")
-
-        @discord.ui.button(label="SHORT", style=discord.ButtonStyle.danger, emoji="🔴")
-        async def short_btn(self, inter, button): await self._answer(inter, "SHORT")
-
-        @discord.ui.button(label="SKIP", style=discord.ButtonStyle.secondary, emoji="⏭")
-        async def skip_btn(self, inter, button): await self._answer(inter, "SKIP")
 
         async def on_timeout(self):
             if not self.item.get("decided"):                      # expired: card edited, nothing journaled
@@ -826,15 +956,17 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
     def _latest_open():
         return next((i for i in reversed(list(pending.values())) if not i.get("decided")), None)
 
-    @tree.command(name="take", description="Accept pending ask; operator places order unless AUREON_EXECUTION=1")
-    async def take_cmd(inter: discord.Interaction):
+    @tree.command(name="take", description="Accept pending ask; places order when AUREON_EXECUTION=1, else arms guardian")
+    @app_commands.describe(lots="Lot size (from AUREON_LOT_BUTTONS); omit to use the card's suggested size")
+    async def take_cmd(inter: discord.Interaction, lots: float | None = None):
         user = inter.user
         def work():
             item = _latest_open()
             if not item:
                 return Reply(content="no open trade question")
-            _decide(item, "TAKE", user)
-            return Reply(content=f"✅ taking **{item['meta'].get('side')}** {item['meta'].get('symbol')} — place it in MT5, I manage it from there")
+            r = ask_decision(cfg, agents, journal, item, "TAKE", user, notify, lots=lots)
+            notify.edit_card(item.get("key"), {"Decision": f"✅ **{r['line']}** · {user.display_name if hasattr(user, 'display_name') else user} · {datetime.now(IST):%H:%M} IST — {r['text']}"[:1024]})
+            return Reply(content=f"✅ {r['line']} — {r['text']}")
         await run(inter, "take", work)
 
     @tree.command(name="skip", description="Skip pending ask; records operator decision")
@@ -1259,8 +1391,23 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
         def work():
             if not ops.admin_allowed(inter.user, os.environ.get("AUREON_ADMIN_ROLE_ID", "")):
                 return Reply(content="Denied: configured administrator role required")
+            # v2.3.6: list what will be resumed
+            lines = []
+            for sym, ag in agents.items():
+                snap = getattr(ag, "snapshot", None) or {}
+                pos = snap.get("positions") or []
+                for p in pos:
+                    st = (snap.get("state") or {}).get(p["ticket"], (snap.get("state") or {}).get(str(p["ticket"]), {}))
+                    sec = st.get("secured", 0)
+                    lines.append(f"#{p['ticket']} {p['direction'].upper()} +{sec:g} secured · {p['points']:+.1f} pts")
+                armed = len(ag.alerts.armed(sym)) if ag.alerts else 0
+                if armed:
+                    lines.append(f"{sym}: {armed} armed alert(s)")
+                if ag.pending_alert:
+                    lines.append(f"{sym}: pending TAKE (alert {ag.pending_alert.get('alert_id')})")
+            summary = "\n".join(lines) if lines else "no open positions, alerts or pending TAKEs"
             _restart_later(inter.user, reason)
-            return Reply(content=f"RESTARTING · requested by {inter.user} · {reason or 'manual'}")
+            return Reply(content=f"RESTARTING · {reason or 'manual'}\n**Will resume:**\n{summary}")
         await run(inter, "restart", work)
 
     @tree.command(name="mode", description="Admin: change EMA process mode and restart; rejects open positions")

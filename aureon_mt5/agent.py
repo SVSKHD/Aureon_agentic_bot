@@ -27,8 +27,46 @@ from .common.news import session_of
 from .common.context_chart import context_chart
 from .strategies.ema5080.trend import find_reentries, state_of
 from . import alerts as alerts_mod
+from .common.chop import chop_state as _chop_state
 import os
 import numpy as np
+
+
+_pending_path = lambda log_dir: os.path.join(log_dir, "pending.json")
+
+
+def _load_pending(log_dir: str, symbol: str, ttl_min: int) -> dict | None:
+    """v2.3.6: load pending TAKE from logs/pending.json for this symbol, if still within TTL."""
+    try:
+        import json as _json
+        with open(_pending_path(log_dir), encoding="utf-8") as f:
+            data = _json.load(f)
+        pa = data.get(symbol.upper())
+        if pa and _time.time() - pa.get("t", 0) <= ttl_min * 60:
+            return pa
+    except Exception:
+        pass
+    return None
+
+
+def _save_pending(log_dir: str, symbol: str, pa: dict | None):
+    """v2.3.6: persist pending TAKE to logs/pending.json atomically."""
+    import json as _json
+    path = _pending_path(log_dir)
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = _json.load(f)
+    except Exception:
+        data = {}
+    if pa is not None:
+        data[symbol.upper()] = pa
+    else:
+        data.pop(symbol.upper(), None)
+    tmp = path + ".tmp"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(tmp, "w", encoding="utf-8") as f:
+        _json.dump(data, f)
+    os.replace(tmp, path)
 
 
 class SymbolAgent(threading.Thread):
@@ -39,7 +77,7 @@ class SymbolAgent(threading.Thread):
         self.claude = claude if (claude is not None and claude.advises(strategy)) else None
         self.claude_any = claude              # v2.0.0: the advisor in ANY mode (review included) — the alert card's add-on line
         self.alerts = alerts if alerts is not None else alerts_mod.AlertStore(cfg.log_dir)   # v2.0.0 /alert store (shared by main)
-        self.pending_alert: dict | None = None   # {"alert_id", "side"}: attach to the next position seen on this symbol
+        self.pending_alert: dict | None = _load_pending(cfg.log_dir, symbol, cfg.ask_ttl_min)   # v2.3.6: survives restart
         self.claude_inbox: "queue.Queue[dict]" = queue.Queue()
         # v2.3.0 Codex add-on: same hooks as Claude; its verdicts are journaled and shown, never applied
         self.codex = codex if (codex is not None and codex.advises(strategy)) else None
@@ -57,6 +95,7 @@ class SymbolAgent(threading.Thread):
         self.last_confirmed_cross: dict | None = None   # v2.0.0 ema2050: {"bar_time", "direction"} — the guardian's exit signal
         self.last_bar: int | None = None
         self.caught_up = False            # late-start catch-up card sent once
+        self._resumed_posted = False      # v2.3.6: RESUMED card once per process start
         self.started_wall = _time.time()
         self.last_bar_wall: float | None = None   # wall clock of the last processed closed bar (heartbeat)
         self.closed_by_aureon: set = set()        # tickets Aureon closed (anything else that disappears was closed by you)
@@ -72,9 +111,11 @@ class SymbolAgent(threading.Thread):
         self.chart_dir = os.path.join(cfg.log_dir, "charts")
         self.last_df = None               # last closed-bar frame with EMAs (for /chart)
         self.last_res = None              # last analysis result (per-bar states for /alert suggestions)
+        self.chop: dict | None = None                  # v2.3.5: {"chop", "crosses", "day", "threshold"}; sticky per server day
         self.health = {"status": "starting", "last_bar": None, "last_poll": None, "errors": 0, "managed": 0,
                        "close": None, "ema_fast": None, "ema_slow": None, "offset_h": self.off, "last_signal": None,
-                       "last_broker_action": None, "guardian": "ON" if g else "OFF (no profile for this mode/symbol)"}
+                       "last_broker_action": None, "guardian": "ON" if g else "OFF (no profile for this mode/symbol)",
+                       "chop": None}
         # v1.9.8: cached status for slash commands (replaced atomically each poll; the bot never calls MT5 for status)
         self.snapshot: dict = {"at": None}
         self._pos_seen: list | None = None
@@ -126,6 +167,7 @@ class SymbolAgent(threading.Thread):
                 if new_bar:
                     self.last_bar = bar_t; self.health["last_bar"] = ist(bar_t, self.off)
                     self.last_bar_wall = _time.time()
+                    self._update_chop(df, bar_t)
                     if not self.caught_up:
                         self.caught_up = True
                         try:
@@ -355,25 +397,73 @@ class SymbolAgent(threading.Thread):
         names = {"asia": "Asia", "london": "London", "ny": "New York", "off": "off-hours"}
         return [field("Track record (4 weeks)", fmt(rows, f"{kind} all sessions") + "\n" + fmt(same, f"{kind} in {names.get(sess, sess)}"), inline=False)]
 
+    # ------------------------------------------------------------------ v2.3.5 chop-day flag
+    def _update_chop(self, df, bar_t):
+        """Recompute chop state once per closed bar. Sticky: once chop=True for a server day, it stays True."""
+        cf, cs = self.S.ema_cols
+        cs_new = _chop_state(df, cf, cs, self.off, self.cfg.chop_crosses)
+        prev = self.chop
+        if prev is not None and prev.get("chop") and prev.get("day") == cs_new["day"]:
+            cs_new["chop"] = True  # sticky for the day
+            cs_new["crosses"] = max(cs_new["crosses"], prev["crosses"])
+        was_chop = prev is not None and prev.get("chop") and prev.get("day") == cs_new["day"]
+        if cs_new["chop"] and not was_chop:
+            self.journal.log("chop_day", symbol=self.symbol, mode=self.S.name, day=cs_new["day"],
+                             crosses=cs_new["crosses"], bar=bar_t)
+            self.notify.send(self.key("CHOP", cs_new["day"]), ctitle(self.symbol, "CHOP DAY"),
+                             [f"{cs_new['crosses']} crosses before 11:00 server — ENTER cards today carry a warning and half size",
+                              "deterministic · no AI"],
+                             color=EVENT_COLOURS.get("info", 0xFEE75C),
+                             footer=cfooter(self.S.display_name, "deterministic · no AI"))
+        self.chop = cs_new
+        self.health["chop"] = f"CHOP ({cs_new['crosses']} crosses <11:00)" if cs_new["chop"] else None
+
+    def _is_chop(self) -> bool:
+        return bool(self.chop and self.chop.get("chop"))
+
+    def _chop_crosses(self) -> int:
+        return self.chop["crosses"] if self.chop else 0
+
+    def _streak_n(self) -> int:
+        """Consecutive losing closed deals (last 3 days), cached per bar."""
+        cache = getattr(self, "_streak_n_cache", None)
+        if cache is not None and cache[0] == self.last_bar:
+            return cache[1]
+        n = 0
+        try:
+            deals = sorted(broker.closed_deals(None, datetime.now(timezone.utc) - timedelta(days=3), datetime.now(timezone.utc) + timedelta(minutes=1)),
+                           key=lambda d: d["time"])
+            for d in reversed(deals):
+                if d["profit"] < 0: n += 1
+                else: break
+        except Exception:
+            n = 0
+        self._streak_n_cache = (self.last_bar, n)
+        return n
+
+    def _half_size(self) -> bool:
+        return self.cfg.streak_half_after > 0 and self._streak_n() >= self.cfg.streak_half_after
+
     def _streak(self) -> str | None:
         """Consecutive losing closed trades (last 3 days, all symbols). Card once when it reaches 2."""
         cache = getattr(self, "_streak_cache", None)
         if cache is not None and cache[0] == self.last_bar:
             return cache[1]
+        n = self._streak_n()
         msg = None
-        try:
-            deals = sorted(broker.closed_deals(None, datetime.now(timezone.utc) - timedelta(days=3), datetime.now(timezone.utc) + timedelta(minutes=1)),
-                           key=lambda d: d["time"])
-            n = 0
-            for d in reversed(deals):
-                if d["profit"] < 0: n += 1
-                else: break
-            if n >= 2:
+        if n >= 2:
+            half = self._half_size()
+            if half:
+                msg = f"🔻 {n} losses in a row — **half size** applied to the next one"
+            else:
                 msg = f"🔻 {n} losses in a row — next one at half size?"
+            try:
+                deals = sorted(broker.closed_deals(None, datetime.now(timezone.utc) - timedelta(days=3), datetime.now(timezone.utc) + timedelta(minutes=1)),
+                               key=lambda d: d["time"])
                 self.notify.send(self.key("STREAK", f"{n}-{deals[-1]['time']}"), ctitle(self.symbol, f"{n} LOSSES IN A ROW"),
                                  [msg, "advisory only — signals continue"], color=EVENT_COLOURS["closed_loss"], footer=cfooter(self.S.display_name, "risk"))
-        except Exception:
-            msg = None
+            except Exception:
+                pass
         self._streak_cache = (self.last_bar, msg)
         return msg
 
@@ -387,22 +477,41 @@ class SymbolAgent(threading.Thread):
         if stk: f.append(field("Streak", stk, inline=False))
         return f
 
-    def _suggested(self, stop_distance: float) -> dict:
+    def _risk_lots(self, stop_distance: float) -> dict:
+        """Lot sizing with optional half-size on a losing streak or chop day (halve once, not twice).
+        Returns {"lots", "half", "half_reason", "raw"}."""
+        streak_half = self._half_size()
+        chop_half = self._is_chop()
+        half = streak_half or chop_half
+        risk = self.cfg.risk_pct / 2 if half else self.cfg.risk_pct
         try:
-            r = broker.lot_for_risk(self.symbol, abs(stop_distance), self.cfg.risk_pct) if not self.dry else None
+            r = broker.lot_for_risk(self.symbol, abs(stop_distance), risk) if not self.dry else None
         except Exception:
             r = None
-        return {"lots": min(r["lots"], self.cfg.max_lots) if r else None}
+        lots = min(r["lots"], self.cfg.max_lots) if r else None
+        reason = ""
+        if streak_half and chop_half:
+            reason = f"chop day · {self._streak_n()} losses in a row"
+        elif chop_half:
+            reason = "chop day"
+        elif streak_half:
+            reason = f"{self._streak_n()} losses in a row"
+        return {"lots": lots, "half": half, "half_reason": reason, "raw": r}
+
+    def _suggested(self, stop_distance: float) -> dict:
+        rl = self._risk_lots(stop_distance)
+        return {"lots": rl["lots"]}
 
     def _lot_field(self, stop_distance: float):
         """AUREON-005: 'risk 1% → 0.08 lots' — display only, never sizes an order."""
-        try:
-            r = broker.lot_for_risk(self.symbol, abs(stop_distance), self.cfg.risk_pct) if not self.dry else None
-        except Exception:
-            r = None
+        rl = self._risk_lots(stop_distance)
+        r = rl["raw"]
         if not r:
             return []
-        return [field("Size", f"**{r['lots']:g} lots** = {r['risk_pct']:g}% risk ({r['risk_money']:,.0f} {r['currency']}) for a {r['stop']:.1f} stop", inline=False)]
+        line = f"**{r['lots']:g} lots** = {r['risk_pct']:g}% risk ({r['risk_money']:,.0f} {r['currency']}) for a {r['stop']:.1f} stop"
+        if rl["half"]:
+            line += f" · **half size** ({rl['half_reason']})"
+        return [field("Size", line, inline=False)]
 
     # ------------------------------------------------------------------ trend states + re-entries (ema5080)
     def _turning(self, df, bar_t, trend_side: str) -> str | None:
@@ -469,12 +578,22 @@ class SymbolAgent(threading.Thread):
             r = res[-1]; self.seen_re.add(r.time)
             s_ = 1 if r.side == "LONG" else -1
             self.health["last_signal"] = f"{r.side} RE @ {ist(bar_t, self.off)}"
-            self.journal.log("signal", symbol=self.symbol, mode=self.S.name, side=r.side, signal_kind="reentry", price=r.price, bar=bar_t)
+            _chop = self._is_chop(); _chop_n = self._chop_crosses()
+            self.journal.log("signal", symbol=self.symbol, mode=self.S.name, side=r.side, signal_kind="reentry", price=r.price, bar=bar_t,
+                             chop=_chop, chop_crosses=_chop_n)
             self.latest_signal = {"bar_time": bar_t, "symbol": self.symbol, "strategy": self.S.name, "kind": "reentry", "direction": r.side, "consumed": False}
             if not self.leg or self.leg["side"] != r.side:
                 self.leg = {"side": r.side, "kind": "reentry", "start_t": bar_t, "start_i_time": bar_t, "start_px": r.price,
                             "best": 0.0, "best_px": r.price, "best_t": bar_t, "against": 0.0, "steps_sent": 0}
             stop = r.pullback_extreme - s_ * 0.5                       # just beyond the pullback extreme
+            re_fields = [field("Side", f"**{r.side}**"), field("Price", f"**{r.price:.2f}**"), field("Bar", f"{ist(bar_t, self.off)} IST"),
+                         field(f"EMA {self.S.fast}", f"{r.ema50:.2f}"), field(f"EMA {self.S.slow}", f"{r.ema80:.2f}"),
+                         field("Pullback reached", f"{r.pullback_extreme:.2f}"),
+                         field("Stop", f"{stop:.2f} (beyond the pullback)", inline=False)]
+            if g:
+                re_fields.append(field("Secure", f"at {r.price + s_ * g.secure_at:.2f} (+{g.secure_at:g}) → then ride", inline=False))
+            if _chop:
+                re_fields.append(field("⚠️ Chop day", f"{_chop_n} crosses before 11:00 server — half size suggested", inline=False))
             png = context_chart(df, self.symbol, self.S.display_name, self.S.fast, self.S.slow, self.S.ema_cols, self.off, self.chart_dir,
                                 bars=120, title_extra="re-entry", reentries=[{"index": r.index, "side": r.side}],
                                 marker={"index": r.index, "side": r.side, "label": "RE", "stop": stop,
@@ -482,15 +601,10 @@ class SymbolAgent(threading.Thread):
             re_key = self.key(f"RE_{r.side}", bar_key(bar_t, self.off))
             self.notify.ask(re_key, ctitle(self.symbol, "RE-ENTRY", r.side),
                             [f"pullback to EMA {self.S.fast} rejected — trend continues", f"**Trade {r.side} now?**"], png=png,
-                            fields=[field("Side", f"**{r.side}**"), field("Price", f"**{r.price:.2f}**"), field("Bar", f"{ist(bar_t, self.off)} IST"),
-                                    field(f"EMA {self.S.fast}", f"{r.ema50:.2f}"), field(f"EMA {self.S.slow}", f"{r.ema80:.2f}"),
-                                    field("Pullback reached", f"{r.pullback_extreme:.2f}"),
-                                    field("Stop", f"{stop:.2f} (beyond the pullback)", inline=False)]
-                                   + ([field("Secure", f"at {r.price + s_ * g.secure_at:.2f} (+{g.secure_at:g}) → then ride", inline=False)] if g else [])
-                                   + self._lot_field(r.price - stop) + self._evidence_field("reentry", r.side, bar_t) + self._context_fields(df),
+                            fields=re_fields + self._lot_field(r.price - stop) + self._evidence_field("reentry", r.side, bar_t) + self._context_fields(df),
                             color=EVENT_COLOURS["signal_long" if r.side == "LONG" else "signal_short"], footer=cfooter(self.S.display_name, "re-entry"),
                             meta={"symbol": self.symbol, "side": r.side, "kind": "reentry", "price": r.price, "bar": bar_t, "mode": self.S.name,
-                                  "sl": stop, **self._suggested(r.price - stop)})
+                                  "sl": stop, "chop": _chop, "chop_crosses": _chop_n, **self._suggested(r.price - stop)})
             for adv in self.advisors():
                 adv.request_entry(self, "reentry", r.side, bar_t, df, card_key=re_key)
 
@@ -643,13 +757,17 @@ class SymbolAgent(threading.Thread):
                 self.leg = {"side": side, "kind": kind, "start_t": bar_t, "start_i_time": bar_t, "start_px": close,
                             "best": 0.0, "best_px": close, "best_t": bar_t, "against": 0.0, "steps_sent": 0}
             self.health["last_signal"] = f"{side} {kind} @ {ist(bar_t, self.off)}"
-            self.journal.log("signal", symbol=self.symbol, mode=self.S.name, side=side, signal_kind=kind, price=close, bar=bar_t)
+            _chop = self._is_chop(); _chop_n = self._chop_crosses()
+            self.journal.log("signal", symbol=self.symbol, mode=self.S.name, side=side, signal_kind=kind, price=close, bar=bar_t,
+                             chop=_chop, chop_crosses=_chop_n)
             g = self.g
             fields = signal_fields(side=side, kind={"P": "P · pre-cross", "cross": "50/80 cross confirmed", "late": "late entry", "pullback": "pullback entry"}.get(kind, kind),
                                    price=close, ema_fast=ef, ema_slow=es, fast=self.S.fast, slow=self.S.slow,
                                    stop=(close - s * g.pre_stop) if g else None, secure_at=(close + s * g.secure_at) if g else None,
                                    bar_ist=ist(bar_t, self.off))
             note = "place it — I manage it" if g else "signal only — no guardian profile for this mode/symbol"
+            if _chop:
+                fields.append(field("⚠️ Chop day", f"{_chop_n} crosses before 11:00 server — half size suggested", inline=False))
             png = context_chart(df, self.symbol, self.S.display_name, self.S.fast, self.S.slow, self.S.ema_cols, self.off, self.chart_dir,
                                 marker={"index": last, "side": side, "label": kind.upper(),
                                         "stop": (close - s * g.pre_stop) if g else None, "secure": (close + s * g.secure_at) if g else None})
@@ -657,7 +775,8 @@ class SymbolAgent(threading.Thread):
             ask_key = self.key(f"{kind.upper()}_{side}", bar_key(bar_t, self.off))
             self.notify.ask(ask_key, ctitle(self.symbol, {"P": "P PRE-CROSS", "cross": "CONFIRMED CROSS", "late": "LATE ENTRY", "pullback": "PULLBACK ENTRY"}.get(kind, kind), side), [note, f"**Trade {side} now?**"], png=png,
                              meta={"symbol": self.symbol, "side": side, "kind": kind, "price": close, "bar": bar_t, "mode": self.S.name,
-                                   "sl": (close - s * g.pre_stop) if g else None, **(self._suggested(g.pre_stop) if g else {})},
+                                   "sl": (close - s * g.pre_stop) if g else None, "chop": _chop, "chop_crosses": _chop_n,
+                                   **(self._suggested(g.pre_stop) if g else {})},
                              fields=fields, color=EVENT_COLOURS["signal_long" if side == "LONG" else "signal_short"],
                              footer=cfooter(self.S.display_name, f"bar {ist(bar_t, self.off)}"))
             if kind in ("P", "cross"):                                       # v1.10.0: enqueue only — never blocks the poll
@@ -704,9 +823,14 @@ class SymbolAgent(threading.Thread):
             telemetry.failure(self.notify, self.journal, title="AUREON ALERT ERROR", key=self.key("ERROR", "alerts"), mode=self.S.name,
                               symbol=self.symbol, action="alert check", exc=e)
 
-    def attach_alert(self, alert_id: str, side: str):
-        """A LONG/SHORT button without execution: 'place it in MT5, I will manage it' — the next position seen carries the alert id."""
-        self.pending_alert = {"alert_id": alert_id, "side": side.upper(), "t": _time.time()}
+    def attach_alert(self, alert_id: str, side: str, card_key: str | None = None):
+        """A LONG/SHORT button or TAKE: 'place it in MT5, I will manage it' — the next position seen carries the alert id."""
+        self.pending_alert = {"alert_id": alert_id, "side": side.upper(), "t": _time.time(), "card_key": card_key}
+        _save_pending(self.cfg.log_dir, self.symbol, self.pending_alert)
+
+    def _save_state_now(self):
+        """Immediate save after a critical state mutation (secured, early lock, ride step, etc.)."""
+        self.journal.save_state(self.symbol, self.state)
 
     # ------------------------------------------------------------------ detection, EMA 20/50 (v2.0.0)
     def _detect_2050(self, res, df, bar_t, close, ef, es):
@@ -765,8 +889,10 @@ class SymbolAgent(threading.Thread):
                     self.leg = {"side": side, "kind": kind, "start_t": bar_t, "start_i_time": bar_t, "start_px": close,
                                 "best": 0.0, "best_px": close, "best_t": bar_t, "against": 0.0, "steps_sent": 0}
                 self.health["last_signal"] = f"{side} enter ({kind}) @ {ist(bar_t, off)}"
+                _chop = self._is_chop(); _chop_n = self._chop_crosses()
                 self.journal.log("signal", symbol=self.symbol, mode=self.S.name, side=side, signal_kind=kind, price=close, bar=bar_t,
-                                 cross_bar=info.get("cross_time"), confirm_bar=info.get("confirm_time"), shoot=info.get("shoot"))
+                                 cross_bar=info.get("cross_time"), confirm_bar=info.get("confirm_time"), shoot=info.get("shoot"),
+                                 chop=_chop, chop_crosses=_chop_n)
                 stop = (close - s * g.pre_stop) if g else None
                 fields = ([field("Side", f"**{side}**"), field("Setup", f"confirmed cross · {kind} entry"), field("Price", f"**{close:.2f}**")]
                           + info_fields(info)
@@ -774,6 +900,8 @@ class SymbolAgent(threading.Thread):
                               field("Secure", f"at {close + s * g.secure_at:.2f} (+{g.secure_at:g}) → SL +{g.secure_level:g} · then ride +{g.ride_step:g} steps · "
                                               f"close on an EMA {self.S.fast} turn once secured · exit on the next confirmed cross", inline=False)] if g else []))
                 note = "place it — I manage it" if g else "signal only — no guardian profile for this symbol"
+                if _chop:
+                    fields.append(field("⚠️ Chop day", f"{_chop_n} crosses before 11:00 server — half size suggested", inline=False))
                 png = context_chart(df, self.symbol, self.S.display_name, self.S.fast, self.S.slow, self.S.ema_cols, off, self.chart_dir,
                                     marker={"index": last, "side": side, "label": "ENTER", "stop": stop,
                                             "secure": (close + s * g.secure_at) if g else None})
@@ -781,7 +909,7 @@ class SymbolAgent(threading.Thread):
                 ask_key = self.key(f"ENTER_{side}", bk)
                 self.notify.ask(ask_key, ctitle(self.symbol, f"ENTER {side} ({kind})"), [note, f"**Trade {side} now?**"], png=png,
                                 meta={"symbol": self.symbol, "side": side, "kind": kind, "price": close, "bar": bar_t, "mode": self.S.name,
-                                      "sl": stop, **(self._suggested(g.pre_stop) if g else {})},
+                                      "sl": stop, "chop": _chop, "chop_crosses": _chop_n, **(self._suggested(g.pre_stop) if g else {})},
                                 fields=fields, color=colour, footer=cfooter(self.S.display_name, f"bar {ist(bar_t, off)}"))
                 for adv in self.advisors():                                    # the ENTER bar only — never raw CROSS / MULTI
                     adv.request_entry(self, "enter", side, bar_t, df, card_key=ask_key)
@@ -874,13 +1002,27 @@ class SymbolAgent(threading.Thread):
             s = 1 if p["direction"] == "long" else -1
             alert_id = None
             if p["ticket"] not in self.state:                    # v1.11.0: first sight of a trade (compare: 'Me · TAKEN')
+                # v2.3.6: try journal reconstruction before creating fresh state
+                rebuilt, src = self.journal.rebuild_state_for_ticket(p["ticket"])
+                if rebuilt is not None:
+                    rebuilt["secured"] = max(rebuilt.get("secured", 0.0), self._locked(p))  # live SL is the truth
+                    self.state[p["ticket"]] = rebuilt
+                    self.journal.log("state_rebuilt", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"],
+                                     source=src, secured=rebuilt["secured"], peak=rebuilt.get("peak", 0),
+                                     alert_id=rebuilt.get("alert_id"))
+                else:
+                    self.journal.log("state_rebuilt", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"],
+                                     source="none")
                 pa = self.pending_alert
                 if pa and pa["side"] == ("LONG" if s > 0 else "SHORT") and _time.time() - pa["t"] <= self.cfg.ask_ttl_min * 60:
-                    alert_id = pa["alert_id"]; self.pending_alert = None          # v2.0.0: the trade you placed for an alert
+                    alert_id = pa["alert_id"]; pa_card_key = pa.get("card_key")
+                    self.pending_alert = None; _save_pending(self.cfg.log_dir, self.symbol, None)   # consumed
+                else:
+                    pa_card_key = None
                 self.journal.log("position_seen", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"],
                                  side="LONG" if s > 0 else "SHORT", entry=p["price_open"], open_time=p.get("time"), alert_id=alert_id)
                 if alert_id:                                                       # v2.0.2: the card shows the ticket (≤ 1 poll)
-                    self.notify.edit_card(alerts_mod.key_for(self.symbol, alert_id),
+                    self.notify.edit_card(pa_card_key or alerts_mod.key_for(self.symbol, alert_id),
                                           {"Decision": f"ATTACHED · ticket {p['ticket']} · {p['direction'].upper()} @ {p['price_open']:.2f}"
                                                        f" · SL {p['sl'] if p['sl'] else '— (protecting)'} · {ist(bar_t, self.off)} IST"})
                     if p["sl"]:                                                    # SL came with the order: say so (the guardian's PROTECTED card)
@@ -928,7 +1070,7 @@ class SymbolAgent(threading.Thread):
             if g.early_at is not None and st["secured"] < g.early_level and st["peak"] >= g.early_at:
                 sl = p["price_open"] + s * g.early_level
                 if self._move_sl(p, sl, f"EARLY LOCK +{g.early_level:g}"):
-                    st["secured"] = g.early_level                                              # 1. state
+                    st["secured"] = g.early_level; self._save_state_now()                      # 1. state (immediate)
                     self.journal.log("early_lock", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], level=g.early_level,
                                      peak=st["peak"], price=p["current"])                      # 2. journal
                     self.notify.send(self.key("EARLY_LOCK", p["ticket"]), ctitle(self.symbol, f"EARLY LOCK +{g.early_level:g}", p["direction"]),
@@ -939,7 +1081,7 @@ class SymbolAgent(threading.Thread):
 
             # 2) P phase → cross confirmed: SL to the slow EMA ± buffer (tighten only)
             if st["pre"] and sgn == s:
-                st["pre"] = False
+                st["pre"] = False; self._save_state_now()
                 sl = es - s * g.ema_slow_sl_buffer
                 ok = self._move_sl(p, sl, "CROSS SL")
                 self.journal.log("cross_confirmed", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], sl=sl, ok=ok)
@@ -955,7 +1097,7 @@ class SymbolAgent(threading.Thread):
             if st["secured"] < g.secure_level and p["points"] >= g.secure_at:
                 sl = p["price_open"] + s * g.secure_level
                 if self._move_sl(p, sl, f"SECURE +{g.secure_level:g}"):
-                    st["secured"] = g.secure_level                                             # 1. state
+                    st["secured"] = g.secure_level; self._save_state_now()                     # 1. state (immediate)
                     if self.cfg.partial_close_pct > 0 and not st.get("partial_done") and not self.dry:                # AUREON-012
                         pr = broker.close_partial(p["ticket"], self.symbol, self.cfg.partial_close_pct / 100.0)
                         st["partial_done"] = True
@@ -978,7 +1120,7 @@ class SymbolAgent(threading.Thread):
                 if p["points"] >= nxt + g.ride_step * 0.4:
                     sl = p["price_open"] + s * nxt
                     if self._move_sl(p, sl, f"RIDE +{nxt:g}"):
-                        st["secured"] = nxt
+                        st["secured"] = nxt; self._save_state_now()                  # immediate
                         self.journal.log("secured", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], level=nxt, step=g.ride_step, price=p["current"])
                         self.notify.send(self.key("SECURED", f"{p['ticket']}-{nxt:g}"), ctitle(self.symbol, f"SECURED +{nxt:g}", p["direction"]), ["lock stepped up"],
                                          fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"], points=p["points"], sl=sl, secured=nxt, peak=st["peak"]),
@@ -1049,4 +1191,34 @@ class SymbolAgent(threading.Thread):
             sig["consumed"] = True                       # nothing to flip; signal spent
         for adv in self.advisors():                      # v1.10.0: advisor verdicts AFTER the guardian — its hard exits win
             adv.drain(self, pos)                         # v2.3.0: Claude first (may apply in manage), then Codex (shown only)
+        # v2.3.6: RESUMED card once after (re)start when positions are present
+        if pos and not self._resumed_posted:
+            self._resumed_posted = True
+            armed = len(self.alerts.armed(self.symbol)) if self.alerts else 0
+            rlines = []
+            for p in pos:
+                st = self.state.get(p["ticket"], {})
+                sec = st.get("secured", 0.0); pk = st.get("peak", 0.0)
+                if sec >= (g.secure_level if g else 1e9):
+                    ph = f"RIDING +{sec:g}"
+                elif sec >= (g.early_level if g else 1e9):
+                    ph = f"SECURED +{sec:g}"
+                elif sec > 0:
+                    ph = f"EARLY +{sec:g}"
+                else:
+                    ph = "PROTECT"
+                src = "state file"
+                if any(r.get("event") == "state_rebuilt" and r.get("ticket") == p["ticket"] for r in self.journal.read(int(self.started_wall))):
+                    rb = next((r for r in self.journal.read(int(self.started_wall)) if r.get("event") == "state_rebuilt" and r.get("ticket") == p["ticket"]), None)
+                    src = rb.get("source", "state file") if rb else "state file"
+                frozen = " · MODE MISMATCH (read-only)" if st.get("frozen") else ""
+                rlines.append(f"#{p['ticket']} {p['direction'].upper()} @ {p['price_open']:.2f} · {p['points']:+.1f} pts · "
+                              f"{ph} · SL {p['sl'] or '—'} · source: {src}{frozen}")
+            self.notify.send(self.key("RESUMED", f"{pos[0]['ticket']}-{int(self.started_wall)}"),
+                             ctitle(self.symbol, "RESUMED"),
+                             rlines + ([f"alerts armed: {armed}"] if armed else []),
+                             color=EVENT_COLOURS.get("info", 0xFEE75C),
+                             footer=cfooter(self.S.display_name, "restart-safe"))
+        elif not pos:
+            self._resumed_posted = True  # no positions — nothing to resume
         self.journal.save_state(self.symbol, self.state)

@@ -146,7 +146,7 @@ def test_order_placed_card_and_journal(tmp_path, monkeypatch):
                      "agent_verdict": "AGENT: LONG — x"}}
     r.store.arm("XAUUSD", 4000.0, 4010.0)
     res = bot.alert_decision(r.cfg, r.agents, r.j, r.store, item, "LONG", "me", notify=r.n)
-    assert res["ok"] and res["ticket"] == 1234567 and res["line"] == "TAKEN LONG · ticket 1234567 · filled 4000.90"
+    assert res["ok"] and res["ticket"] == 1234567 and res["line"] == "TAKEN LONG 0.5 lots · ticket 1234567 · filled 4000.90"
     o = [x for x in r.j.read(0) if x["event"] == "order_placed"][-1]
     assert o["ok"] is True and o["ticket"] == 1234567 and abs(o["fill"] - 4000.9) < 1e-9
     t = next(t for t in r.n.titles if "ORDER PLACED · LONG" in t); body = r.n.bodies[r.n.titles.index(t)]

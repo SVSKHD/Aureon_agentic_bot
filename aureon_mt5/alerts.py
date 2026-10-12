@@ -146,16 +146,31 @@ class AlertStore:
         return False
 
     def check(self, symbol: str, bid: float, ask: float, bar_time: int | None = None) -> list[dict]:
-        """Mark and return the armed alerts the tick just crossed. Each alert fires once, ever."""
+        """Mark and return the armed alerts the tick just crossed. Each alert fires once, ever.
+        v2.3.6: also detects gap crossings (price crossed while Aureon was down)."""
         fired = []
+        sym = symbol.upper()
         with self._lock:
-            for a in self._data["alerts"].get(symbol.upper(), []):
-                if a["status"] != "armed" or not self.crossed(a, bid, ask):
+            last = self._data.get("last_tick", {}).get(sym)
+            for a in self._data["alerts"].get(sym, []):
+                if a["status"] != "armed":
                     continue
-                a.update(status="fired", hit_price=ask if a["side_hint"] == "from below" else bid, fired_t=int(_time.time()), fired_bar=bar_time)
+                if not self.crossed(a, bid, ask):
+                    continue
+                hp = ask if a["side_hint"] == "from below" else bid
+                extra = {}
+                # v2.3.6 gap detection: if the last known tick was on the non-crossed side, note the gap
+                if last is not None and not self.crossed(a, last.get("bid", bid), last.get("ask", ask)):
+                    extra["gap_note"] = f"crossed while Aureon was down (last seen {last.get('bid', 0):.2f}/{last.get('ask', 0):.2f} at {last.get('time', '?')})"
+                a.update(status="fired", hit_price=hp, fired_t=int(_time.time()), fired_bar=bar_time, **extra)
                 fired.append(dict(a))
+            # throttled last_tick save: on change > 0.5 pt or no previous
+            if last is None or abs(bid - last.get("bid", 0)) > 0.5 or abs(ask - last.get("ask", 0)) > 0.5:
+                self._data.setdefault("last_tick", {})[sym] = {"bid": bid, "ask": ask, "time": int(_time.time())}
             if fired:
                 self._save()
+            elif last is None:
+                self._save()  # first tick stored
         return fired
 
 

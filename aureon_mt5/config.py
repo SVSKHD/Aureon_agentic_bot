@@ -6,7 +6,19 @@ from dataclasses import dataclass, field
 from dotenv import load_dotenv
 load_dotenv()   # load .env if present
 
-VERSION = "2.3.3"
+VERSION = "2.3.7"
+
+
+def _parse_lot_buttons(raw: str) -> list[float]:
+    vals = []
+    for x in raw.split(","):
+        x = x.strip()
+        if not x:
+            continue
+        f = float(x)
+        if f > 0 and f not in vals:
+            vals.append(f)
+    return sorted(vals)[:5] or [0.5, 1.0, 1.5]
 
 
 @dataclass
@@ -36,6 +48,7 @@ class Config:
     execution_enabled: bool = os.environ.get("AUREON_EXECUTION", "0") == "1"
     allow_live: bool = os.environ.get("AUREON_ALLOW_LIVE", "0") == "1"
     max_lots: float = float(os.environ.get("AUREON_MAX_LOTS", "1.0"))
+    lot_buttons: list[float] = field(default_factory=lambda: _parse_lot_buttons(os.environ.get("AUREON_LOT_BUTTONS", "0.5,1.0,1.5")))
     # AUREON-012 partial close at secure (0 = off)
     partial_close_pct: float = float(os.environ.get("AUREON_PARTIAL_PCT", "0"))
     # AUREON-013 weekly store: SUPABASE_URL + SUPABASE_SERVICE_KEY in .env (read by supabase_sync.py)
@@ -44,6 +57,8 @@ class Config:
     # "realtime": also push signals/decisions as they happen and sync nightly. Reports are always computed locally on demand.
     supabase_mode: str = os.environ.get("AUREON_SUPABASE_MODE", "weekly")
     watchdog_ping: bool = os.environ.get("AUREON_WATCHDOG", "0") == "1"     # minute heartbeat to Supabase — off on the free plan
+    streak_half_after: int = int(os.environ.get("AUREON_STREAK_HALF_AFTER", "0"))
+    chop_crosses: int = int(os.environ.get("AUREON_CHOP_CROSSES", "5"))
     # your manual SL rules: if you placed an SL wider than the guardian's P-phase stop, the guardian does not close at −pre_stop
     respect_manual_sl: bool = os.environ.get("AUREON_RESPECT_MANUAL_SL", "1") == "1"
     # Codex read-only advisor (Discord on-demand; never blocks signals or guardian)
