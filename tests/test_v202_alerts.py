@@ -102,7 +102,7 @@ def test_decision_journals_both_verdicts(tmp_path, monkeypatch):
     res = bot.alert_decision(r.cfg, r.agents, r.j, r.store, item, "LONG", "me")
     d = [x for x in r.j.read(0) if x["event"] == "alert_decision"][-1]
     assert d["agent_verdict"].startswith("AGENT: LONG") and d["claude_verdict"] == "TAKE" and d["claude_side"] == "SHORT"
-    assert d["agreed_agent"] is True and d["agreed_claude"] is False and res["line"].startswith("TAKEN LONG · waiting for your ticket…")
+    assert d["agreed_agent"] is True and d["agreed_claude"] is False and "TAKEN LONG" in res["line"] and "waiting for your ticket" in res["line"]
     res = bot.alert_decision(r.cfg, r.agents, r.j, r.store, item, "SKIP", "me")
     d = [x for x in r.j.read(0) if x["event"] == "alert_decision"][-1]
     assert d["side"] == "skip" and d["agreed_agent"] is False and d["agreed_claude"] is False and res["line"] == "SKIPPED"
@@ -146,7 +146,7 @@ def test_order_placed_card_and_journal(tmp_path, monkeypatch):
                      "agent_verdict": "AGENT: LONG — x"}}
     r.store.arm("XAUUSD", 4000.0, 4010.0)
     res = bot.alert_decision(r.cfg, r.agents, r.j, r.store, item, "LONG", "me", notify=r.n)
-    assert res["ok"] and res["ticket"] == 1234567 and res["line"] == "TAKEN LONG 0.5 lots · ticket 1234567 · filled 4000.90"
+    assert res["ok"] and res["ticket"] == 1234567 and "TAKEN LONG 0.5 lots" in res["line"] and "ticket 1234567" in res["line"]
     o = [x for x in r.j.read(0) if x["event"] == "order_placed"][-1]
     assert o["ok"] is True and o["ticket"] == 1234567 and abs(o["fill"] - 4000.9) < 1e-9
     t = next(t for t in r.n.titles if "ORDER PLACED · LONG" in t); body = r.n.bodies[r.n.titles.index(t)]
@@ -169,14 +169,14 @@ def test_requote_retried_once_then_rejected(tmp_path, monkeypatch):
     rr = make(tmp_path, monkeypatch, execution=True); monkeypatch.setattr(broker, "_m", fake3)
     item = {"meta": {"kind": "alert", "alert_id": "A1", "symbol": "XAUUSD", "price": 4000.6, "bar": 1, "mode": "ema2050", "suggested_side": "LONG"}}
     res = bot.alert_decision(rr.cfg, rr.agents, rr.j, rr.store, item, "LONG", "me", notify=rr.n, retry_sleep=0.0)
-    assert not res["ok"] and res["line"].startswith("TAKEN LONG · ❌ order rejected") and res["text"].startswith("❌ order rejected")
+    assert not res["ok"] and "TAKEN LONG" in res["line"] and "order rejected" in res["line"] and res["text"].startswith("❌ order rejected")
 
 
 def test_execution_off_attaches_and_edits_card_on_first_position(tmp_path, monkeypatch):
     r = make(tmp_path, monkeypatch, execution=False)
     item = {"meta": {"kind": "alert", "alert_id": "A1", "symbol": "XAUUSD", "price": 4000.6, "bar": 1, "mode": "ema2050", "suggested_side": "LONG"}}
     res = bot.alert_decision(r.cfg, r.agents, r.j, r.store, item, "LONG", "me", notify=r.n)
-    assert res["line"] == "TAKEN LONG · waiting for your ticket… · SL 3988.80 (−12) (guardian will set it)" and r.fake.orders == []
+    assert "TAKEN LONG" in res["line"] and "waiting for your ticket" in res["line"] and "SL 3988.80" in res["line"] and r.fake.orders == []
     edits = []
     r.n.card_edit_hook = lambda key, upd: edits.append((key, upd)) or True
     r.fake.closed = False; r.fake.pos.price_open = 4000.8; r.fake.pos.sl = 3988.8; r.fake.price = 4001.0

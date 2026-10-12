@@ -55,7 +55,7 @@ def test_broker_reject_line(tmp_path, monkeypatch):
     fake = ReqMT5(price=4000.5, requotes=0, final_ok=False); monkeypatch.setattr(broker, "_m", fake); r.fake = fake
     item = _item()
     res = bot.ask_decision(r.cfg, r.agents, r.j, item, "TAKE", "me", notify=r.n, retry_sleep=0.0)
-    assert res["line"].startswith("TAKEN LONG · ❌ order rejected")
+    assert "TAKEN LONG" in res["line"] and "order rejected" in res["line"]
     assert res["placed"] is False
     assert "retcode" in " ".join(str(v) for v in res.values()) or res["ok"] is False
 

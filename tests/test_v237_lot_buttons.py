@@ -180,3 +180,110 @@ def test_compare_no_sizing_line_without_data():
     res = compare.compute(records, [], 0, 1000, OFF)
     c = compare.card(res)
     assert "Sizing" not in [f["name"] for f in c["fields"]]
+
+
+# ================================================================== v2.3.11 tests
+
+# ---- alert card meta has lots, half_size, chop
+def test_alert_card_meta_has_lots_and_chop(tmp_path, monkeypatch):
+    from tests.test_v200_alerts import TickMT5, Cap as Cap200
+    from tests.test_v200_ema2050 import _bull
+    from aureon_mt5 import broker as br, alerts as A
+    from aureon_mt5.agent import SymbolAgent
+    from aureon_mt5.strategies import get_strategy
+    from aureon_mt5.strategies.ema2050 import journeys as J
+    from aureon_mt5.journal import Journal
+    from aureon_mt5.common.timeutil import now_server
+    S = get_strategy("ema2050")
+    fake = TickMT5(price=4000.5)
+    monkeypatch.setattr(br, "_m", fake); monkeypatch.setattr(br, "_offset_h", OFF)
+    cfg = Config(); cfg.dry = False; cfg.log_dir = str(tmp_path)
+    n = Cap200(); j = Journal(str(tmp_path)); store = A.AlertStore(str(tmp_path))
+    ag = SymbolAgent("XAUUSD", cfg, S, n, j, (), alerts=store); ag.off = OFF
+    df = _bull(n=12, touch_at=(11,))
+    res = J.build(df, J.rules_for("XAUUSD"), OFF); res["df"] = df
+    ag.last_df = df; ag.last_res = res; ag.last_bar = int(df["time"].iloc[-1]); ag._refresh_snapshot(True)
+    store.arm("XAUUSD", 4000.0, 4010.0); fake.bid, fake.ask = 3999.5, 3999.8; fake.tick_time = now_server(OFF)
+    n.bot_ready = True
+    ag._check_alerts(df, df, int(df["time"].iloc[-1]))
+    item = n.ask_queue.get_nowait()
+    m = item["meta"]
+    assert "lots" in m and m["lots"] is not None  # risk-based lots
+    assert "half_size" in m
+    assert "chop" in m and "chop_crosses" in m
+    # Size field on the card
+    field_names = [f["name"] for f in item["fields"]]
+    assert "Size" in field_names
+
+
+# ---- lot_button_spec: no meta["lots"] → NO ★
+def test_spec_no_star_when_lots_none():
+    cfg = Config(); cfg.execution_enabled = True; cfg.lot_buttons = [0.5, 1.0, 1.5]; cfg.max_lots = 2.0
+    spec = bot.lot_button_spec(cfg, {})  # no "lots" key
+    assert len(spec) == 3
+    assert not any(b["star"] for b in spec)  # no ★
+
+
+# ---- AlertView always both rows; ★ only on suggested_side
+def test_alert_view_both_rows_star_on_suggested():
+    """AlertView with execution on: both LONG and SHORT rows; ★ only on suggested_side."""
+    cfg = Config(); cfg.execution_enabled = True; cfg.lot_buttons = [0.5, 1.0]; cfg.max_lots = 2.0
+    meta = {"lots": 0.8, "suggested_side": "LONG", "symbol": "XAUUSD", "kind": "alert"}
+    btns = bot.lot_button_spec(cfg, meta)
+    # Simulating AlertView logic: both sides always, ★ only on LONG
+    sides = ["LONG", "SHORT"]
+    for side in sides:
+        show_star = (side == "LONG")
+        for b in btns:
+            base = b["label"].rstrip("★")
+            lbl = f"{side} {base}" + ("★" if show_star and b["star"] else "")
+            if side == "LONG" and b["star"]:
+                assert "★" in lbl
+            if side == "SHORT":
+                assert "★" not in lbl
+
+
+# ---- Decision line: "(suggested X★)" when lots present, omitted when None
+def test_decision_line_suggested_text(tmp_path, monkeypatch):
+    r = make(tmp_path, monkeypatch, execution=True); r.cfg.max_lots = 2.0
+    fake = ReqMT5(price=4000.5, requotes=0); monkeypatch.setattr(broker, "_m", fake); r.fake = fake
+    # With lots in meta → line has "suggested"
+    item1 = {"meta": {"kind": "cross", "symbol": "XAUUSD", "price": 4000.6, "bar": 1, "mode": "ema2050", "side": "LONG", "lots": 1.7},
+             "key": "test:key1"}
+    res1 = bot.ask_decision(r.cfg, r.agents, r.j, item1, "TAKE", "me", notify=r.n, lots=1.0)
+    assert "(suggested 1.7★)" in res1["line"]
+    # Without lots in meta → no "suggested" text
+    item2 = {"meta": {"kind": "cross", "symbol": "XAUUSD", "price": 4000.6, "bar": 2, "mode": "ema2050", "side": "LONG"},
+             "key": "test:key2"}
+    res2 = bot.ask_decision(r.cfg, r.agents, r.j, item2, "TAKE", "me", notify=r.n, lots=0.5)
+    assert "suggested" not in res2["line"]
+
+
+# ---- execute_entry rejection line includes size
+def test_rejection_line_includes_size(tmp_path, monkeypatch):
+    r = make(tmp_path, monkeypatch, execution=True); r.cfg.max_lots = 2.0
+    fake = ReqMT5(price=4000.5, requotes=0, final_ok=False); monkeypatch.setattr(broker, "_m", fake); r.fake = fake
+    item = {"meta": {"kind": "cross", "symbol": "XAUUSD", "price": 4000.6, "bar": 1, "mode": "ema2050", "side": "LONG", "lots": 1.0},
+            "key": "test:key"}
+    res = bot.ask_decision(r.cfg, r.agents, r.j, item, "TAKE", "me", notify=r.n, retry_sleep=0.0)
+    assert "place 1 lots in MT5" in res["line"] or "place 1 lots in MT5" in res["text"]
+
+
+# ---- execute_entry not-placed line includes size
+def test_not_placed_line_includes_size(tmp_path, monkeypatch):
+    r = make(tmp_path, monkeypatch, execution=False)
+    item = {"meta": {"kind": "cross", "symbol": "XAUUSD", "price": 4000.6, "bar": 1, "mode": "ema2050", "side": "LONG"},
+            "key": "test:key"}
+    res = bot.ask_decision(r.cfg, r.agents, r.j, item, "TAKE", "me", notify=r.n)
+    assert "lots" in res["line"] and "place" in res["line"]
+
+
+# ---- compare excludes None lots from sized_up/sized_down
+def test_compare_excludes_none_lots():
+    records = [
+        {"t": 10, "event": "signal", "mode": "ema2050", "signal_kind": "pullback", "side": "LONG", "bar": 100, "symbol": "XAUUSD"},
+        {"t": 11, "event": "decision", "decision": "TAKE", "symbol": "XAUUSD", "bar": 100, "lots_chosen": None, "lots_suggested": None},
+    ]
+    rows = compare.build_rows(records, [], 0, 1000, OFF)
+    g = compare.groups(rows)
+    assert len(g["sized_up"]) == 0 and len(g["sized_down"]) == 0

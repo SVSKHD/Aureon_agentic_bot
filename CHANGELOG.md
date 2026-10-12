@@ -2,6 +2,21 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.3.11 — 2026-10-12  (PATCH: lot buttons — finish alert cards)
+- ALREADY DONE: AskView lot buttons (v2.3.7), lot_button_spec, execute_entry lots param, /take lots, ORDER PLACED Size field,
+  compare sizing groups.
+- **TODO → DONE** alerts.py `reached_card` meta: added `lots` (from `_risk_lots`), `half_size`, `chop`, `chop_crosses` +
+  `_lot_field` as the card's Size field.
+- **TODO → DONE** `lot_button_spec`: `meta["lots"]` None → NO ★ (no max_lots fallback). `execute_entry`/`ask_decision`/`alert_decision`:
+  `lots_suggested` = `meta["lots"]` or None (journals None); compare excludes None from `sized_up`/`sized_down` (already did).
+- **TODO → DONE** AlertView with execution on: always both rows (LONG …, SHORT …) + SKIP row; `suggested_side`'s row is first and
+  only that row gets ★.
+- **TODO → DONE** AlertView._answer: colour GREEN if `r["ok"]`, RED if not ok, GREY for SKIP; ephemeral followup when card edit fails.
+- **TODO → DONE** Decision line: `TAKEN LONG 1.0 lots (suggested 1.7★) · ticket … · filled …` (omitted when lots_suggested is None).
+- **TODO → DONE** execute_entry rejection / not-placed lines include the size: `place 1.0 lots in MT5, I will manage it`.
+- **PARTIAL** Volume validation at start: not implemented (requires live MT5 `symbol_info` which tests can't call).
+- Strategy rules changed: NO.
+
 ## v2.3.10 — 2026-10-12  (PATCH: Discord watchdog on by default)
 - **Watchdog** (`aureon_mt5/watchdog.py`): `Watchdog.tick()` called every ~30 s from the main/supervisor thread. Per symbol:
   `STALE:<SYMBOL>` (market open, no new M5 bar > `heartbeat_stale_min` min), `dead:<SYMBOL>` (agent thread not alive).

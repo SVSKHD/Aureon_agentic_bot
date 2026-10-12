@@ -459,10 +459,18 @@ def reached_card(agent, a: dict, hit_price: float, tick_time: int, bar_t: int, d
               field("AGENT VERDICT", sug["text"], inline=False), field("CLAUDE VERDICT", ph, inline=False)]
     if cx_state != "off":                                   # v2.3.0: the Codex block only when Codex is configured
         fields.append(field("CODEX VERDICT", cx_ph, inline=False))
+    # v2.3.11: lots, half_size, chop in meta + Size field on the card
+    stop_pts = agent.g.pre_stop if agent.g else None
+    sizing = agent._risk_lots(stop_pts) if (stop_pts and hasattr(agent, "_risk_lots")) else {"lots": None, "half": False, "half_reason": ""}
+    lot_fields = agent._lot_field(stop_pts) if (stop_pts and hasattr(agent, "_lot_field")) else []
+    fields += lot_fields
     meta = {"kind": "alert", "alert_id": a["id"], "symbol": a["symbol"], "price": hit_price, "bar": bar_t, "mode": S.name,
             "suggested_side": sug["side"], "suggestion": sug["decision"], "reason": sug["reason"], "sl": sug["sl"],
-            "stop_pts": agent.g.pre_stop if agent.g else None, "note": a.get("note", ""), "agent_verdict": sug["line"],
-            "agent_block": sug["text"], "claude_state": state, "codex_state": cx_state}
+            "stop_pts": stop_pts, "note": a.get("note", ""), "agent_verdict": sug["line"],
+            "agent_block": sug["text"], "claude_state": state, "codex_state": cx_state,
+            "lots": sizing["lots"], "half_size": sizing["half"],
+            "chop": agent._is_chop() if hasattr(agent, "_is_chop") else False,
+            "chop_crosses": agent._chop_crosses() if hasattr(agent, "_chop_crosses") else 0}
     colour = EVENT_COLOURS["signal_long" if sug["side"] == "LONG" else "signal_short" if sug["side"] == "SHORT" else "news"]
     return {"key": key_for(a["symbol"], a["id"]), "title": title, "lines": [f"**{sug['line']}**"], "fields": fields, "meta": meta, "color": colour,
             "footer": cfooter(S.display_name, f"alert {a['id']}"), "ema": b["ema"], "trend": b["trend"], "guardian": b["gctx"], "suggestion": sug,
