@@ -29,6 +29,10 @@ class Governor:
         ist_now = context.get("ist_now") or self.clock()
         ist_h = ist_now.hour + ist_now.minute / 60
 
+        # halted (v2.3.13)
+        if context.get("halted"):
+            return Decision(False, "halted", "HALT is on — /unhalt to resume")
+
         # session_window: 23:00–05:30 IST
         if ist_h >= 23 or ist_h < 5.5:
             return Decision(False, "session_window", f"no entries 23:00–05:30 IST (now {ist_now:%H:%M})")

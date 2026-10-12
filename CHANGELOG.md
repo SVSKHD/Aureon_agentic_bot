@@ -2,6 +2,16 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.3.13 — 2026-10-12  (PATCH: /halt kill switch)
+- **`/halt [reason]`**: sets persistent HALT flag in `logs/halt.json`; closes every open position on every symbol via
+  `broker.close` (retried 3x); summary card with per-ticket retcodes. Dry mode / execution off: reports "would close" without
+  touching MT5.
+- **While HALT is on**: governor rule `halted` blocks all entries (buttons, `/take`, `/override`, future AGENT). Detectors still
+  run. The guardian keeps managing any position that appears — never loosens SL. HALT survives restart.
+- **`/unhalt confirm:UNHALT`**: requires the exact phrase. Journal `halt`/`unhalt` with user + reason.
+- **`/status`**: first line shows `⛔ HALTED since 10:42 IST (by …: reason)` while on.
+- Strategy rules changed: NO.
+
 ## v2.3.12 — 2026-10-12  (PATCH: enforced risk governor)
 - **`aureon_mt5/governor.py`** (pure): `Governor(cfg).check(symbol, side, lots, context) -> Decision(allowed, rule, detail)`.
   Rules (each env-configurable, each with a stable name):

@@ -70,6 +70,11 @@ def status_card(sym: str, ag, cfg, journal=None, monitor=None, claude=None, code
     connected = bool(snap.get("connected"))
     color = GREEN if ag.is_alive() and connected and h.get("status") in ("running", "market closed") else YELLOW if ag.is_alive() else RED
 
+    from .halt import load as _load_halt
+    _halt = _load_halt(cfg.log_dir)
+    if _halt:
+        color = RED
+
     fields = [
         _field("Mode", S.display_name),
         _field("Market", f"{'🟢' if mk == 'OPEN' else '⏸'} {mk} · tick {age_s}"),
@@ -78,6 +83,8 @@ def status_card(sym: str, ag, cfg, journal=None, monitor=None, claude=None, code
         _field("Guardian", h.get("guardian") or "—"),
         _field("Last bar", f"{h.get('last_bar') or '—'} IST"),
     ]
+    if _halt:
+        fields.insert(0, _field("HALT", f"⛔ HALTED since {_halt.get('ist', '?')} IST (by {_halt.get('by', '?')}: {_halt.get('reason', '')})", False))
     if h.get("close") is not None:
         order = "↑ fast > slow" if h.get("ema_fast", 0) > h.get("ema_slow", 0) else "↓ fast < slow"
         fields += [
@@ -539,9 +546,11 @@ def _governor_context(cfg, agents, sym: str) -> dict:
             news_block = any(r - 60 * 60 <= tu < r + 30 * 60 for r in (ag.news or ()))
         except Exception:
             pass
+    from .halt import is_halted
+    halted = is_halted(cfg.log_dir)
     return {"trades_today": trades_today, "losses_today": sum(1 for d in (deals if 'deals' in dir() else []) if d.get("profit", 0) < 0),
             "realised_money_today": realised_money, "equity": equity, "ist_now": ist_now,
-            "news_block": news_block, "open_positions": open_pos}
+            "news_block": news_block, "open_positions": open_pos, "halted": halted}
 
 
 def execute_entry(cfg, agents, journal, item: dict, side: str, user, notify=None, retry_sleep: float = 2.0, card_key=None, lots=None) -> dict:
@@ -1122,6 +1131,47 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             except Exception as e:
                 return Reply(content=f"watchdog: error reading state — {e}")
         await run(inter, "watchdog", work)
+
+    @tree.command(name="halt", description="Kill switch: close all positions and block all entries")
+    @app_commands.describe(reason="Reason for the halt")
+    async def halt_cmd(inter: discord.Interaction, reason: str = ""):
+        user = inter.user
+        def work():
+            from . import halt as halt_mod
+            if halt_mod.is_halted(cfg.log_dir):
+                return Reply(content="already halted — /unhalt confirm:UNHALT to resume")
+            halt_mod.set_halt(cfg.log_dir, str(user), reason)
+            journal.log("halt", by=str(user), reason=reason or "manual")
+            if cfg.dry or not cfg.execution_enabled:
+                # Dry mode: report what would be closed
+                pos_lines = []
+                for sym, ag in agents.items():
+                    snap = getattr(ag, "snapshot", {}) or {}
+                    for p in snap.get("positions", []):
+                        pos_lines.append(f"would close #{p['ticket']} {p['direction'].upper()} {p['points']:+.1f}")
+                summary = "\n".join(pos_lines) if pos_lines else "no open positions"
+                return Reply(content=f"⛔ HALTED (dry/exec off) · {reason or 'manual'}\n{summary}")
+            results = halt_mod.close_all_positions(cfg.symbols)
+            summary = halt_mod.halt_summary(results)
+            notify.card("⛔ HALT", summary, footer=f"by {user} · {datetime.now(IST):%H:%M} IST")
+            return Reply(content=summary)
+        await run(inter, "halt", work)
+
+    @tree.command(name="unhalt", description="Resume after a halt — requires exact confirmation phrase")
+    @app_commands.describe(confirm="Type UNHALT to confirm")
+    async def unhalt_cmd(inter: discord.Interaction, confirm: str = ""):
+        user = inter.user
+        def work():
+            from . import halt as halt_mod
+            if not halt_mod.is_halted(cfg.log_dir):
+                return Reply(content="not halted")
+            if confirm.strip() != "UNHALT":
+                return Reply(content="type `/unhalt confirm:UNHALT` (exact) to resume")
+            prev = halt_mod.clear_halt(cfg.log_dir)
+            journal.log("unhalt", by=str(user))
+            notify.card("✅ UNHALT", f"Resumed by {user}", footer=f"{datetime.now(IST):%H:%M} IST")
+            return Reply(content="✅ unhalted — entries allowed again")
+        await run(inter, "unhalt", work)
 
     @tree.command(name="governor", description="Show risk governor rules and current values")
     async def governor_cmd(inter: discord.Interaction):
