@@ -2,6 +2,23 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.3.16 — 2026-10-12  (PATCH: voice command scope)
+- **`aureon_mt5/voice.py`**: deterministic keyword/grammar intent parser (`parse_intent(transcript) -> ParsedIntent`).
+  Intents: status, alerts, plan (read-only, execute immediately), take, skip, alert, halt, unhalt, override
+  (order-affecting, require typed confirmation). No LLM for intent parsing.
+- **Confirmation system** (`ConfirmationManager`): order-affecting intents from voice create a challenge
+  `"Reply CONFIRM 7F3 within 60 s to take LONG 1.0 XAUUSD"`. Only a typed message with the exact code executes,
+  through the same bot functions. Governor, demo/live gate, halt all apply. Expired/mismatched → nothing happens.
+- **`aureon_mt5/voice_transport.py`**: `VoiceHandler` handles audio (transcribe → parse → execute/challenge) and
+  typed confirmation. Telegram bot + HTTP endpoint are transport options (both optional).
+- **Transcription**: whisper/faster-whisper (optional dep). `transcribe(audio_path)` returns text or None when not installed.
+  Audio is never stored after transcription.
+- **Journal**: every voice command logged (transcript, intent, confirmed or not, result).
+- `AUREON_VOICE=0` default, `AUREON_VOICE_CHATS`, `AUREON_VOICE_SECRET`.
+- **Difference from docs/VOICE_SCOPE.md**: the doc lists candidate intents and says "NOT IMPLEMENTED". This version implements
+  them with the doc's safety rule: "Never execute an order solely from speech — require typed confirmation."
+- Strategy rules changed: NO.
+
 ## v2.3.15 — 2026-10-12  (PATCH: daily plan card 05:00 IST)
 - **`aureon_mt5/daily_plan.py`**: at 05:00 IST every weekday (Mon–Fri), one card `🗓 DAILY PLAN · Tue 13 Oct` with:
   News (today's high-impact events + entry blocks), Sessions (IST windows), Yesterday (net pts, trades, win/loss),
