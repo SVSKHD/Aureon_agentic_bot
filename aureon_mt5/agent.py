@@ -1249,18 +1249,42 @@ class SymbolAgent(threading.Thread):
                             self.key("OPP_CROSS", f"{p['ticket']}-{bar_key(bar_t, self.off)}"), st, "opposite_cross", bar_t)
                 continue
 
-            # 1c) v2.0.0 early lock: once +early_at has been seen, SL → entry + early_level (never loosened; skipped if already better)
-            if g.early_at is not None and st["secured"] < g.early_level and st["peak"] >= g.early_at:
-                sl = p["price_open"] + s * g.early_level
-                if self._move_sl(p, sl, f"EARLY LOCK +{g.early_level:g}"):
-                    st["secured"] = g.early_level; self._save_state_now()                      # 1. state (immediate)
+            # 1c) v2.0.0/v2.4.5 early lock: soft (bar close) | hard (broker SL) | off
+            _elk = self.cfg.early_lock_mode
+            if g.early_at is not None and not st.get("soft_lock") and st["secured"] < g.early_level and st["peak"] >= g.early_at and _elk != "off":
+                if _elk == "soft":
+                    # SOFT: don't move the broker SL; set soft_lock in state
+                    st["soft_lock"] = g.early_level; st["soft_lock_t"] = bar_t; self._save_state_now()
                     self.journal.log("early_lock", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], level=g.early_level,
-                                     peak=st["peak"], price=p["current"])                      # 2. journal
-                    self.notify.send(self.key("EARLY_LOCK", p["ticket"]), ctitle(self.symbol, f"EARLY LOCK +{g.early_level:g}", p["direction"]),
-                                     [f"+{g.early_at:g} seen — SL moved to entry +{g.early_level:g}, next: secure at +{g.secure_at:g}"],
+                                     peak=st["peak"], price=p["current"], soft=True)
+                    lock_px = p["price_open"] + s * g.early_level
+                    self.notify.send(self.key("EARLY_LOCK", p["ticket"]), ctitle(self.symbol, f"EARLY LOCK (soft) +{g.early_level:g}", p["direction"]),
+                                     [f"+{g.early_at:g} seen — I'll close if an M5 bar CLOSES {'below' if s > 0 else 'above'} {lock_px:.2f} · broker SL stays at −{g.pre_stop:g} · next: secure at +{g.secure_at:g}"],
                                      fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"],
-                                                            points=p["points"], sl=sl, secured=g.early_level, peak=st["peak"]),
+                                                            points=p["points"], sl=p["sl"], peak=st["peak"]),
                                      color=EVENT_COLOURS["secured"], footer=cfooter(self.S.display_name))
+                else:
+                    # HARD: move the broker SL (today's behaviour)
+                    sl = p["price_open"] + s * g.early_level
+                    if self._move_sl(p, sl, f"EARLY LOCK +{g.early_level:g}"):
+                        st["secured"] = g.early_level; self._save_state_now()
+                        self.journal.log("early_lock", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], level=g.early_level,
+                                         peak=st["peak"], price=p["current"], soft=False)
+                        self.notify.send(self.key("EARLY_LOCK", p["ticket"]), ctitle(self.symbol, f"EARLY LOCK +{g.early_level:g}", p["direction"]),
+                                         [f"+{g.early_at:g} seen — SL moved to entry +{g.early_level:g}, next: secure at +{g.secure_at:g}"],
+                                         fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"],
+                                                                points=p["points"], sl=sl, secured=g.early_level, peak=st["peak"]),
+                                         color=EVENT_COLOURS["secured"], footer=cfooter(self.S.display_name))
+
+            # 1d) v2.4.5 soft early lock exit: on a NEW CLOSED bar, close if bar closed beyond the lock level
+            if new_bar and st.get("soft_lock") and _elk == "soft":
+                lock_level = st["soft_lock"]; lock_px = p["price_open"] + s * lock_level
+                if (s > 0 and close <= lock_px) or (s < 0 and close >= lock_px):
+                    self.journal.log("soft_lock_exit", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"],
+                                     close=close, level=lock_level, points_at_exit=p["points"], peak=st["peak"])
+                    self._close(p, f"soft early lock — bar closed at {close:.2f}", f"SOFT LOCK EXIT — {tag}",
+                                self.key("SOFT_LOCK_EXIT", p["ticket"]), st, "soft_early_lock", bar_t)
+                    continue
 
             # 2) P phase → cross confirmed: SL to the slow EMA ± buffer (tighten only)
             if st["pre"] and sgn == s:
@@ -1293,6 +1317,9 @@ class SymbolAgent(threading.Thread):
                             telemetry.failure(self.notify, self.journal, title="AUREON PARTIAL CLOSE FAILED", key=self.key("ERROR", f"partial-{p['ticket']}"),
                                               mode=self.S.name, symbol=self.symbol, ticket=p["ticket"], action="PARTIAL CLOSE",
                                               retcode=pr.retcode, comment=pr.comment, last_error=pr.last_error, retry="not retried — full position keeps riding")
+                    if st.get("soft_lock"):
+                        self.journal.log("soft_lock_cleared", symbol=self.symbol, ticket=p["ticket"], reason="secure moved SL above soft level")
+                        st.pop("soft_lock", None); st.pop("soft_lock_t", None)
                     self.journal.log("secured", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], level=g.secure_level, step=g.secure_level, price=p["current"])  # 2. journal
                     self.notify.send(self.key("SECURED", f"{p['ticket']}-{g.secure_level:g}"), ctitle(self.symbol, f"SECURED +{g.secure_level:g}", p["direction"]), ["riding — lock steps up every +" + f"{g.ride_step:g}"],
                                      fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"], points=p["points"], sl=sl, secured=g.secure_level, peak=st["peak"]),

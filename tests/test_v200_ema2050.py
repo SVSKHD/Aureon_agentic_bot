@@ -247,7 +247,7 @@ def rig(tmp_path, monkeypatch):
     def make(direction="long", entry=4200.0, sl=0.0, price=4200.0):
         fake = FakeMT5(direction, entry, sl, price)
         monkeypatch.setattr(broker, "_m", fake); monkeypatch.setattr(broker, "_offset_h", OFF)
-        cfg = Config(); cfg.dry = False; cfg.log_dir = str(tmp_path); n = Cap()
+        cfg = Config(); cfg.dry = False; cfg.log_dir = str(tmp_path); cfg.early_lock_mode = "hard"; n = Cap()
         ag = SymbolAgent("XAUUSD", cfg, S, n, Journal(str(tmp_path)), ())
         return fake, ag, n
     return make

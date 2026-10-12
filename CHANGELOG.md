@@ -2,6 +2,19 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.4.5 — 2026-10-13  (PATCH: soft early lock)
+- **Soft early lock** (`AUREON_EARLY_LOCK_MODE=soft`, default): when peak >= `early_at`, do NOT move the broker SL. Instead set
+  `st["soft_lock"]` and close only when a NEW CLOSED M5 bar's close is at or beyond `entry + level` against the trade. Intrabar
+  wicks never trigger it. Broker SL remains at `−pre_stop` until the SECURE step moves it. Card: "EARLY LOCK (soft) +1".
+- **Hard mode** (`AUREON_EARLY_LOCK_MODE=hard`): today's behaviour unchanged — broker SL moved on peak trigger.
+- **Off mode** (`AUREON_EARLY_LOCK_MODE=off`): no early lock at all.
+- **State separation**: `st["secured"]` = locked by broker SL. `st["soft_lock"]` = soft level. Once SECURE moves the real SL above
+  the soft level, `soft_lock` is cleared (journaled). `_locked(p)` and "live SL is the truth" don't touch soft_lock.
+- **Soft lock exit**: `soft_lock_exit` journal event. Reason key `soft_early_lock` in guardian close.
+- **Restart**: `soft_lock` persisted in `guardian_state.json`, restored on restart.
+- `AUREON_SOFT_FALLBACK_MIN=5` (safety fallback when bot can't watch — deferred to a follow-up).
+- Strategy rules changed: **YES** — early lock is now bar-close based by default; hard mode keeps the old rule.
+
 ## v2.4.4 — 2026-10-13  (PATCH: override / AGENT dry-run harness)
 - **`scripts/rehearse.py`**: scripted rehearsal against fake MT5 + console notifier. Scenarios: missed → /override placed,
   override refused (drift), AGENT window → agent takes, HALT mid-trade, governor blocks. Pass/fail table.
