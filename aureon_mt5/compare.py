@@ -55,6 +55,8 @@ class Row:
     chop: bool = False             # v2.3.5: chop-day flag from the signal journal record
     lots_chosen: float | None = None    # v2.3.7: button lot size
     lots_suggested: float | None = None # v2.3.7: risk-based suggested size
+    missed: bool = False               # v2.3.9: setup_missed event fired
+    overridden: bool = False           # v2.3.9: override event fired
 
 
 def _ev(v: dict, source: str = "claude"):
@@ -81,6 +83,8 @@ def build_rows(records: list[dict], graded: list, since: int, until: int, off: f
     for d in records:
         if d.get("event") == "decision" and d.get("decision") in ("TAKE", "SKIP", "EXPIRED"):
             decisions[(d.get("symbol"), d.get("bar"))] = d
+    missed_bars = {(r.get("symbol"), r.get("bar") or r.get("card_key")) for r in records if r.get("event") == "setup_missed"}
+    overridden_bars = {(r.get("symbol"), r.get("bar") or r.get("card_key")) for r in records if r.get("event") == "override"}
     rows, seen = [], set()
     for s in sorted(sigs, key=lambda r: r["bar"]):
         kind = KINDS_BY_MODE[s.get("mode", STRATEGY)][s["signal_kind"]]; side = str(s.get("side", "")).upper()
@@ -111,6 +115,12 @@ def build_rows(records: list[dict], graded: list, since: int, until: int, off: f
             row.lots_suggested = dec_rec.get("lots_suggested")
         elif dec_rec == "TAKE":
             row.me, row.me_via = "TAKEN", "button"
+        # v2.3.9: missed/overridden from journal events (match by symbol+bar)
+        sig_key = (row.symbol, s.get("bar"))
+        if sig_key in missed_bars:
+            row.missed = True
+        if sig_key in overridden_bars:
+            row.overridden = True
         rows.append(row)
     # trades seen in MT5: assign each to the most recent same-side signal whose window contains its open time
     for p in records:
@@ -187,6 +197,10 @@ def groups(rows: list[Row]) -> dict[str, list[Row]]:
         # v2.3.7 sizing groups
         "sized_up": [r for r in rows if r.lots_chosen is not None and r.lots_suggested is not None and r.lots_chosen > r.lots_suggested],
         "sized_down": [r for r in rows if r.lots_chosen is not None and r.lots_suggested is not None and r.lots_chosen < r.lots_suggested],
+        # v2.3.9 missed/overridden
+        "missed": [r for r in rows if r.missed],
+        "overridden": [r for r in rows if r.overridden],
+        "missed_not_overridden": [r for r in rows if r.missed and not r.overridden],
     }
 
 
@@ -615,6 +629,18 @@ def card(res: CompareResult, *, title: str = "AUREON · MT5 · COMPARE", mode_di
         if clm.n:
             chop_line += f" · win {clm.win_rate:.0%} · avg {clm.expectancy:+.1f} pts"
         fields.append({"name": "Chop vs Clear", "value": chop_line, "inline": False})
+    missed = res.groups.get("missed", [])
+    if missed:
+        ovr = res.groups.get("overridden", [])
+        let_go = res.groups.get("missed_not_overridden", [])
+        om = metrics(ovr); lm = metrics(let_go)
+        parts = [f"**Missed:** {len(missed)} · overridden {len(ovr)}"]
+        if om.n:
+            parts.append(f"(win {om.win_rate:.0%} · avg {om.expectancy:+.1f} pts)")
+        parts.append(f"· let go {len(let_go)}")
+        if lm.n:
+            parts.append(f"(win {lm.win_rate:.0%} · avg {lm.expectancy:+.1f} pts)")
+        fields.append({"name": "Missed setups", "value": " ".join(parts), "inline": False})
     sized_rows = [r for r in res.rows if r.lots_chosen is not None and r.lots_suggested is not None]
     if sized_rows:
         up = len(res.groups.get("sized_up", []))

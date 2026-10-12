@@ -69,6 +69,38 @@ def _save_pending(log_dir: str, symbol: str, pa: dict | None):
     os.replace(tmp, path)
 
 
+def _load_open_asks(log_dir: str, symbol: str) -> list[dict]:
+    """v2.3.9: load open asks from logs/pending.json for this symbol."""
+    try:
+        import json as _json
+        with open(_pending_path(log_dir), encoding="utf-8") as f:
+            data = _json.load(f)
+        return data.get(f"{symbol.upper()}:asks", [])
+    except Exception:
+        return []
+
+
+def _save_open_asks(log_dir: str, symbol: str, asks: list[dict]):
+    """v2.3.9: persist open asks to logs/pending.json."""
+    import json as _json
+    path = _pending_path(log_dir)
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = _json.load(f)
+    except Exception:
+        data = {}
+    key = f"{symbol.upper()}:asks"
+    if asks:
+        data[key] = asks
+    else:
+        data.pop(key, None)
+    tmp = path + ".tmp"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(tmp, "w", encoding="utf-8") as f:
+        _json.dump(data, f)
+    os.replace(tmp, path)
+
+
 class SymbolAgent(threading.Thread):
     def __init__(self, symbol: str, cfg: Config, strategy: Strategy, notify: Notifier, journal: Journal, news: tuple, claude=None, alerts=None,
                  codex=None):
@@ -112,6 +144,8 @@ class SymbolAgent(threading.Thread):
         self.last_df = None               # last closed-bar frame with EMAs (for /chart)
         self.last_res = None              # last analysis result (per-bar states for /alert suggestions)
         self.chop: dict | None = None                  # v2.3.5: {"chop", "crosses", "day", "threshold"}; sticky per server day
+        self.open_asks: list[dict] = _load_open_asks(cfg.log_dir, symbol)  # v2.3.9: pending signal asks awaiting position
+        self.open_misses: list[dict] = []             # v2.3.9: misses awaiting /override
         self.health = {"status": "starting", "last_bar": None, "last_poll": None, "errors": 0, "managed": 0,
                        "close": None, "ema_fast": None, "ema_slow": None, "offset_h": self.off, "last_signal": None,
                        "last_broker_action": None, "guardian": "ON" if g else "OFF (no profile for this mode/symbol)",
@@ -184,6 +218,7 @@ class SymbolAgent(threading.Thread):
                     self._guard(new_bar, bar_t, df, close, ef, es, sgn)
                 self._refresh_snapshot(True)
                 self._check_alerts(closed, df, bar_t)
+                self._check_misses()
             except Exception as e:
                 from .crashes import report as report_crash
                 self.health["errors"] += 1; self.health["status"] = f"error: {e}"
@@ -398,6 +433,14 @@ class SymbolAgent(threading.Thread):
         return [field("Track record (4 weeks)", fmt(rows, f"{kind} all sessions") + "\n" + fmt(same, f"{kind} in {names.get(sess, sess)}"), inline=False)]
 
     # ------------------------------------------------------------------ v2.3.5 chop-day flag
+    def _chop_day_journaled(self, day: str) -> bool:
+        """v2.3.8: True if journal already has a chop_day event for this symbol and day (survives restart)."""
+        try:
+            recs = self.journal.read(int(_time.time()) - 2 * 86400)
+            return any(r["event"] == "chop_day" and r.get("symbol") == self.symbol and r.get("day") == day for r in recs)
+        except Exception:
+            return False
+
     def _update_chop(self, df, bar_t):
         """Recompute chop state once per closed bar. Sticky: once chop=True for a server day, it stays True."""
         cf, cs = self.S.ema_cols
@@ -407,7 +450,7 @@ class SymbolAgent(threading.Thread):
             cs_new["chop"] = True  # sticky for the day
             cs_new["crosses"] = max(cs_new["crosses"], prev["crosses"])
         was_chop = prev is not None and prev.get("chop") and prev.get("day") == cs_new["day"]
-        if cs_new["chop"] and not was_chop:
+        if cs_new["chop"] and not was_chop and not self._chop_day_journaled(cs_new["day"]):
             self.journal.log("chop_day", symbol=self.symbol, mode=self.S.name, day=cs_new["day"],
                              crosses=cs_new["crosses"], bar=bar_t)
             self.notify.send(self.key("CHOP", cs_new["day"]), ctitle(self.symbol, "CHOP DAY"),
@@ -423,6 +466,121 @@ class SymbolAgent(threading.Thread):
 
     def _chop_crosses(self) -> int:
         return self.chop["crosses"] if self.chop else 0
+
+    # ------------------------------------------------------------------ v2.3.9 missed setup
+    def track_ask(self, card_key: str, side: str, kind: str, price: float, bar: int, lots: float | None, sl: float | None):
+        """Record that a signal ask card was posted. Called from _detect / _detect_2050."""
+        ask = {"card_key": card_key, "side": side, "kind": kind, "price": price, "bar": bar,
+               "lots": lots, "sl": sl, "posted_t": _time.time(), "decided": None, "placed": False}
+        self.open_asks.append(ask)
+        _save_open_asks(self.cfg.log_dir, self.symbol, self.open_asks)
+
+    def mark_ask_decided(self, card_key: str, decision: str, placed: bool = False):
+        """Mark an ask as answered (TAKE/SKIP/EXPIRED). Called from bot.py button handlers."""
+        for a in self.open_asks:
+            if a["card_key"] == card_key:
+                a["decided"] = decision; a["placed"] = placed; break
+        _save_open_asks(self.cfg.log_dir, self.symbol, self.open_asks)
+
+    def _has_position_in_direction(self, side: str) -> bool:
+        pos = broker.positions(self.symbol) if not self.dry else []
+        direction = "long" if side == "LONG" else "short"
+        return any(p["direction"] == direction for p in pos)
+
+    def _check_misses(self):
+        """Every poll: check if any tracked ask has expired its grace window without a position appearing."""
+        if not self.open_asks:
+            return
+        now = _time.time()
+        grace = self.cfg.missed_grace_min * 60
+        remaining = []
+        for a in self.open_asks:
+            elapsed = now - a["posted_t"]
+            if a.get("decided") == "SKIP" or a.get("placed"):
+                continue  # answered SKIP or order placed → not missed
+            if elapsed < grace:
+                remaining.append(a)
+                continue
+            # Grace expired — check if a position appeared in that direction
+            if self._has_position_in_direction(a["side"]):
+                continue  # position exists → not missed
+            # Check blackout: market closed / news / 23:00–05:30 IST
+            ist_h = datetime.now(IST).hour + datetime.now(IST).minute / 60
+            if not broker.market_open(self.symbol, self.off, self.dry) or ist_h >= 23 or ist_h < 5.5:
+                remaining.append(a)  # keep checking later
+                continue
+            # It's a miss
+            reason = "TAKE pressed, no ticket" if a.get("decided") == "TAKE" else "no position"
+            tk = None
+            if not self.dry:
+                try: tk = broker.tick(self.symbol)
+                except Exception: pass
+            now_px = tk["bid"] if (tk and a["side"] == "LONG") else (tk["ask"] if tk else a["price"])
+            s = 1 if a["side"] == "LONG" else -1
+            drift = round(s * (now_px - a["price"]), 2) if now_px else 0.0
+            self.journal.log("setup_missed", symbol=self.symbol, mode=self.S.name, card_key=a["card_key"],
+                             side=a["side"], kind=a["kind"], price=a["price"], now=now_px, drift=drift,
+                             chop=self._is_chop(), half_size=bool(self.chop and self.chop.get("chop")) or self._half_size(),
+                             reason=reason)
+            miss = {**a, "missed_t": now, "now_price": now_px, "drift": drift, "reason": reason}
+            self.open_misses.append(miss)
+            self.notify.send(self.key("MISSED", a["card_key"]),
+                             ctitle(self.symbol, f"SETUP MISSED · {a['side']}"),
+                             [f"No position within {self.cfg.missed_grace_min} min — /override to let Aureon take it"],
+                             fields=[field("Signal", f"{a['kind']} · {ist(a['bar'], self.off)} IST"),
+                                     field("Card price", f"{a['price']:.2f}"),
+                                     field("Now", f"{now_px:.2f}" if now_px else "—"),
+                                     field("Drift", f"{drift:+.2f} pts"),
+                                     field("Suggested lots", f"{a.get('lots', '—')}"),
+                                     field("SL", f"{a.get('sl', '—')}"),
+                                     field("Minutes since signal", f"{elapsed / 60:.0f}")],
+                             color=EVENT_COLOURS.get("info", 0xFEE75C),
+                             footer=cfooter(self.S.display_name, "missed setup"))
+        self.open_asks = remaining
+        _save_open_asks(self.cfg.log_dir, self.symbol, self.open_asks)
+
+    def check_override(self, miss_key: str | None = None) -> dict | None:
+        """Check if the latest (or specified) miss is still overridable. Returns the miss dict or None with reason."""
+        if not self.open_misses:
+            return None
+        miss = None
+        if miss_key:
+            miss = next((m for m in self.open_misses if m["card_key"] == miss_key), None)
+        else:
+            miss = self.open_misses[-1] if self.open_misses else None
+        if not miss:
+            return None
+        now = _time.time()
+        elapsed = now - miss["missed_t"]
+        if elapsed > self.cfg.override_window_min * 60:
+            miss["expired_reason"] = "time"; return None
+        # Check drift
+        tk = None
+        if not self.dry:
+            try: tk = broker.tick(self.symbol)
+            except Exception: pass
+        now_px = (tk["bid"] if miss["side"] == "LONG" else tk["ask"]) if tk else miss.get("now_price", miss["price"])
+        s = 1 if miss["side"] == "LONG" else -1
+        drift_against = round(-s * (now_px - miss["price"]), 2)  # positive = against the trade
+        if drift_against > self.cfg.override_max_drift:
+            miss["expired_reason"] = f"drift {drift_against:+.1f}"; return None
+        # Check SL crossed
+        if miss.get("sl") is not None:
+            if (miss["side"] == "LONG" and now_px <= miss["sl"]) or (miss["side"] == "SHORT" and now_px >= miss["sl"]):
+                miss["expired_reason"] = "SL crossed"; return None
+        # Check blackout
+        ist_h = datetime.now(IST).hour + datetime.now(IST).minute / 60
+        if not broker.market_open(self.symbol, self.off, self.dry):
+            miss["expired_reason"] = "market closed"; return None
+        if ist_h >= 23 or ist_h < 5.5:
+            miss["expired_reason"] = "blackout hours"; return None
+        miss["now_price"] = now_px
+        miss["drift_at_press"] = round(s * (now_px - miss["price"]), 2)
+        return miss
+
+    def consume_miss(self, card_key: str):
+        """Remove a miss from the open list (after override or ignore)."""
+        self.open_misses = [m for m in self.open_misses if m["card_key"] != card_key]
 
     def _streak_n(self) -> int:
         """Consecutive losing closed deals (last 3 days), cached per bar."""
@@ -605,6 +763,7 @@ class SymbolAgent(threading.Thread):
                             color=EVENT_COLOURS["signal_long" if r.side == "LONG" else "signal_short"], footer=cfooter(self.S.display_name, "re-entry"),
                             meta={"symbol": self.symbol, "side": r.side, "kind": "reentry", "price": r.price, "bar": bar_t, "mode": self.S.name,
                                   "sl": stop, "chop": _chop, "chop_crosses": _chop_n, **self._suggested(r.price - stop)})
+            self.track_ask(re_key, r.side, "reentry", r.price, bar_t, self._suggested(r.price - stop).get("lots"), stop)
             for adv in self.advisors():
                 adv.request_entry(self, "reentry", r.side, bar_t, df, card_key=re_key)
 
@@ -779,6 +938,8 @@ class SymbolAgent(threading.Thread):
                                    **(self._suggested(g.pre_stop) if g else {})},
                              fields=fields, color=EVENT_COLOURS["signal_long" if side == "LONG" else "signal_short"],
                              footer=cfooter(self.S.display_name, f"bar {ist(bar_t, self.off)}"))
+            self.track_ask(ask_key, side, kind, close, bar_t, self._suggested(g.pre_stop).get("lots") if g else None,
+                          (close - s * g.pre_stop) if g else None)
             if kind in ("P", "cross"):                                       # v1.10.0: enqueue only — never blocks the poll
                 for adv in self.advisors():
                     adv.request_entry(self, kind, side, bar_t, df, card_key=ask_key)
@@ -911,6 +1072,7 @@ class SymbolAgent(threading.Thread):
                                 meta={"symbol": self.symbol, "side": side, "kind": kind, "price": close, "bar": bar_t, "mode": self.S.name,
                                       "sl": stop, "chop": _chop, "chop_crosses": _chop_n, **(self._suggested(g.pre_stop) if g else {})},
                                 fields=fields, color=colour, footer=cfooter(self.S.display_name, f"bar {ist(bar_t, off)}"))
+                self.track_ask(ask_key, side, kind, close, bar_t, self._suggested(g.pre_stop).get("lots") if g else None, stop)
                 for adv in self.advisors():                                    # the ENTER bar only — never raw CROSS / MULTI
                     adv.request_entry(self, "enter", side, bar_t, df, card_key=ask_key)
 
