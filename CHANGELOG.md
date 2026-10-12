@@ -2,6 +2,18 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.3.14 — 2026-10-12  (PATCH: spread + slippage in replay and reports)
+- **Live signals**: every `signal` journal event records `spread_pts` from the live tick at the signal bar.
+- **Live orders**: `order_placed` journal event gains `slippage_pts` (fill − card price in trade direction; positive = worse),
+  `spread_pts` (at fill), and `card_price`.
+- **Replay** (`run.py`): `--spread PTS` (default 0.3, env `AUREON_REPLAY_SPREAD`). The research summary shows
+  `gross +X · cost Y (assumed 0.3) · **net +Z**`. Each simulated trade's result is gross; net = gross − spread per trade.
+- **Compare card**: new "Costs (taken trades)" field shows `gross · cost (spread + slippage) · net` for graded taken trades.
+  Live rows use real costs from journal; replay rows use the assumption.
+- **Compare Row**: `spread_pts` and `slippage_pts` fields (from signal and order_placed journal events).
+- Old journals without cost fields load with None values (no error).
+- Strategy rules changed: NO.
+
 ## v2.3.13 — 2026-10-12  (PATCH: /halt kill switch)
 - **`/halt [reason]`**: sets persistent HALT flag in `logs/halt.json`; closes every open position on every symbol via
   `broker.close` (retried 3x); summary card with per-ticket retcodes. Dry mode / execution off: reports "would close" without

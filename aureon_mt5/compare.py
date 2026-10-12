@@ -57,6 +57,8 @@ class Row:
     lots_suggested: float | None = None # v2.3.7: risk-based suggested size
     missed: bool = False               # v2.3.9: setup_missed event fired
     overridden: bool = False           # v2.3.9: override event fired
+    spread_pts: float | None = None    # v2.3.14: spread at signal time
+    slippage_pts: float | None = None  # v2.3.14: slippage from order_placed
 
 
 def _ev(v: dict, source: str = "claude"):
@@ -83,6 +85,10 @@ def build_rows(records: list[dict], graded: list, since: int, until: int, off: f
     for d in records:
         if d.get("event") == "decision" and d.get("decision") in ("TAKE", "SKIP", "EXPIRED"):
             decisions[(d.get("symbol"), d.get("bar"))] = d
+    orders = {}
+    for o in records:
+        if o.get("event") == "order_placed" and o.get("ok"):
+            orders[(o.get("symbol"), o.get("bar"))] = o
     missed_bars = {(r.get("symbol"), r.get("bar") or r.get("card_key")) for r in records if r.get("event") == "setup_missed"}
     overridden_bars = {(r.get("symbol"), r.get("bar") or r.get("card_key")) for r in records if r.get("event") == "override"}
     rows, seen = [], set()
@@ -94,6 +100,7 @@ def build_rows(records: list[dict], graded: list, since: int, until: int, off: f
         seen.add(key)
         row = Row(s.get("symbol"), kind, side, int(s["bar"]), SESSIONS.get(session_of(int(s["bar"]), off), "Off-hours"))
         row.chop = bool(s.get("chop"))
+        row.spread_pts = s.get("spread_pts")
         g = grades.get(key)
         if g is not None:
             row.grade = g.grade; row.money = g.money
@@ -115,6 +122,10 @@ def build_rows(records: list[dict], graded: list, since: int, until: int, off: f
             row.lots_suggested = dec_rec.get("lots_suggested")
         elif dec_rec == "TAKE":
             row.me, row.me_via = "TAKEN", "button"
+        # v2.3.14: slippage from order_placed
+        order = orders.get((row.symbol, s.get("bar")))
+        if order:
+            row.slippage_pts = order.get("slippage_pts")
         # v2.3.9: missed/overridden from journal events (match by symbol+bar)
         sig_key = (row.symbol, s.get("bar"))
         if sig_key in missed_bars:
@@ -604,6 +615,19 @@ def card(res: CompareResult, *, title: str = "AUREON · MT5 · COMPARE", mode_di
     if extra:
         pbt += "\n" + " · ".join(extra)
     fields.append({"name": "Pullbacks (Claude vs guardian)", "value": pbt, "inline": False})
+    # v2.3.14: costs summary (spread + slippage from live; labelled when from journal)
+    cost_rows = [r for r in res.rows if r.status == "GRADED" and r.me == "TAKEN"]
+    if cost_rows:
+        spreads = [r.spread_pts for r in cost_rows if r.spread_pts is not None]
+        slips = [r.slippage_pts for r in cost_rows if r.slippage_pts is not None]
+        gross_pts = sum(r.points for r in cost_rows if r.points is not None)
+        total_cost = sum(spreads) + sum(slips) if (spreads or slips) else 0
+        net_pts = gross_pts - total_cost
+        parts = [f"gross {gross_pts:+.1f} pts"]
+        if spreads or slips:
+            parts.append(f"cost {total_cost:.1f} pts (spread {sum(spreads):.1f} + slip {sum(slips):.1f})")
+        parts.append(f"net {net_pts:+.1f} pts")
+        fields.append({"name": "Costs (taken trades)", "value": " · ".join(parts), "inline": False})
     h = res.h2h or {}
     if h.get("both"):                                                     # v2.3.0 head-to-head
         sp = (f"when they SPLIT ({h['split']}): Claude right {h['claude_right']} ({h['claude_pts']:+.1f} pts) · "

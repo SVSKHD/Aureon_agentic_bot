@@ -471,6 +471,16 @@ class SymbolAgent(threading.Thread):
     def _chop_crosses(self) -> int:
         return self.chop["crosses"] if self.chop else 0
 
+    def _spread_pts(self) -> float | None:
+        """v2.3.14: current spread from broker tick (None in dry mode)."""
+        if self.dry:
+            return None
+        try:
+            tk = broker.tick(self.symbol)
+            return round(tk["ask"] - tk["bid"], 5) if tk else None
+        except Exception:
+            return None
+
     # ------------------------------------------------------------------ v2.3.9 missed setup
     def track_ask(self, card_key: str, side: str, kind: str, price: float, bar: int, lots: float | None, sl: float | None):
         """Record that a signal ask card was posted. Called from _detect / _detect_2050."""
@@ -740,9 +750,9 @@ class SymbolAgent(threading.Thread):
             r = res[-1]; self.seen_re.add(r.time)
             s_ = 1 if r.side == "LONG" else -1
             self.health["last_signal"] = f"{r.side} RE @ {ist(bar_t, self.off)}"
-            _chop = self._is_chop(); _chop_n = self._chop_crosses()
+            _chop = self._is_chop(); _chop_n = self._chop_crosses(); _spread = self._spread_pts()
             self.journal.log("signal", symbol=self.symbol, mode=self.S.name, side=r.side, signal_kind="reentry", price=r.price, bar=bar_t,
-                             chop=_chop, chop_crosses=_chop_n)
+                             chop=_chop, chop_crosses=_chop_n, spread_pts=_spread)
             self.latest_signal = {"bar_time": bar_t, "symbol": self.symbol, "strategy": self.S.name, "kind": "reentry", "direction": r.side, "consumed": False}
             if not self.leg or self.leg["side"] != r.side:
                 self.leg = {"side": r.side, "kind": "reentry", "start_t": bar_t, "start_i_time": bar_t, "start_px": r.price,
@@ -920,9 +930,9 @@ class SymbolAgent(threading.Thread):
                 self.leg = {"side": side, "kind": kind, "start_t": bar_t, "start_i_time": bar_t, "start_px": close,
                             "best": 0.0, "best_px": close, "best_t": bar_t, "against": 0.0, "steps_sent": 0}
             self.health["last_signal"] = f"{side} {kind} @ {ist(bar_t, self.off)}"
-            _chop = self._is_chop(); _chop_n = self._chop_crosses()
+            _chop = self._is_chop(); _chop_n = self._chop_crosses(); _spread = self._spread_pts()
             self.journal.log("signal", symbol=self.symbol, mode=self.S.name, side=side, signal_kind=kind, price=close, bar=bar_t,
-                             chop=_chop, chop_crosses=_chop_n)
+                             chop=_chop, chop_crosses=_chop_n, spread_pts=_spread)
             g = self.g
             fields = signal_fields(side=side, kind={"P": "P · pre-cross", "cross": "50/80 cross confirmed", "late": "late entry", "pullback": "pullback entry"}.get(kind, kind),
                                    price=close, ema_fast=ef, ema_slow=es, fast=self.S.fast, slow=self.S.slow,
@@ -1054,10 +1064,10 @@ class SymbolAgent(threading.Thread):
                     self.leg = {"side": side, "kind": kind, "start_t": bar_t, "start_i_time": bar_t, "start_px": close,
                                 "best": 0.0, "best_px": close, "best_t": bar_t, "against": 0.0, "steps_sent": 0}
                 self.health["last_signal"] = f"{side} enter ({kind}) @ {ist(bar_t, off)}"
-                _chop = self._is_chop(); _chop_n = self._chop_crosses()
+                _chop = self._is_chop(); _chop_n = self._chop_crosses(); _spread = self._spread_pts()
                 self.journal.log("signal", symbol=self.symbol, mode=self.S.name, side=side, signal_kind=kind, price=close, bar=bar_t,
                                  cross_bar=info.get("cross_time"), confirm_bar=info.get("confirm_time"), shoot=info.get("shoot"),
-                                 chop=_chop, chop_crosses=_chop_n)
+                                 chop=_chop, chop_crosses=_chop_n, spread_pts=_spread)
                 stop = (close - s * g.pre_stop) if g else None
                 fields = ([field("Side", f"**{side}**"), field("Setup", f"confirmed cross · {kind} entry"), field("Price", f"**{close:.2f}**")]
                           + info_fields(info)

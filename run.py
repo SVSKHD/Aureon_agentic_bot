@@ -50,11 +50,13 @@ def replay_range(S, symbol, source, d0, d1, csv, off, news, verbose=False, trade
     return days
 
 
-def research_summary(days: list[dict], S, symbol: str, lot: float, point_value: float, off: float) -> str:
+def research_summary(days: list[dict], S, symbol: str, lot: float, point_value: float, off: float, spread: float = 0.0) -> str:
     """days: [{"day": date, "journeys": [...], "summary": {...}}]. Points, $ at --lot, offered/available/captured, counts, goal days,
     best/worst day, max drawdown (trade by trade, closed trades), month table."""
     closed = [(d["day"], j) for d in days for j in d["journeys"] if j.exit_reason != "open"]
-    net = sum(j.result for _, j in closed)
+    gross = sum(j.result for _, j in closed)
+    cost_total = spread * len(closed)
+    net = gross - cost_total
     wins = [j for _, j in closed if j.result > 0]; losers = [j for _, j in closed if j.result <= 0]
     by_reason = {}
     for _, j in closed:
@@ -73,8 +75,10 @@ def research_summary(days: list[dict], S, symbol: str, lot: float, point_value: 
             peak, peak_day = eq, d
         if eq - peak < dd:
             dd, dd_from, dd_to = eq - peak, peak_day, d
+    spread_note = f" (assumed {spread:g})" if spread > 0 else ""
     L = [f"RESEARCH SUMMARY · {S.display_name} · {symbol} · {days[0]['day']:%Y-%m-%d} → {days[-1]['day']:%Y-%m-%d} · {len(days)} trading days",
-         f"profit {net:+.1f} pts  (${net * lot * point_value:,.0f} at {lot:g} lot, ${point_value:g}/pt/lot)   ·   "
+         f"gross {gross:+.1f} pts · cost {cost_total:.1f} pts{spread_note} · **net {net:+.1f} pts**  "
+         f"(${net * lot * point_value:,.0f} at {lot:g} lot, ${point_value:g}/pt/lot)   ·   "
          f"moves offered {offered:+.1f} · available at entry {available:+.1f} · captured {captured:.1f}%",
          f"trades {len(closed)} · winners {len(wins)} · losers {len(losers)} · " + " · ".join(f"{k.replace('_', ' ')} {v}" for k, v in sorted(by_reason.items())),
          f"goal days (≥ +{GOAL_PTS:g}) {goal_days}/{len(days)} · losing days {losing_days} · "
@@ -137,6 +141,7 @@ def main():
     ap.add_argument("--server-utc-offset", type=float, default=3.0); ap.add_argument("--out", default="out")
     ap.add_argument("--lot", type=float, default=1.0); ap.add_argument("--point-value", type=float, help="$ per point per lot (default: 100 gold, 5000 silver)")
     ap.add_argument("--trades", action="store_true", help="range replay: list every trade")
+    ap.add_argument("--spread", type=float, default=float(os.environ.get("AUREON_REPLAY_SPREAD", "0.3")), help="assumed spread in pts for net calculation (default 0.3)")
     # v2.1.0 shadow replay (measurement only; without --claude nothing changes)
     ap.add_argument("--claude", choices=["entry", "entry+pullback"], help="ask Claude at every ENTER bar (and pullbacks) exactly as live; verdicts recorded, never applied")
     ap.add_argument("--claude-max", type=int, default=60, help="max Claude calls per run (default 60); unscored bars continue from the cache next run")
@@ -167,7 +172,7 @@ def main():
         days = replay_range(S, a.symbol, a.source, d0, d1, a.csv, off, news, verbose=True, trades=a.trades)
         if not days:
             print("no bars in that range"); sys.exit(1)
-        block = research_summary(days, S, a.symbol, a.lot, pv, off)
+        block = research_summary(days, S, a.symbol, a.lot, pv, off, spread=a.spread)
         print("\n" + block)
         if a.claude or a.codex:
             shadow_replay(a, S, off, news, days, f"{a.symbol} · {d0} → {d1}")
@@ -198,7 +203,7 @@ def main():
             if e.label in ("CROSS", "CONFIRMED", "MULTI", "WP", "F"):
                 print(f"    {datetime.fromtimestamp(e.time - off * 3600, tz=IST):%H:%M} IST  {e.label:<9} {e.direction:<4} {e.reason}")
         if rng:
-            print("\n" + research_summary([{"day": rng["day"], "journeys": m5["journeys"], "summary": sm}], S, a.symbol, a.lot, pv, off))
+            print("\n" + research_summary([{"day": rng["day"], "journeys": m5["journeys"], "summary": sm}], S, a.symbol, a.lot, pv, off, spread=a.spread))
     if a.claude or a.codex:
         shadow_replay(a, S, off, news, [{"day": rng["day"] if rng else date.today(), "journeys": m5["journeys"], "summary": sm, "df": m5["df"]}],
                       f"{a.symbol} · {rng['day'] if rng else 'latest bars'}")

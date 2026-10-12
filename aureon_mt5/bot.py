@@ -584,14 +584,17 @@ def execute_entry(cfg, agents, journal, item: dict, side: str, user, notify=None
                 "ok": False, "ticket": None, "placed": False, "lots": lots_chosen}
     if cfg.execution_enabled and (demo or cfg.allow_live) and not getattr(cfg, "dry", False):
         r = broker.place_market(sym, side, lots_chosen, sl, comment=f"aureon {aid}", retry_sleep=retry_sleep)
+        card_px = float(m.get("price") or px or 0.0)
+        fill = r.price if r.price is not None else px
+        slip = ((fill - card_px) if side == "LONG" else (card_px - fill)) if (fill is not None and card_px) else None
+        spread_at_fill = round(r.ask - r.bid, 5) if (r.ask is not None and r.bid is not None) else None
         journal.log("order_placed", symbol=sym, mode=m.get("mode"), alert_id=aid, side=side, lots=lots_chosen, sl=sl, ok=bool(r.ok),
                     status=r.status, retcode=r.retcode, ticket=r.ticket, fill=r.price, by=str(user),
-                    lots_chosen=lots_chosen, lots_suggested=lots_suggested, lots_source=lots_source, half_size=half_size)
+                    lots_chosen=lots_chosen, lots_suggested=lots_suggested, lots_source=lots_source, half_size=half_size,
+                    slippage_pts=round(slip, 2) if slip is not None else None, spread_pts=spread_at_fill, card_price=card_px)
         if ag is not None: ag.attach_alert(aid, side, card_key=card_key)
         if r.ok:
-            card_px = float(m.get("price") or px or 0.0); fill = r.price if r.price is not None else px
-            slip = ((fill - card_px) if side == "LONG" else (card_px - fill)) if (fill is not None and card_px) else None
-            spread = (r.ask - r.bid) if (r.ask is not None and r.bid is not None) else None
+            spread = spread_at_fill
             sugg_s = f"{lots_suggested:g}" if lots_suggested is not None else "—"
             size_field = f"{lots_chosen:g} lots ({lots_source}) · suggested {sugg_s} · half size: {'yes' if half_size else 'no'}"
             capped = lots is not None and float(lots) > cfg.max_lots
