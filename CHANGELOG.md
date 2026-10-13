@@ -2,6 +2,15 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.6.2 — 2026-10-13  (PATCH: event publisher for the connector)
+- **`aureon_mt5/publisher.py`**: when `AUREON_PUBLISH=1` and `REDIS_URL` set, appends to Redis Stream `aureon:events`
+  (XADD, MAXLEN ~10000): open, sl_change, partial, close, heartbeat, halt, unhalt. Payload: event_id (uuid4, idempotent),
+  ts, master_ticket, symbol, side, lots, price, sl, actor, mode, version.
+- Publishing happens AFTER MT5 confirm + state + journal. Redis failure → spool to `logs/outbox.jsonl`, replayed when
+  Redis returns. Reconciliation snapshot every tick: `aureon:positions` hash.
+- `redis` is an optional dependency. `AUREON_PUBLISH=0` default.
+- Strategy rules changed: NO.
+
 ## v2.6.1 — 2026-10-13  (PATCH: bounded threshold tuning + /approve)
 - **`aureon_mt5/tuning.py`**: for each tunable parameter (`pre_stop`, `secure_at`, `ride_step`, `early_at`, `early_level`,
   `chop_crosses`, `missed_grace_min`, `override_max_drift`, `heartbeat_stale_min`) — min, max, and max step per change defined
