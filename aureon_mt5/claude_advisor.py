@@ -61,6 +61,8 @@ def _side_word(side: str | None) -> str | None:
 
 
 # ============================================================================= snapshot (built on the agent thread)
+# v2.5.0: context_pack.pack is the canonical builder; build_snapshot is kept as a thin backwards-compat wrapper
+# New callers should use context_pack.pack directly.
 def build_snapshot(agent, event: str, side: str, bar_t: int, df, *, position: dict | None = None, st: dict | None = None,
                    kind: str | None = None) -> dict:
     """Only market/strategy data the bot already has. Never account, balance, login, webhook or token."""

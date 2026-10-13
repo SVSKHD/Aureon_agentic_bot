@@ -2,6 +2,15 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.5.0 — 2026-10-13  (MINOR: context packer)
+- **`aureon_mt5/context_pack.py`** (pure): `pack(agent, df, signal, journal) -> dict` + `to_prompt(dict) -> str`.
+  Contents: last N closed bars (AUREON_CTX_BARS default 48: close, ema fast/slow), cross/morning counts, chop flag, session,
+  minutes to/since news, HTF bias, spread, today's trades/results, last 10 closed trades, governor state, control mode,
+  position data (entry, SL, secured, soft_lock, peak, MAE). Fixed key order, rounded numbers, deterministic truncation order
+  (bars dropped first) to fit AUREON_CTX_MAX_CHARS (default 6000).
+- **`build_snapshot`** in `claude_advisor.py` kept as backwards-compat wrapper (comment directs new callers to `context_pack.pack`).
+- Strategy rules changed: NO.
+
 ## v2.4.5 — 2026-10-13  (PATCH: soft early lock)
 - **Soft early lock** (`AUREON_EARLY_LOCK_MODE=soft`, default): when peak >= `early_at`, do NOT move the broker SL. Instead set
   `st["soft_lock"]` and close only when a NEW CLOSED M5 bar's close is at or beyond `entry + level` against the trade. Intrabar
