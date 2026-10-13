@@ -1062,6 +1062,26 @@ class SymbolAgent(threading.Thread):
                                  [f"**{ev.reason}**", "still watching the pullback window" if "position" in ev.reason else "this cross is skipped"],
                                  fields=info_fields(info) + [field("Price", f"**{close:.2f}**")], color=EVENT_COLOURS["info"],
                                  footer=cfooter(self.S.display_name, "no entry"))
+            elif ev.label == "PRE":
+                # v2.5.2: PRE-CROSS heads-up (notification only, no buttons, no trade)
+                if self.cfg.pre_alert_2050:
+                    gap_now = info.get("gap", 0); gap_atr = info.get("gap_atr", 0)
+                    ist_h = datetime.now(IST).hour + datetime.now(IST).minute / 60
+                    skip_session = getattr(self.cfg, "_test_skip_session", False)
+                    blackout = "" if skip_session or (5.5 <= ist_h < 23) else " (no entries now)"
+                    self.journal.log("pre_cross", symbol=self.symbol, mode=self.S.name, side=side, price=close, bar=bar_t,
+                                     gap=gap_now, gap_atr=gap_atr, chop=self._is_chop())
+                    self.health["last_pre"] = f"PRE {side} @ {ist(bar_t, off)}"
+                    self.notify.send(self.key(f"PRE_{side}", bk), ctitle(self.symbol, f"PRE-CROSS forming · {side}"),
+                                     [f"EMA {self.S.fast} is closing on EMA {self.S.slow} {'from above' if side == 'SHORT' else 'from below'}"
+                                      f" — a {side} cross may form · not a trade{blackout}",
+                                      f"entry still needs: cross → confirm (3 bars, gap 1.5) → pullback"],
+                                     fields=[field("Gap now", f"{gap_now:+.2f} pts ({gap_atr:.1f}× ATR)"),
+                                             field(f"EMA {self.S.fast}", f"{ef:.2f}"), field(f"EMA {self.S.slow}", f"{es:.2f}"),
+                                             field("Price", f"**{close:.2f}**"), field("Session", names.get(session_of(bar_t, off), "—")),
+                                             field("Chop", "yes" if self._is_chop() else "no")],
+                                     color=EVENT_COLOURS.get("cross", 0xFEE75C),
+                                     footer=cfooter(self.S.display_name, f"bar {ist(bar_t, off)} · PRE only"))
             elif ev.label in ("EB", "ES"):
                 kind = "pullback" if ev.reason == "pullback" else "no-pullback"
                 self.latest_signal = {"bar_time": bar_t, "symbol": self.symbol, "strategy": self.S.name, "kind": kind, "direction": side, "consumed": False}

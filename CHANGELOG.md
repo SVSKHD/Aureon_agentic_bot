@@ -2,6 +2,16 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.5.2 — 2026-10-13  (PATCH: ema2050 PRE-CROSS heads-up + p_win floor)
+- **ema2050 PRE-CROSS detection** (`strategies/ema2050/journeys.py`): ported from ema5080's P logic using EMA 20/50.
+  CrossEvent label `"PRE"` emitted when: price closes through EMA20 for 2 bars, gap shrinking, gap <= 1.5× ATR, lines
+  were separated within 24 bars. One PRE per approach, re-arms after a cross or cooldown. PRE never creates a trade.
+- **Agent card**: `notify.send` (NOT ask — no TAKE buttons, no track_ask, no missed-setup, no AGENT entry). Lines: "EMA 20 is
+  closing on EMA 50 — a LONG cross may form · not a trade". Journal `pre_cross`.
+- **`AUREON_PRE_ALERT_2050=1`** (default on); `AUREON_PWIN_FLOOR=0` (off by default, for v2.5.2 AGENT mode integration).
+  `AUREON_PWIN_WAIT_S=15`.
+- Strategy rules changed: NO — notification only.
+
 ## v2.5.1 — 2026-10-13  (PATCH: advisors as p_win rankers + calibration)
 - **Advisor output schema**: entry events now accept ranker mode — `p_win` (0–1), `rationale` (<=200 chars), `risks` (short strings).
   `decision` (TAKE/SKIP) is optional for entry events; when absent, `decision="RANK"`. Pullback HOLD/TIGHTEN/CLOSE unchanged.

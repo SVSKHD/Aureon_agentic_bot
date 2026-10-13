@@ -60,6 +60,13 @@ class Rules:
     touch_tol: float = 1.5          # pullback: low <= EMA20 + tol (longs) / high >= EMA20 − tol (shorts)
     pullback_window: int = 12       # first touch after the confirm bar, up to confirm + this
     max_chase: float = 5.0          # the FALLBACK entry must close within this of EMA20 (never applied to touch entries)
+    # ---- v2.5.2 PRE-CROSS alert (notification only, never creates a trade)
+    pre_alert: bool = True
+    pre_gap_atr: float = 1.5         # gap must be <= this × avg range
+    pre_sep_atr: float = 1.5         # lines must have been separated by >= this × avg range within pre_sep_bars
+    pre_sep_bars: int = 24
+    pre_through_bars: int = 2        # price must close through EMA20 for this many consecutive bars
+    pre_cooldown_bars: int = 12      # one PRE per approach, re-arm after a cross or cooldown
     shoot_bars: int = 40            # pre-cross shoot: bars before the cross (report only)
     min_shoot: float = 0.0          # 0 = no filter (tested: filters failed 2025)
     no_entry_server_hours: tuple = (21.0, 24.0)   # no entries from 21:00 server to midnight — the only time filter
@@ -473,7 +480,48 @@ def build(df: pd.DataFrame, rules: Rules, server_offset_h: float = 3.0, trade_fr
     for sname, *_ in SESSIONS:
         xs = [x for x in closed if x.session == sname]
         summary["by_session"][sname] = {"trades": len(xs), "net": round(sum(x.result for x in xs), 2)}
-    return {"journeys": journeys, "events": events, "pre": [], "summary": summary, "bar_states": states,
+    # ---- v2.5.2 PRE-CROSS detection (notification only, never creates a trade)
+    pre_events: list[CrossEvent] = []
+    if rules.pre_alert:
+        avg_rng = pd.Series(high - low).rolling(20, min_periods=1).mean().to_numpy()
+        pre_armed = True; pre_last = -rules.pre_cooldown_bars
+        for i in range(max(rules.pre_through_bars, 2), n):
+            if i in cross_set:
+                pre_armed = True; pre_last = i; continue  # re-arm after a cross
+            if i - pre_last < rules.pre_cooldown_bars:
+                continue  # cooldown
+            if not pre_armed or sign[i] == 0:
+                continue
+            # The coming cross direction is AGAINST the current EMA order
+            d_new = "bear" if sign[i] > 0 else "bull"
+            s_new = -1 if d_new == "bear" else 1
+            # Price must close through EMA20 for pre_through_bars consecutive bars
+            through = True
+            for k in range(rules.pre_through_bars):
+                idx = i - k
+                if s_new < 0:
+                    through = through and close[idx] < e20[idx]
+                else:
+                    through = through and close[idx] > e20[idx]
+            if not through:
+                continue
+            # Gap must be shrinking
+            if not (abs(gap[i]) < abs(gap[i - 1])):
+                continue
+            # Gap must be <= pre_gap_atr × avg range
+            ar = avg_rng[i] if not np.isnan(avg_rng[i]) else 0.0
+            if ar <= 0 or abs(gap[i]) > rules.pre_gap_atr * ar:
+                continue
+            # Lines must have been separated within pre_sep_bars
+            lo_b = max(0, i - rules.pre_sep_bars)
+            if np.isnan(avg_rng[i]) or np.nanmax(np.abs(gap[lo_b:i + 1])) < rules.pre_sep_atr * avg_rng[i]:
+                continue
+            pre_events.append(CrossEvent(i, int(time[i]), d_new, "PRE",
+                                          f"EMA 20 closing on EMA 50 — {d_new} cross may form",
+                                          info={"gap": round(float(gap[i]), 2), "gap_atr": round(abs(gap[i]) / ar, 2) if ar else 0}))
+            pre_armed = False; pre_last = i
+
+    return {"journeys": journeys, "events": events + pre_events, "pre": pre_events, "summary": summary, "bar_states": states,
             "cross_infos": infos, "day_end_bar": last_k if day_end is not None else None}
 
 
