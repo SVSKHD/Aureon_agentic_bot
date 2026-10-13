@@ -1152,6 +1152,15 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
                 return Reply(content=f"watchdog: error reading state — {e}")
         await run(inter, "watchdog", work)
 
+    @tree.command(name="review", description="Show the latest nightly review (pattern flags)")
+    async def review_cmd(inter: discord.Interaction):
+        def work():
+            from . import review as _review
+            result = _review.compute(journal, cfg.server_utc_offset)
+            c = _review.card(result)
+            return Reply(card=c)
+        await run(inter, "review", work)
+
     @tree.command(name="eod", description="Run the end-of-day review now (or for a specific date)")
     @app_commands.describe(date="YYYY-MM-DD (default: today)")
     async def eod_cmd(inter: discord.Interaction, date: str = ""):

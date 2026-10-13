@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from dotenv import load_dotenv
 load_dotenv()   # load .env if present
 
-VERSION = "2.5.3"
+VERSION = "2.6.0"
 
 
 def _parse_lot_buttons(raw: str) -> list[float]:

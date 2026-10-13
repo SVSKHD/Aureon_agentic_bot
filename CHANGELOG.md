@@ -2,6 +2,16 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.6.0 — 2026-10-13  (MINOR: nightly review)
+- **`aureon_mt5/review.py`** (deterministic, no LLM): after the EOD review, scores the last 20 trading days from journal:
+  entries and exits by session (Asia/London/NY) × actor (human/agent): n, win%, net pts, stops. Protect-stop hit rate per
+  session, "secured then closed early" pts left on the table, chop vs clear, missed vs overridden.
+- **Pattern flags** with fixed thresholds: e.g. "protect stop hit 58% in Asia (n=19) vs 31% overall" → `pre_stop`;
+  "early close left avg +6.2 pts after +10 secure" → `ride_step`. Each flag names the parameter it concerns.
+- One card `🔍 NIGHTLY REVIEW` with summary + per-session metrics + top 5 flags. Full results to
+  `logs/review/<date>.json`. `/review` shows the latest.
+- Strategy rules changed: NO.
+
 ## v2.5.3 — 2026-10-13  (PATCH: Codex end-of-day review)
 - **`aureon_mt5/eod_review.py`**: at `AUREON_EOD_AT` (default 23:15 IST) on trading days, builds a day pack from journal
   (signals, decisions, orders, guardian actions, misses, governor blocks, costs, chop) and runs `codex exec` with a read-only

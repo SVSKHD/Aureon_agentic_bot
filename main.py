@@ -398,6 +398,17 @@ def main():
             plan_tick(cfg, agents, journal, notify)
             from aureon_mt5.eod_review import tick as eod_tick
             eod_tick(cfg, journal, notify)
+            # v2.6.0 nightly review (deterministic, after EOD)
+            from aureon_mt5 import review as _review
+            _review_key = f"review:{datetime.now(IST).strftime('%Y-%m-%d')}"
+            if _review_key not in notify.sent and datetime.now(IST).hour >= 23 and datetime.now(IST).minute >= 20:
+                try:
+                    res = _review.compute(journal, cfg.server_utc_offset)
+                    c = _review.card(res)
+                    notify.send(_review_key, c["title"], [c["description"]], fields=c["fields"], color=0x95A5A6, footer=c["footer"])
+                    _review.save(cfg.log_dir, res, datetime.now(IST).strftime("%Y-%m-%d"))
+                except Exception:
+                    pass
             from aureon_mt5.control import check_auto_transitions
             from aureon_mt5.schedule import tick as schedule_tick
             for _sym in cfg.symbols:
