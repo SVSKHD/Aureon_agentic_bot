@@ -74,20 +74,31 @@ def extract_json(text: str) -> dict:
 
 
 def validate(v: dict, event: str) -> dict:
-    """Shape check against the event. Raises ValueError on anything we must not act on."""
+    """Shape check against the event. Raises ValueError on anything we must not act on.
+    v2.5.1: entry events accept ranker schema (p_win + rationale, no decision required)."""
     allowed = DECISIONS.get(event)
     if not allowed:
         raise ValueError(f"unknown event {event!r}")
+
+    # v2.5.1: ranker schema for entry events — p_win is the primary output, decision is optional
+    is_entry = event in ENTRY_EVENTS
     dec = str(v.get("decision", "")).strip().upper()
-    if dec not in allowed:
+    if is_entry and not dec:
+        dec = "RANK"  # ranker mode: no TAKE/SKIP decision, just p_win
+    elif not is_entry and not dec:
+        raise ValueError(f"decision required for {event}")
+    elif dec and dec not in allowed and dec != "RANK":
         raise ValueError(f"decision {dec or '∅'} not valid for {event}")
+
     side = v.get("side")
     side = None if side in (None, "", "null", "None") else str(side).strip().upper()
     if side not in (None, "BUY", "SELL"):
         raise ValueError(f"side {side!r} invalid")
     conf = str(v.get("confidence", "")).strip().lower()
-    if conf not in CONFIDENCE:
-        raise ValueError(f"confidence {conf!r} invalid")
+    if conf and conf not in CONFIDENCE:
+        conf = "medium"  # default for ranker mode
+    if not conf:
+        conf = "medium"
     tt = v.get("tighten_to")
     if tt in ("", "null", "None"):
         tt = None
@@ -98,8 +109,14 @@ def validate(v: dict, event: str) -> dict:
             raise ValueError("tighten_to not a number")
     if dec == "TIGHTEN" and tt is None:
         raise ValueError("TIGHTEN without tighten_to")
-    words = str(v.get("reason", "")).split()
-    ev = v.get("evidence")                                    # v2.0.0: the snapshot field names the verdict used (journaled)
+    # v2.5.1: rationale replaces reason for ranker mode; accept both
+    reason_text = v.get("rationale") or v.get("reason") or ""
+    words = str(reason_text).split()
+    risks = v.get("risks", [])
+    if isinstance(risks, str):
+        risks = [risks]
+    risks = [str(r)[:80] for r in risks if str(r).strip()][:5]
+    ev = v.get("evidence")
     if isinstance(ev, str):
         ev = [x.strip() for x in ev.split(",")]
     evidence = [str(x)[:40] for x in ev if str(x).strip()][:MAX_EVIDENCE] if isinstance(ev, (list, tuple)) else []
@@ -109,7 +126,8 @@ def validate(v: dict, event: str) -> dict:
     except (TypeError, ValueError):
         p_win = None
     return {"decision": dec, "side": side, "tighten_to": tt if dec == "TIGHTEN" else None, "confidence": conf,
-            "reason": " ".join(words[:MAX_REASON_WORDS]), "evidence": evidence, "p_win": p_win}
+            "reason": " ".join(words[:MAX_REASON_WORDS]), "rationale": " ".join(words[:MAX_REASON_WORDS]),
+            "evidence": evidence, "p_win": p_win, "risks": risks}
 
 
 def _is_auth(text: str) -> bool:

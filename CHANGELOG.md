@@ -2,6 +2,18 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.5.1 — 2026-10-13  (PATCH: advisors as p_win rankers + calibration)
+- **Advisor output schema**: entry events now accept ranker mode — `p_win` (0–1), `rationale` (<=200 chars), `risks` (short strings).
+  `decision` (TAKE/SKIP) is optional for entry events; when absent, `decision="RANK"`. Pullback HOLD/TIGHTEN/CLOSE unchanged.
+  Invalid/timeout → `p_win` None (fail closed = no ranking, never a block). Old verdict records still load.
+- **`validate()`** in `claude_cli.py` updated: accepts `rationale` and `risks` fields; `confidence` defaults to "medium" when absent.
+  No advisor can block, skip, or delay an entry — they only rank.
+- **`aureon_mt5/calibration.py`**: `calibrate(rows, source, min_n)` → `CalibResult(useful, top_half_avg, bottom_half_avg, buckets, brier)`.
+  "Useful" = top half beats bottom half on avg NET pts with n >= `AUREON_CALIB_MIN_N` (default 30). Stored in
+  `logs/advisor_calibration.json`. `is_useful(log_dir, source)` for downstream use (v2.5.2).
+- `AUREON_CALIB_MIN_N=30`.
+- Strategy rules changed: NO.
+
 ## v2.5.0 — 2026-10-13  (MINOR: context packer)
 - **`aureon_mt5/context_pack.py`** (pure): `pack(agent, df, signal, journal) -> dict` + `to_prompt(dict) -> str`.
   Contents: last N closed bars (AUREON_CTX_BARS default 48: close, ema fast/slow), cross/morning counts, chop flag, session,

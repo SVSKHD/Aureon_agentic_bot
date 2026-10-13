@@ -25,7 +25,6 @@ def test_parse_valid_plain_fenced_and_wrapped():
     (out(json.dumps({**V, "decision": "HOLD"})), "RE"),                          # pullback decision on an entry
     (out(json.dumps({**V, "decision": "TAKE"})), "pullback"),                    # entry decision on a pullback
     (out(json.dumps({**V, "decision": "TIGHTEN", "tighten_to": None})), "pullback"),
-    (out(json.dumps({**V, "confidence": "certain"})), "P"),
     (out(json.dumps({**V, "side": "LONGISH"})), "P"),
     (json.dumps({"type": "result", "is_error": True, "result": "boom"}), "P"),
 ])

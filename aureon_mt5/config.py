@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from dotenv import load_dotenv
 load_dotenv()   # load .env if present
 
-VERSION = "2.5.0"
+VERSION = "2.5.1"
 
 
 def _parse_lot_buttons(raw: str) -> list[float]:
@@ -94,6 +94,7 @@ class Config:
     claude_workdir: str = os.environ.get("AUREON_CLAUDE_WORKDIR", "") or os.path.join(os.path.expanduser("~"), "aureon_claude")
     # v1.11.0 weekly compare: optional Claude self-review of its wrong calls after the Saturday COMPARE card (counts toward the budget)
     compare_claude_review: bool = os.environ.get("AUREON_COMPARE_CLAUDE_REVIEW", "0") == "1"
+    calib_min_n: int = int(os.environ.get("AUREON_CALIB_MIN_N", "30"))
     ctx_bars: int = int(os.environ.get("AUREON_CTX_BARS", "48"))
     ctx_max_chars: int = int(os.environ.get("AUREON_CTX_MAX_CHARS", "6000"))
     voice: bool = os.environ.get("AUREON_VOICE", "0") == "1"
