@@ -28,6 +28,7 @@ from .common.context_chart import context_chart
 from .strategies.ema5080.trend import find_reentries, state_of
 from . import alerts as alerts_mod
 from .common.chop import chop_state as _chop_state
+from . import leg_guardian as lg
 import os
 import numpy as np
 
@@ -1174,6 +1175,259 @@ class SymbolAgent(threading.Thread):
                               mode=self.S.name, symbol=self.symbol, ticket=p["ticket"], action=f"CLOSE ({reason})", bid=r.bid, ask=r.ask,
                               retcode=r.retcode, comment=r.comment, last_error=r.last_error, retry="close by hand if it persists")
 
+    # ------------------------------------------------------------------ guardian: classic profile (pre-v2.7.0 behaviour)
+    def _guard_classic(self, p, st, g, s, new_bar, bar_t, df, close, ef, es, sgn, gap, tag):
+        sig = self.latest_signal
+        # 1c) early lock: soft (bar close) | hard (broker SL) | off
+        _elk = self.cfg.early_lock_mode
+        if g.early_at is not None and not st.get("soft_lock") and st["secured"] < g.early_level and st["peak"] >= g.early_at and _elk != "off":
+            if _elk == "soft":
+                st["soft_lock"] = g.early_level; st["soft_lock_t"] = bar_t; self._save_state_now()
+                self.journal.log("early_lock", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], level=g.early_level,
+                                 peak=st["peak"], price=p["current"], soft=True)
+                lock_px = p["price_open"] + s * g.early_level
+                self.notify.send(self.key("EARLY_LOCK", p["ticket"]), ctitle(self.symbol, f"EARLY LOCK (soft) +{g.early_level:g}", p["direction"]),
+                                 [f"+{g.early_at:g} seen — I'll close if an M5 bar CLOSES {'below' if s > 0 else 'above'} {lock_px:.2f} · broker SL stays at −{g.pre_stop:g} · next: secure at +{g.secure_at:g}"],
+                                 fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"],
+                                                        points=p["points"], sl=p["sl"], peak=st["peak"]),
+                                 color=EVENT_COLOURS["secured"], footer=cfooter(self.S.display_name))
+            else:
+                sl = p["price_open"] + s * g.early_level
+                if self._move_sl(p, sl, f"EARLY LOCK +{g.early_level:g}"):
+                    st["secured"] = g.early_level; self._save_state_now()
+                    self.journal.log("early_lock", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], level=g.early_level,
+                                     peak=st["peak"], price=p["current"], soft=False)
+                    self.notify.send(self.key("EARLY_LOCK", p["ticket"]), ctitle(self.symbol, f"EARLY LOCK +{g.early_level:g}", p["direction"]),
+                                     [f"+{g.early_at:g} seen — SL moved to entry +{g.early_level:g}, next: secure at +{g.secure_at:g}"],
+                                     fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"],
+                                                            points=p["points"], sl=sl, secured=g.early_level, peak=st["peak"]),
+                                     color=EVENT_COLOURS["secured"], footer=cfooter(self.S.display_name))
+
+        # 1d) soft early lock exit
+        if new_bar and st.get("soft_lock") and _elk == "soft":
+            lock_level = st["soft_lock"]; lock_px = p["price_open"] + s * lock_level
+            if (s > 0 and close <= lock_px) or (s < 0 and close >= lock_px):
+                self.journal.log("soft_lock_exit", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"],
+                                 close=close, level=lock_level, points_at_exit=p["points"], peak=st["peak"])
+                self._close(p, f"soft early lock — bar closed at {close:.2f}", f"SOFT LOCK EXIT — {tag}",
+                            self.key("SOFT_LOCK_EXIT", p["ticket"]), st, "soft_early_lock", bar_t)
+                return
+
+        # 2) P phase → cross confirmed
+        if st["pre"] and sgn == s:
+            st["pre"] = False; self._save_state_now()
+            sl = es - s * g.ema_slow_sl_buffer
+            ok = self._move_sl(p, sl, "CROSS SL")
+            self.journal.log("cross_confirmed", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], sl=sl, ok=ok)
+            self.notify.send(self.key("CROSS", p["ticket"]), ctitle(self.symbol, "CROSS CONFIRMED", p["direction"]),
+                             [f"EMA {self.S.fast} crossed {'above' if s > 0 else 'below'} EMA {self.S.slow}" + ("" if ok else " · SL move pending — see failure alert")],
+                             fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"], points=p["points"], sl=sl,
+                                                    extra={"Next": f"secure at {p['price_open'] + s * g.secure_at:.2f} (+{g.secure_at:g})"}),
+                             color=EVENT_COLOURS["cross"], footer=cfooter(self.S.display_name))
+        elif g.slow_ema_sl and not st["pre"] and st["secured"] < g.secure_level and new_bar:
+            self._move_sl(p, es - s * g.ema_slow_sl_buffer, "FOLLOW EMA80", quiet=True)
+
+        # 3) SECURE
+        if st["secured"] < g.secure_level and p["points"] >= g.secure_at:
+            sl = p["price_open"] + s * g.secure_level
+            if self._move_sl(p, sl, f"SECURE +{g.secure_level:g}"):
+                st["secured"] = g.secure_level; self._save_state_now()
+                if self.cfg.partial_close_pct > 0 and not st.get("partial_done") and not self.dry:
+                    pr = broker.close_partial(p["ticket"], self.symbol, self.cfg.partial_close_pct / 100.0)
+                    st["partial_done"] = True
+                    if pr.ok:
+                        self.journal.log("partial", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], volume=pr.requested_sl, points=p["points"])
+                        self.notify.send(self.key("PARTIAL", p["ticket"]), ctitle(self.symbol, f"PARTIAL CLOSED {self.cfg.partial_close_pct:g}%", p["direction"]),
+                                         [f"{pr.requested_sl:g} lots banked at {p['points']:+.2f} — rest rides with SL at +{g.secure_level:g}"],
+                                         color=EVENT_COLOURS["secured"], footer=cfooter(self.S.display_name, "partial"))
+                    else:
+                        telemetry.failure(self.notify, self.journal, title="AUREON PARTIAL CLOSE FAILED", key=self.key("ERROR", f"partial-{p['ticket']}"),
+                                          mode=self.S.name, symbol=self.symbol, ticket=p["ticket"], action="PARTIAL CLOSE",
+                                          retcode=pr.retcode, comment=pr.comment, last_error=pr.last_error, retry="not retried — full position keeps riding")
+                if st.get("soft_lock"):
+                    self.journal.log("soft_lock_cleared", symbol=self.symbol, ticket=p["ticket"], reason="secure moved SL above soft level")
+                    st.pop("soft_lock", None); st.pop("soft_lock_t", None)
+                self.journal.log("secured", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], level=g.secure_level, step=g.secure_level, price=p["current"])
+                self.notify.send(self.key("SECURED", f"{p['ticket']}-{g.secure_level:g}"), ctitle(self.symbol, f"SECURED +{g.secure_level:g}", p["direction"]), ["riding — lock steps up every +" + f"{g.ride_step:g}"],
+                                 fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"], points=p["points"], sl=sl, secured=g.secure_level, peak=st["peak"]),
+                                 color=EVENT_COLOURS["secured"], footer=cfooter(self.S.display_name))
+        # 4) ride
+        elif st["secured"] >= g.secure_level:
+            nxt = st["secured"] + g.ride_step
+            if p["points"] >= nxt + g.ride_step * 0.4:
+                sl = p["price_open"] + s * nxt
+                if self._move_sl(p, sl, f"RIDE +{nxt:g}"):
+                    st["secured"] = nxt; self._save_state_now()
+                    self.journal.log("secured", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], level=nxt, step=g.ride_step, price=p["current"])
+                    self.notify.send(self.key("SECURED", f"{p['ticket']}-{nxt:g}"), ctitle(self.symbol, f"SECURED +{nxt:g}", p["direction"]), ["lock stepped up"],
+                                     fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"], points=p["points"], sl=sl, secured=nxt, peak=st["peak"]),
+                                     color=EVENT_COLOURS["secured"], footer=cfooter(self.S.display_name))
+
+        # 5) exits on bar close
+        if new_bar:
+            against_f = (close < ef) if s > 0 else (close > ef)
+            against_s = (close < es) if s > 0 else (close > es)
+            separating = st["pre"] and len(gap) >= 3 and abs(gap[-1]) > abs(gap[-2]) > abs(gap[-3])
+            reason = jr = None
+            if st["secured"] >= g.secure_level and against_f:
+                reason, jr = f"bar closed through EMA {self.S.fast} ({ef:.2f}) — ride over", "ema_fast_turn"
+            elif st["pre"] and p["points"] <= -g.pre_stop and not (
+                    self.cfg.respect_manual_sl and p["sl"] and abs(p["price_open"] - p["sl"]) > g.pre_stop + 1e-6):
+                reason, jr = f"P failed: {p['points']:+.2f}, lines not crossed", "pre_stop"
+            elif separating and st["bars"] >= 2:
+                reason, jr = f"P aborted: EMA {self.S.fast}/{self.S.slow} separating again before the cross", "pre_abort"
+            elif st["pre"] and st["bars"] >= g.pre_timeout_bars and st["secured"] == 0 and not st.get("timeout_hold"):
+                if p["points"] > 0 or (self.cfg.respect_manual_sl and p.get("tp")):
+                    st["timeout_hold"] = True
+                    be = p["price_open"] + s * 0.5 if p["points"] > 1.0 else None
+                    ok = self._move_sl(p, be, "TIMEOUT → BREAKEVEN") if be is not None else False
+                    self.journal.log("pre_timeout_hold", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], points=p["points"], be=be, sl_ok=ok)
+                    self.notify.send(self.key("TIMEOUT_HOLD", p["ticket"]), ctitle(self.symbol, "P TIMEOUT · HOLDING", p["direction"]),
+                                     [f"{st['bars']} bars without the cross, but the trade is {p['points']:+.2f}"
+                                      + (" and you set your own TP" if p.get("tp") else "") + " — **not closing**",
+                                      (f"SL → entry +0.5 ({be:.2f})" if ok else "SL unchanged") + " · I'll keep managing it"],
+                                     fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"],
+                                                            points=p["points"], sl=(be if ok else (p["sl"] or None)), peak=st["peak"]),
+                                     color=EVENT_COLOURS["news"], footer=cfooter(self.S.display_name, "guardian"))
+                else:
+                    reason, jr = f"P timeout: {st['bars']} bars without the cross", "pre_timeout"
+            elif g.slow_ema_sl and not st["pre"] and st["secured"] < g.secure_level and against_s:
+                reason, jr = f"bar closed through EMA {self.S.slow} ({es:.2f})", "ema_slow_stop"
+            if reason:
+                self._close(p, reason, f"{'✅' if p['points'] > 0 else '🛑'} CLOSED — {tag}", self.key("CLOSED", f"{p['ticket']}-{bar_key(bar_t, self.off)}"), st, jr, bar_t)
+
+    # ------------------------------------------------------------------ guardian: leg profile (v2.7.0)
+    def _guard_leg(self, p, st, g, s, new_bar, bar_t, df, close, ef, es, sgn, gap, tag):
+        """Leg-based guardian. Phase A = before move proven. Phase B = riding with the leg."""
+        cfg = self.cfg; entry = p["price_open"]
+        phase = st.get("leg_phase", "A")
+
+        # Phase A → Phase B transition: peak >= secure_at
+        if phase == "A" and st["peak"] >= g.secure_at:
+            phase = "B"
+            st["leg_phase"] = "B"
+            floor_pts = cfg.ride_floor
+            st["floor_pts"] = floor_pts
+            st["trail_pts"] = floor_pts
+            sl = entry + s * floor_pts
+            if self._move_sl(p, sl, f"FLOOR +{floor_pts:g}"):
+                st["secured"] = floor_pts; self._save_state_now()
+            # partial close unchanged
+            if cfg.partial_close_pct > 0 and not st.get("partial_done") and not self.dry:
+                pr = broker.close_partial(p["ticket"], self.symbol, cfg.partial_close_pct / 100.0)
+                st["partial_done"] = True
+                if pr.ok:
+                    self.journal.log("partial", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], volume=pr.requested_sl, points=p["points"])
+            self.journal.log("move_proven", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"],
+                             peak=st["peak"], floor=floor_pts, guardian_profile="leg")
+            self.notify.send(self.key("MOVE_PROVEN", p["ticket"]), ctitle(self.symbol, f"MOVE PROVEN +{st['peak']:.1f} · floor +{floor_pts:g}", p["direction"]),
+                             [f"riding with the leg · SL floor at entry +{floor_pts:g}"],
+                             fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=entry, now=p["current"],
+                                                    points=p["points"], sl=entry + s * floor_pts, secured=floor_pts, peak=st["peak"]),
+                             color=EVENT_COLOURS["secured"], footer=cfooter(self.S.display_name, "leg guardian"))
+
+        if phase == "A":
+            # Phase A: broker SL stays at -pre_stop (hard). Soft trail on closed bars.
+            _elk = cfg.early_lock_mode
+            if g.early_at is not None and st["peak"] >= g.early_at and not st.get("soft_trail_armed") and _elk != "off":
+                st["soft_trail_armed"] = True
+                trail_level = lg.soft_trail_level(st["peak"], g.early_at, g.early_level, cfg.soft_giveback_pts, cfg.soft_giveback_frac)
+                st["soft_lock"] = trail_level; st["soft_lock_t"] = bar_t; self._save_state_now()
+                lock_px = entry + s * trail_level
+                self.journal.log("early_lock", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], level=trail_level,
+                                 peak=st["peak"], price=p["current"], soft=True, guardian_profile="leg")
+                self.notify.send(self.key("EARLY_LOCK", p["ticket"]), ctitle(self.symbol, f"SOFT TRAIL +{trail_level:.1f}", p["direction"]),
+                                 [f"+{g.early_at:g} seen — trailing lock at +{trail_level:.1f} (bar close) · broker SL stays at −{g.pre_stop:g}"],
+                                 fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=entry, now=p["current"],
+                                                        points=p["points"], sl=p["sl"], peak=st["peak"]),
+                                 color=EVENT_COLOURS["secured"], footer=cfooter(self.S.display_name, "leg guardian"))
+            # Update soft trail level as peak grows
+            if st.get("soft_trail_armed") and st.get("soft_lock") is not None:
+                new_trail = lg.soft_trail_level(st["peak"], g.early_at, g.early_level, cfg.soft_giveback_pts, cfg.soft_giveback_frac)
+                if new_trail > st["soft_lock"]:
+                    st["soft_lock"] = new_trail
+
+            # Soft trail exit on bar close
+            if new_bar and st.get("soft_lock") is not None and st.get("soft_trail_armed"):
+                lock_px = entry + s * st["soft_lock"]
+                if (s > 0 and close <= lock_px) or (s < 0 and close >= lock_px):
+                    self.journal.log("soft_lock_exit", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"],
+                                     close=close, level=st["soft_lock"], points_at_exit=p["points"], peak=st["peak"],
+                                     guardian_profile="leg", exit_rule="soft_trail")
+                    self._close(p, f"soft trail — bar closed at {close:.2f} (lock +{st['soft_lock']:.1f})", f"SOFT TRAIL EXIT — {tag}",
+                                self.key("SOFT_LOCK_EXIT", p["ticket"]), st, "soft_trail", bar_t)
+                    return
+
+            # P phase → cross confirmed
+            if st["pre"] and sgn == s:
+                st["pre"] = False; self._save_state_now()
+                sl = es - s * g.ema_slow_sl_buffer
+                self._move_sl(p, sl, "CROSS SL")
+
+        elif phase == "B":
+            # Phase B: trail on closed bars, ride with the leg
+            if new_bar:
+                # compute avg range for ATR trail
+                rng_col = df["high"].to_numpy() - df["low"].to_numpy()
+                avg_range = float(np.mean(rng_col[-20:])) if len(rng_col) >= 20 else float(np.mean(rng_col[-max(1, len(rng_col)):]))
+                # collect recent closed bars
+                bars_close = df["close"].to_numpy()[-cfg.ride_swing_bars:].tolist()
+                bars_low = df["low"].to_numpy()[-cfg.ride_swing_bars:].tolist()
+                bars_high = df["high"].to_numpy()[-cfg.ride_swing_bars:].tolist()
+                peak_px = entry + s * st["peak"] if s > 0 else entry - s * st["peak"]
+
+                old_trail = st.get("trail_pts", st.get("floor_pts", cfg.ride_floor))
+                new_trail = lg.phase_b_trail(bars_close, bars_low, bars_high, p["direction"],
+                                             peak_px, entry, st.get("floor_pts", cfg.ride_floor),
+                                             old_trail, cfg.ride_swing_bars, cfg.ride_buffer,
+                                             cfg.ride_atr_mult, avg_range)
+                if new_trail > old_trail:
+                    sl = entry + s * new_trail
+                    if self._move_sl(p, sl, f"TRAIL +{new_trail:.1f}"):
+                        st["trail_pts"] = new_trail; st["secured"] = new_trail; self._save_state_now()
+                        # card only when trail rises >= 3 pts from last reported
+                        last_reported = st.get("trail_reported", st.get("floor_pts", cfg.ride_floor))
+                        if new_trail - last_reported >= 3.0:
+                            st["trail_reported"] = new_trail
+                            self.journal.log("trail_update", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"],
+                                             trail=new_trail, peak=st["peak"], guardian_profile="leg")
+                            self.notify.send(self.key("TRAIL", f"{p['ticket']}-{int(new_trail)}"), ctitle(self.symbol, f"TRAIL +{new_trail:.1f}", p["direction"]),
+                                             [f"SL trailing the move · floor +{st.get('floor_pts', cfg.ride_floor):g}"],
+                                             fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=entry, now=p["current"],
+                                                                    points=p["points"], sl=sl, secured=new_trail, peak=st["peak"]),
+                                             color=EVENT_COLOURS["secured"], footer=cfooter(self.S.display_name, "leg guardian"))
+
+            # Phase B exits on bar close
+            if new_bar:
+                against_f = lg.bar_closes_through_ema(close, ef, p["direction"])
+                against_s = lg.bar_closes_through_ema(close, es, p["direction"])
+                reason = jr = None
+
+                # a) EMA slow close → close
+                if against_s:
+                    reason, jr = f"bar closed through EMA {self.S.slow} ({es:.2f})", "ema_slow_close"
+                # b) leg ends (EMAs crossed back) → close
+                elif not lg.leg_alive(self.leg, p["direction"], ef, es):
+                    reason, jr = f"leg ended — EMA {self.S.fast}/{self.S.slow} crossed back", "leg_end"
+                # c) EMA fast close → tighten only (don't exit)
+                elif against_f:
+                    low_buf = float(df["low"].iloc[-1]) - cfg.ride_buffer if s > 0 else None
+                    high_buf = float(df["high"].iloc[-1]) + cfg.ride_buffer if s < 0 else None
+                    tighten_px = low_buf if s > 0 else high_buf
+                    tighten_pts = (tighten_px - entry) if s > 0 else (entry - tighten_px)
+                    old_t = st.get("trail_pts", st.get("floor_pts", cfg.ride_floor))
+                    if tighten_pts > old_t:
+                        sl = entry + s * tighten_pts
+                        if self._move_sl(p, sl, f"EMA{self.S.fast} TIGHTEN +{tighten_pts:.1f}"):
+                            st["trail_pts"] = tighten_pts; st["secured"] = tighten_pts; self._save_state_now()
+                            self.journal.log("ema_fast_tighten", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"],
+                                             trail=tighten_pts, guardian_profile="leg")
+
+                if reason:
+                    self._close(p, reason, f"{'✅' if p['points'] > 0 else '🛑'} CLOSED — {tag}",
+                                self.key("CLOSED", f"{p['ticket']}-{bar_key(bar_t, self.off)}"), st, jr, bar_t)
+                    return
+
     # ------------------------------------------------------------------ guardian
     def _guard(self, new_bar, bar_t, df, close, ef, es, sgn):
         g = self.g; cf, cs = self.S.ema_cols
@@ -1269,127 +1523,30 @@ class SymbolAgent(threading.Thread):
                             self.key("OPP_CROSS", f"{p['ticket']}-{bar_key(bar_t, self.off)}"), st, "opposite_cross", bar_t)
                 continue
 
-            # 1c) v2.0.0/v2.4.5 early lock: soft (bar close) | hard (broker SL) | off
-            _elk = self.cfg.early_lock_mode
-            if g.early_at is not None and not st.get("soft_lock") and st["secured"] < g.early_level and st["peak"] >= g.early_at and _elk != "off":
-                if _elk == "soft":
-                    # SOFT: don't move the broker SL; set soft_lock in state
-                    st["soft_lock"] = g.early_level; st["soft_lock_t"] = bar_t; self._save_state_now()
-                    self.journal.log("early_lock", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], level=g.early_level,
-                                     peak=st["peak"], price=p["current"], soft=True)
-                    lock_px = p["price_open"] + s * g.early_level
-                    self.notify.send(self.key("EARLY_LOCK", p["ticket"]), ctitle(self.symbol, f"EARLY LOCK (soft) +{g.early_level:g}", p["direction"]),
-                                     [f"+{g.early_at:g} seen — I'll close if an M5 bar CLOSES {'below' if s > 0 else 'above'} {lock_px:.2f} · broker SL stays at −{g.pre_stop:g} · next: secure at +{g.secure_at:g}"],
-                                     fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"],
-                                                            points=p["points"], sl=p["sl"], peak=st["peak"]),
-                                     color=EVENT_COLOURS["secured"], footer=cfooter(self.S.display_name))
-                else:
-                    # HARD: move the broker SL (today's behaviour)
-                    sl = p["price_open"] + s * g.early_level
-                    if self._move_sl(p, sl, f"EARLY LOCK +{g.early_level:g}"):
-                        st["secured"] = g.early_level; self._save_state_now()
-                        self.journal.log("early_lock", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], level=g.early_level,
-                                         peak=st["peak"], price=p["current"], soft=False)
-                        self.notify.send(self.key("EARLY_LOCK", p["ticket"]), ctitle(self.symbol, f"EARLY LOCK +{g.early_level:g}", p["direction"]),
-                                         [f"+{g.early_at:g} seen — SL moved to entry +{g.early_level:g}, next: secure at +{g.secure_at:g}"],
-                                         fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"],
-                                                                points=p["points"], sl=sl, secured=g.early_level, peak=st["peak"]),
-                                         color=EVENT_COLOURS["secured"], footer=cfooter(self.S.display_name))
+            # v2.7.0: guardian profile — "leg" or "classic"
+            _is_leg = self.cfg.guardian_profile == "leg"
+            # Link guardian ↔ leg: attach/create self.leg for the same side if none
+            if _is_leg and p["ticket"] not in (st.get("_leg_linked") or set()):
+                if self.leg and self.leg["side"].upper() == p["direction"].upper():
+                    st["leg_id"] = id(self.leg)
+                elif not self.leg:
+                    # create a leg starting at this position's entry
+                    self.leg = {"side": p["direction"].upper(), "kind": "position", "start_t": st.get("entry_t", bar_t),
+                                "start_i_time": st.get("entry_t", bar_t), "start_px": p["price_open"],
+                                "best": max(0.0, p["points"]), "best_px": p["price_open"] + s * max(0.0, p["points"]),
+                                "best_t": bar_t, "against": 0.0, "steps_sent": 0}
+                    st["leg_id"] = id(self.leg)
+            _has_same_leg = _is_leg and self.leg is not None and self.leg["side"].upper() == p["direction"].upper()
 
-            # 1d) v2.4.5 soft early lock exit: on a NEW CLOSED bar, close if bar closed beyond the lock level
-            if new_bar and st.get("soft_lock") and _elk == "soft":
-                lock_level = st["soft_lock"]; lock_px = p["price_open"] + s * lock_level
-                if (s > 0 and close <= lock_px) or (s < 0 and close >= lock_px):
-                    self.journal.log("soft_lock_exit", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"],
-                                     close=close, level=lock_level, points_at_exit=p["points"], peak=st["peak"])
-                    self._close(p, f"soft early lock — bar closed at {close:.2f}", f"SOFT LOCK EXIT — {tag}",
-                                self.key("SOFT_LOCK_EXIT", p["ticket"]), st, "soft_early_lock", bar_t)
-                    continue
-
-            # 2) P phase → cross confirmed: SL to the slow EMA ± buffer (tighten only)
-            if st["pre"] and sgn == s:
-                st["pre"] = False; self._save_state_now()
-                sl = es - s * g.ema_slow_sl_buffer
-                ok = self._move_sl(p, sl, "CROSS SL")
-                self.journal.log("cross_confirmed", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], sl=sl, ok=ok)
-                self.notify.send(self.key("CROSS", p["ticket"]), ctitle(self.symbol, "CROSS CONFIRMED", p["direction"]),
-                                 [f"EMA {self.S.fast} crossed {'above' if s > 0 else 'below'} EMA {self.S.slow}" + ("" if ok else " · SL move pending — see failure alert")],
-                                 fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"], points=p["points"], sl=sl,
-                                                        extra={"Next": f"secure at {p['price_open'] + s * g.secure_at:.2f} (+{g.secure_at:g})"}),
-                                 color=EVENT_COLOURS["cross"], footer=cfooter(self.S.display_name))
-            elif g.slow_ema_sl and not st["pre"] and st["secured"] < g.secure_level and new_bar:
-                self._move_sl(p, es - s * g.ema_slow_sl_buffer, "FOLLOW EMA80", quiet=True)   # same safe path: retcode, telemetry, never-loosen
-
-            # 3) SECURE — first priority; announced only when confirmed
-            if st["secured"] < g.secure_level and p["points"] >= g.secure_at:
-                sl = p["price_open"] + s * g.secure_level
-                if self._move_sl(p, sl, f"SECURE +{g.secure_level:g}"):
-                    st["secured"] = g.secure_level; self._save_state_now()                     # 1. state (immediate)
-                    if self.cfg.partial_close_pct > 0 and not st.get("partial_done") and not self.dry:                # AUREON-012
-                        pr = broker.close_partial(p["ticket"], self.symbol, self.cfg.partial_close_pct / 100.0)
-                        st["partial_done"] = True
-                        if pr.ok:
-                            self.journal.log("partial", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], volume=pr.requested_sl, points=p["points"])
-                            self.notify.send(self.key("PARTIAL", p["ticket"]), ctitle(self.symbol, f"PARTIAL CLOSED {self.cfg.partial_close_pct:g}%", p["direction"]),
-                                             [f"{pr.requested_sl:g} lots banked at {p['points']:+.2f} — rest rides with SL at +{g.secure_level:g}"],
-                                             color=EVENT_COLOURS["secured"], footer=cfooter(self.S.display_name, "partial"))
-                        else:
-                            telemetry.failure(self.notify, self.journal, title="AUREON PARTIAL CLOSE FAILED", key=self.key("ERROR", f"partial-{p['ticket']}"),
-                                              mode=self.S.name, symbol=self.symbol, ticket=p["ticket"], action="PARTIAL CLOSE",
-                                              retcode=pr.retcode, comment=pr.comment, last_error=pr.last_error, retry="not retried — full position keeps riding")
-                    if st.get("soft_lock"):
-                        self.journal.log("soft_lock_cleared", symbol=self.symbol, ticket=p["ticket"], reason="secure moved SL above soft level")
-                        st.pop("soft_lock", None); st.pop("soft_lock_t", None)
-                    self.journal.log("secured", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], level=g.secure_level, step=g.secure_level, price=p["current"])  # 2. journal
-                    self.notify.send(self.key("SECURED", f"{p['ticket']}-{g.secure_level:g}"), ctitle(self.symbol, f"SECURED +{g.secure_level:g}", p["direction"]), ["riding — lock steps up every +" + f"{g.ride_step:g}"],
-                                     fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"], points=p["points"], sl=sl, secured=g.secure_level, peak=st["peak"]),
-                                     color=EVENT_COLOURS["secured"], footer=cfooter(self.S.display_name))
-            # 4) ride
-            elif st["secured"] >= g.secure_level:
-                nxt = st["secured"] + g.ride_step
-                if p["points"] >= nxt + g.ride_step * 0.4:
-                    sl = p["price_open"] + s * nxt
-                    if self._move_sl(p, sl, f"RIDE +{nxt:g}"):
-                        st["secured"] = nxt; self._save_state_now()                  # immediate
-                        self.journal.log("secured", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], level=nxt, step=g.ride_step, price=p["current"])
-                        self.notify.send(self.key("SECURED", f"{p['ticket']}-{nxt:g}"), ctitle(self.symbol, f"SECURED +{nxt:g}", p["direction"]), ["lock stepped up"],
-                                         fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"], points=p["points"], sl=sl, secured=nxt, peak=st["peak"]),
-                                         color=EVENT_COLOURS["secured"], footer=cfooter(self.S.display_name))
-
-            # 5) exits on bar close
-            if new_bar:
-                against_f = (close < ef) if s > 0 else (close > ef)
-                against_s = (close < es) if s > 0 else (close > es)
-                separating = st["pre"] and len(gap) >= 3 and abs(gap[-1]) > abs(gap[-2]) > abs(gap[-3])
-                reason = jr = None
-                if st["secured"] >= g.secure_level and against_f:
-                    reason, jr = f"bar closed through EMA {self.S.fast} ({ef:.2f}) — ride over", "ema_fast_turn"
-                elif st["pre"] and p["points"] <= -g.pre_stop and not (
-                        self.cfg.respect_manual_sl and p["sl"] and abs(p["price_open"] - p["sl"]) > g.pre_stop + 1e-6):
-                    reason, jr = f"P failed: {p['points']:+.2f}, lines not crossed", "pre_stop"
-                elif separating and st["bars"] >= 2:
-                    reason, jr = f"P aborted: EMA {self.S.fast}/{self.S.slow} separating again before the cross", "pre_abort"
-                elif st["pre"] and st["bars"] >= g.pre_timeout_bars and st["secured"] == 0 and not st.get("timeout_hold"):
-                    if p["points"] > 0 or (self.cfg.respect_manual_sl and p.get("tp")):
-                        # in profit, or you set your own TP: hold — lock breakeven instead of closing
-                        st["timeout_hold"] = True
-                        be = p["price_open"] + s * 0.5 if p["points"] > 1.0 else None
-                        ok = self._move_sl(p, be, "TIMEOUT → BREAKEVEN") if be is not None else False
-                        self.journal.log("pre_timeout_hold", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], points=p["points"], be=be, sl_ok=ok)
-                        self.notify.send(self.key("TIMEOUT_HOLD", p["ticket"]), ctitle(self.symbol, "P TIMEOUT · HOLDING", p["direction"]),
-                                         [f"{st['bars']} bars without the cross, but the trade is {p['points']:+.2f}"
-                                          + (" and you set your own TP" if p.get("tp") else "") + " — **not closing**",
-                                          (f"SL → entry +0.5 ({be:.2f})" if ok else "SL unchanged") + " · I'll keep managing it"],
-                                         fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"],
-                                                                points=p["points"], sl=(be if ok else (p["sl"] or None)), peak=st["peak"]),
-                                         color=EVENT_COLOURS["news"], footer=cfooter(self.S.display_name, "guardian"))
-                    else:
-                        reason, jr = f"P timeout: {st['bars']} bars without the cross", "pre_timeout"
-                elif g.slow_ema_sl and not st["pre"] and st["secured"] < g.secure_level and against_s:
-                    reason, jr = f"bar closed through EMA {self.S.slow} ({es:.2f})", "ema_slow_stop"
-                if reason:
-                    self._close(p, reason, f"{'✅' if p['points'] > 0 else '🛑'} CLOSED — {tag}", self.key("CLOSED", f"{p['ticket']}-{bar_key(bar_t, self.off)}"), st, jr, bar_t)
-                    continue
+            if _is_leg and _has_same_leg:
+                self._guard_leg(p, st, g, s, new_bar, bar_t, df, close, ef, es, sgn, gap, tag)
+            elif _is_leg and not _has_same_leg:
+                # position without a same-side leg → classic exits for safety
+                self._guard_classic(p, st, g, s, new_bar, bar_t, df, close, ef, es, sgn, gap, tag)
+            else:
+                self._guard_classic(p, st, g, s, new_bar, bar_t, df, close, ef, es, sgn, gap, tag)
+            if p["ticket"] not in self.state:
+                continue  # position was closed
 
             # 5b) advisor + periodic snapshot (notifications only — no broker action)
             if new_bar:
@@ -1410,7 +1567,19 @@ class SymbolAgent(threading.Thread):
             tutc = int(_time.time())
             if not st["news_done"] and any(r - g.news_flat_min * 60 <= tutc < r for r in self.news):
                 st["news_done"] = True
-                if p["points"] >= g.secure_at * 0.1:
+                _leg_phase_b = _is_leg and st.get("leg_phase") == "B"
+                if _leg_phase_b:
+                    # Phase B in leg profile: tighten, don't close
+                    news_sl = p["price_open"] + s * max(st.get("trail_pts", 0), p["points"] - 3)
+                    if self._move_sl(p, news_sl, "NEWS TIGHTEN"):
+                        trail_now = max(st.get("trail_pts", 0), p["points"] - 3)
+                        st["trail_pts"] = trail_now; self._save_state_now()
+                        self.notify.send(self.key("NEWS", p["ticket"]), ctitle(self.symbol, f"NEWS <{g.news_flat_min} MIN · TIGHTENED", p["direction"]),
+                                         [f"Phase B — SL tightened to +{trail_now:.1f}, not closing"],
+                                         fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"],
+                                                                points=p["points"], sl=news_sl, peak=st["peak"]),
+                                         color=EVENT_COLOURS["news"], footer=cfooter(self.S.display_name))
+                elif p["points"] >= g.secure_at * 0.1:
                     self._close(p, "news in <15 min", f"📰 BANKED before news — {tag}", self.key("NEWS", p["ticket"]), st, "news_flat", bar_t)
                 elif st["secured"] == 0:
                     if self._move_sl(p, p["price_open"] - s * g.pre_stop, "NEWS CAP"):

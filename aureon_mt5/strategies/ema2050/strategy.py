@@ -17,8 +17,8 @@ class EMA2050(Strategy):
 
     def rules_for(self, symbol): return rules_for(symbol)
     def add_emas(self, df): return analysis.add_emas(df, 20, 50)
-    def analyse(self, bars, symbol, server_offset_h, news, display_from=None, trade_from=None, overrides=None, day_end=None):
-        return analysis.analyse(bars, display_from, symbol, server_offset_h, news, trade_from, overrides, day_end)
+    def analyse(self, bars, symbol, server_offset_h, news, display_from=None, trade_from=None, overrides=None, day_end=None, **guardian_kw):
+        return analysis.analyse(bars, display_from, symbol, server_offset_h, news, trade_from, overrides, day_end, **guardian_kw)
     def render_png(self, *a, **k): return render_png.render_png(*a, **k)
     def render_html(self, *a, **k): return render_html.render_html(*a, **k)
     def describe(self):

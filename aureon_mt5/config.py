@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from dotenv import load_dotenv
 load_dotenv()   # load .env if present
 
-VERSION = "2.6.2"
+VERSION = "2.7.0"
 
 
 def _parse_lot_buttons(raw: str) -> list[float]:
@@ -73,6 +73,14 @@ class Config:
     week_goal_pts: float = float(os.environ.get("AUREON_WEEK_GOAL_PTS", "0"))
     early_lock_mode: str = os.environ.get("AUREON_EARLY_LOCK_MODE", "soft")   # soft | hard | off
     soft_fallback_min: int = int(os.environ.get("AUREON_SOFT_FALLBACK_MIN", "5"))
+    # v2.7.0 guardian profile: "leg" (move-detector based) | "classic" (exact pre-v2.7.0 behaviour)
+    guardian_profile: str = os.environ.get("AUREON_GUARDIAN_PROFILE", "classic")
+    soft_giveback_pts: float = float(os.environ.get("AUREON_SOFT_GIVEBACK_PTS", "2.5"))
+    soft_giveback_frac: float = float(os.environ.get("AUREON_SOFT_GIVEBACK_FRAC", "0.5"))
+    ride_floor: float = float(os.environ.get("AUREON_RIDE_FLOOR", "4"))
+    ride_swing_bars: int = int(os.environ.get("AUREON_RIDE_SWING_BARS", "6"))
+    ride_buffer: float = float(os.environ.get("AUREON_RIDE_BUFFER", "1.0"))
+    ride_atr_mult: float = float(os.environ.get("AUREON_RIDE_ATR_MULT", "3.0"))
     # your manual SL rules: if you placed an SL wider than the guardian's P-phase stop, the guardian does not close at −pre_stop
     respect_manual_sl: bool = os.environ.get("AUREON_RESPECT_MANUAL_SL", "1") == "1"
     # Codex read-only advisor (Discord on-demand; never blocks signals or guardian)

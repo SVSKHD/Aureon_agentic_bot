@@ -24,15 +24,16 @@ POINT_VALUE = {"XAU": 100.0, "XAG": 5000.0}     # $ per 1.0 price point per lot 
 GOAL_PTS = 10.0
 
 
-def analyse_day(S, bars_all, rng, symbol, off, news):
+def analyse_day(S, bars_all, rng, symbol, off, news, **guardian_kw):
     """One trading day: EMAs on the full history, trades only inside the day, open trades closed at the day end (if the mode replays it)."""
     df = bars_all["M5"].df
     cut = df[df["time"] < rng["day_end"]].reset_index(drop=True)
     extra = {"day_end": rng["day_end"]} if getattr(S, "day_end_exit", False) else {}
+    extra.update(guardian_kw)
     return S.analyse({"M5": Bars(symbol, "M5", cut)}, symbol, off, news, display_from=rng["prev_start"], trade_from=rng["day_start"], **extra)
 
 
-def replay_range(S, symbol, source, d0, d1, csv, off, news, verbose=False, trades=False) -> list[dict]:
+def replay_range(S, symbol, source, d0, d1, csv, off, news, verbose=False, trades=False, **guardian_kw) -> list[dict]:
     """The range replay (`--from/--to`): one analyse_day per trading day with bars. Shared by main() and tests/test_v231_parity.py."""
     bars_all, rngs = load_range(symbol, source, d0, d1, csv)
     days = []
@@ -40,7 +41,7 @@ def replay_range(S, symbol, source, d0, d1, csv, off, news, verbose=False, trade
     for rng in rngs:
         if not len(m5_all[(m5_all["time"] >= rng["day_start"]) & (m5_all["time"] < rng["day_end"])]):
             continue                                                       # holiday / no bars
-        m5 = analyse_day(S, bars_all, rng, symbol, off, news)["M5"]; sm = m5["summary"]
+        m5 = analyse_day(S, bars_all, rng, symbol, off, news, **guardian_kw)["M5"]; sm = m5["summary"]
         days.append({"day": rng["day"], "journeys": m5["journeys"], "summary": sm, "df": m5["df"]})
         if verbose:
             print(f"{rng['day']:%a %d %b}: {sm['trades']} trades · net {sm['net']:+.1f} · crosses {sm.get('crosses', '—')} · confirmed {sm.get('confirmed', '—')} · multi {sm.get('whipsaws', 0)}")
@@ -133,6 +134,27 @@ def trade_line(j, off):
             f"peak {j.mfe:+.1f} · dd {j.mae:+.1f}{extra}")
 
 
+def _print_grid_row(profile, floor, swing, atr, days, spread):
+    """Print one row of the guardian grid comparison table."""
+    closed = [j for d in days for j in d["journeys"] if j.exit_reason != "open"]
+    n = len(closed)
+    if not n:
+        print(f"{profile:<12}{floor:>6}{swing:>6}{atr:>5}{0:>5}{'—':>7}{'—':>8}{'—':>8}{'—':>8}{'—':>8}{'—':>6}{'—':>6}{'—':>10}")
+        return
+    wins = [j for j in closed if j.result > 0]; losers = [j for j in closed if j.result <= 0]
+    net = sum(j.result for j in closed) - spread * n
+    wr = 100 * len(wins) / n if n else 0
+    avg_w = sum(j.result for j in wins) / len(wins) if wins else 0
+    avg_l = sum(j.result for j in losers) / len(losers) if losers else 0
+    eq = peak = 0.0; dd = 0.0
+    for j in closed:
+        eq += j.result; peak = max(peak, eq); dd = min(dd, eq - peak)
+    pct20 = 100 * sum(j.mfe >= 20 for j in closed) / n
+    pct30 = 100 * sum(j.mfe >= 30 for j in closed) / n
+    give_back = sum(j.mfe - j.result for j in closed) / n if n else 0
+    print(f"{profile:<12}{floor:>6}{swing:>6}{atr:>5}{n:>5}{wr:>6.1f}%{net:>+8.1f}{avg_w:>+8.1f}{avg_l:>+8.1f}{dd:>+8.1f}{pct20:>5.0f}%{pct30:>5.0f}%{give_back:>+10.1f}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode"); ap.add_argument("--symbol", default="XAUUSD"); ap.add_argument("--date"); ap.add_argument("--bars", type=int, default=600)
@@ -142,6 +164,7 @@ def main():
     ap.add_argument("--lot", type=float, default=1.0); ap.add_argument("--point-value", type=float, help="$ per point per lot (default: 100 gold, 5000 silver)")
     ap.add_argument("--trades", action="store_true", help="range replay: list every trade")
     ap.add_argument("--spread", type=float, default=float(os.environ.get("AUREON_REPLAY_SPREAD", "0.3")), help="assumed spread in pts for net calculation (default 0.3)")
+    ap.add_argument("--guardian", choices=["classic", "leg", "grid"], default="classic", help="guardian profile for replay exits (default classic)")
     # v2.1.0 shadow replay (measurement only; without --claude nothing changes)
     ap.add_argument("--claude", choices=["entry", "entry+pullback"], help="ask Claude at every ENTER bar (and pullbacks) exactly as live; verdicts recorded, never applied")
     ap.add_argument("--claude-max", type=int, default=60, help="max Claude calls per run (default 60); unscored bars continue from the cache next run")
@@ -169,7 +192,29 @@ def main():
         years = sorted({d0.year, d1.year})
         news = () if (a.no_nfp and not a.news) else tuple(sorted({t for y in years for t in load_news(a.news, y)}))
         print(f"{S.display_name} · {a.symbol} · {d0} → {d1} · replay day by day (entries inside the server day, open trades closed at the day end)")
-        days = replay_range(S, a.symbol, a.source, d0, d1, a.csv, off, news, verbose=True, trades=a.trades)
+        guardian_kw = {}
+        if a.guardian in ("leg", "grid"):
+            guardian_kw["guardian_profile"] = "leg"
+        else:
+            guardian_kw["guardian_profile"] = "classic"
+
+        if a.guardian == "grid":
+            # grid search over floor, swing_bars, atr_mult
+            print("\n--- GUARDIAN GRID SEARCH ---")
+            header = f"{'profile':<12}{'floor':>6}{'swing':>6}{'atr':>5}{'n':>5}{'win%':>7}{'net':>8}{'avg_w':>8}{'avg_l':>8}{'max_dd':>8}{'>=+20':>6}{'>=+30':>6}{'give_back':>10}"
+            print(header)
+            # classic first
+            days_c = replay_range(S, a.symbol, a.source, d0, d1, a.csv, off, news, guardian_profile="classic")
+            _print_grid_row("classic", 0, 0, 0, days_c, a.spread)
+            for fl in (2, 4, 6):
+                for sb in (4, 6, 10):
+                    for am in (2, 3, 4):
+                        days_g = replay_range(S, a.symbol, a.source, d0, d1, a.csv, off, news,
+                                              guardian_profile="leg", ride_floor=fl, ride_swing_bars=sb, ride_atr_mult=am)
+                        _print_grid_row("leg", fl, sb, am, days_g, a.spread)
+            days = days_c  # for the rest of the output
+        else:
+            days = replay_range(S, a.symbol, a.source, d0, d1, a.csv, off, news, verbose=True, trades=a.trades, **guardian_kw)
         if not days:
             print("no bars in that range"); sys.exit(1)
         block = research_summary(days, S, a.symbol, a.lot, pv, off, spread=a.spread)

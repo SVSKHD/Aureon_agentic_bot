@@ -2,6 +2,24 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.7.0 — 2026-10-13  (MINOR: leg-based guardian profile)
+- **`aureon_mt5/leg_guardian.py`** (new, pure): `soft_trail_level()`, `phase_b_trail()`, `leg_alive()`, `bar_closes_through_ema()`.
+- **`aureon_mt5/agent.py`**: guardian logic split into `_guard_classic()` (exact pre-v2.7.0 behaviour) and `_guard_leg()` (move-detector based).
+  Selected by `AUREON_GUARDIAN_PROFILE` (`classic` default, `leg` for demo).
+- **Leg profile Phase A**: broker SL stays at `−pre_stop`. Soft TRAILING lock = `max(early_level, peak − giveback)` where
+  `giveback = max(AUREON_SOFT_GIVEBACK_PTS=2.5, AUREON_SOFT_GIVEBACK_FRAC=0.5 × peak)`. Armed at `early_at`, exit on bar close.
+- **Leg profile Phase B** (peak >= `secure_at`): broker SL set to floor `AUREON_RIDE_FLOOR=+4` (NOT +secure_level=+10).
+  Trail on CLOSED bars: `max(floor, swing trail = lowest low of AUREON_RIDE_SWING_BARS=6 bars − AUREON_RIDE_BUFFER=1.0,
+  ATR trail = peak − AUREON_RIDE_ATR_MULT=3.0 × avg range)`. Never loosens. Card when trail rises >= 3 pts.
+- **Phase B exits**: SL hit (`trail_hit`), bar closes through EMA slow (`ema_slow_close`), leg ends (`leg_end`).
+  EMA fast close only tightens the trail. News in Phase B tightens, doesn't close.
+- **Guardian ↔ leg link**: on `position_seen`, attach/create `self.leg` for the same side. No same-side leg → classic exits.
+- **Replay**: `run.py --guardian classic|leg|grid`. Grid over floor {2,4,6} × swing {4,6,10} × ATR mult {2,3,4}.
+  Compare table per config: n, win%, net pts (with --spread), avg winner, avg loser, max drawdown, % >=+20/+30, avg give-back.
+- **`compare.py`**: `Row` gains `exit_rule` and `guardian_profile` fields (appended last).
+- **`Journey`** dataclass: `exit_rule` and `guardian_profile` fields (serialized in `to_dict()`).
+- Strategy rules changed: **YES — exits only**. Classic profile keeps exact old rules. Entry rules unchanged. SL never loosened.
+
 ## v2.6.2 — 2026-10-13  (PATCH: event publisher for the connector)
 - **`aureon_mt5/publisher.py`**: when `AUREON_PUBLISH=1` and `REDIS_URL` set, appends to Redis Stream `aureon:events`
   (XADD, MAXLEN ~10000): open, sl_change, partial, close, heartbeat, halt, unhalt. Payload: event_id (uuid4, idempotent),

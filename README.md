@@ -35,12 +35,28 @@ applies to the fallback only) · the only time filter: no entries server 21:00�
 news block 60/30 (NFP auto + `news_blackout.txt`) · one trade per cross · pre-cross shoot (40 bars) reported, not filtered.
 Not added (tested, failed 2025): trend/hold/slope/EMA200/re-entry/extension filters.
 
-Guardian (ema2050, Gold profile): no SL → **−12** (`🛡 PROTECTED`) · **+3 seen → SL entry +1** (`EARLY LOCK +1`, never loosened) ·
-+10 → SL +10 (announced when MT5 confirms) · ride +5 steps (2 pts air) · **no EMA50 follow-SL** (tested: wicked on normal bounces) ·
-close on the **EMA20 turn once secured** · exit at the next **confirmed** opposite cross (`🔁 OPPOSITE CROSS`) · no P phase (timeout /
-pre-stop / separation paths are skipped) · news safeguard as 50/80 · live SL is the truth, SL never loosened, `respect_manual_sl` as configured.
+Guardian (ema2050, Gold profile, `AUREON_GUARDIAN_PROFILE`):
+
+**Classic** (`classic`, default): no SL → **−12** (`PROTECTED`) · **+3 seen → SL entry +1** (`EARLY LOCK +1`, never loosened) ·
++10 → SL +10 (announced when MT5 confirms) · ride +5 steps (2 pts air) · **no EMA50 follow-SL** ·
+close on the **EMA20 turn once secured** · exit at the next **confirmed** opposite cross · no P phase ·
+news safeguard as 50/80 · live SL is the truth, SL never loosened.
+
+**Leg** (`leg`, v2.7.0): the move detector (`self.leg`) drives exits.
+- Phase A (peak < `secure_at`): broker SL stays at −`pre_stop`. Soft TRAILING lock: `max(early_level, peak − giveback)`
+  where `giveback = max(AUREON_SOFT_GIVEBACK_PTS, AUREON_SOFT_GIVEBACK_FRAC × peak)`. Exit on bar close through the lock.
+- Phase B (peak >= `secure_at`): broker SL set to floor `AUREON_RIDE_FLOOR` (+4 default, never +10). Trail on CLOSED bars:
+  `max(floor, swing trail = lowest low of last RIDE_SWING_BARS bars − RIDE_BUFFER, ATR trail = peak − RIDE_ATR_MULT × avg range)`.
+  SL updated once per bar, never loosened. Card only when trail rises >= 3 pts.
+- Phase B exits: a) broker SL hit (trail/floor), b) bar closes through EMA SLOW → close (`ema_slow_close`),
+  c) leg ends (EMAs crossed back → `leg_end`), d) news/day-end. EMA FAST close only tightens the trail.
+- News in Phase B: tighten SL to `max(current trail, points − 3)`, never close.
+- Position without a same-side leg → classic exits.
+
+Replay: `python run.py --guardian classic|leg|grid` · grid searches floor {2,4,6} × swing {4,6,10} × ATR mult {2,3,4}.
+
 Cards: `CROSS LONG|SHORT (unconfirmed)` · `CROSS CONFIRMED` · `MULTI CROSS (ignored)` · `ENTER LONG|SHORT (pullback | no-pullback)` (TAKE/SKIP) ·
-`NO ENTRY (too far from EMA20 | no-entry hour | news)` · then PROTECTED / EARLY LOCK / SECURED / RIDE / CLOSED. Every card: cross time,
+`NO ENTRY (too far from EMA20 | no-entry hour | news)` · then PROTECTED / EARLY LOCK or SOFT TRAIL / MOVE PROVEN / TRAIL / CLOSED. Every card: cross time,
 confirm time, pre-cross shoot, session, EMA20/50, bars since cross.
 
 Replay / verify:

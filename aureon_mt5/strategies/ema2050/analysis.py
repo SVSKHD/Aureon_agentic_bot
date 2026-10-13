@@ -68,18 +68,18 @@ def detect_crosses(df: pd.DataFrame, horizon: int = 24) -> list[Cross]:
 
 
 def analyse(bars: dict[str, Bars], display_from: int | None, symbol: str, server_offset_h: float, news_times: tuple,
-            trade_from: int | None, overrides: dict | None = None, day_end: int | None = None) -> dict:
+            trade_from: int | None, overrides: dict | None = None, day_end: int | None = None, **guardian_kw) -> dict:
     """EMAs on the full history, then everything before `display_from` (warm-up) is dropped. M5 only."""
     df = add_emas(bars["M5"].df)
     if display_from is not None:
         df = df[df["time"] >= display_from].reset_index(drop=True)
     rules = dataclasses.replace(rules_for(symbol), news_times=news_times, **(overrides or {}))
     out = {"df": df, "crosses": detect_crosses(df), "ema_periods": (FAST, SLOW)}
-    out.update(build_journeys(df, rules, server_offset_h, trade_from, day_end))
+    out.update(build_journeys(df, rules, server_offset_h, trade_from, day_end, **guardian_kw))
     out["rules"] = rules
     out["trend"] = trend_series(df, rules.slope_bars, rules.min_slope50)
     out["unfiltered_summary"] = build_journeys(df, dataclasses.replace(unfiltered_for(symbol), news_times=news_times),
-                                               server_offset_h, trade_from, day_end)["summary"]
+                                               server_offset_h, trade_from, day_end, **guardian_kw)["summary"]
     out["m15_trend_now"] = out["trend"][-1] if len(out["trend"]) else "range"
     return {"M5": out}
 

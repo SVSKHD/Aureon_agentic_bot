@@ -59,6 +59,8 @@ class Row:
     overridden: bool = False           # v2.3.9: override event fired
     spread_pts: float | None = None    # v2.3.14: spread at signal time
     slippage_pts: float | None = None  # v2.3.14: slippage from order_placed
+    exit_rule: str = ""               # v2.7.0: detailed exit rule name
+    guardian_profile: str = ""        # v2.7.0: "classic" or "leg"
 
 
 def _ev(v: dict, source: str = "claude"):
@@ -132,6 +134,12 @@ def build_rows(records: list[dict], graded: list, since: int, until: int, off: f
             row.missed = True
         if sig_key in overridden_bars:
             row.overridden = True
+        # v2.7.0: exit_rule + guardian_profile from exit journal events
+        for ex in records:
+            if ex.get("event") == "exit" and ex.get("symbol") == row.symbol and ex.get("reason"):
+                row.exit_rule = ex.get("reason", "")
+                row.guardian_profile = ex.get("guardian_profile", "")
+                break
         rows.append(row)
     # trades seen in MT5: assign each to the most recent same-side signal whose window contains its open time
     for p in records:
