@@ -1152,6 +1152,58 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
                 return Reply(content=f"watchdog: error reading state — {e}")
         await run(inter, "watchdog", work)
 
+    @tree.command(name="approve-tuning", description="Approve a tuning proposal by ID")
+    @app_commands.describe(proposal_id="Proposal ID from the tuning card")
+    async def approve_tuning_cmd(inter: discord.Interaction, proposal_id: int):
+        def work():
+            from . import tuning
+            result = tuning.approve(cfg.log_dir, proposal_id, journal)
+            if isinstance(result, str):
+                return Reply(content=result)
+            return Reply(content=f"✅ approved #{proposal_id}: {result['param']} → {result['new']}")
+        await run(inter, "approve-tuning", work)
+
+    @tree.command(name="reject-tuning", description="Reject a tuning proposal by ID")
+    @app_commands.describe(proposal_id="Proposal ID")
+    async def reject_tuning_cmd(inter: discord.Interaction, proposal_id: int):
+        def work():
+            from . import tuning
+            result = tuning.reject(cfg.log_dir, proposal_id, journal)
+            if isinstance(result, str):
+                return Reply(content=result)
+            return Reply(content=f"❌ rejected #{proposal_id}")
+        await run(inter, "reject-tuning", work)
+
+    @tree.command(name="revert-tuning", description="Revert an active tuning override")
+    @app_commands.describe(param="Parameter name to revert")
+    async def revert_tuning_cmd(inter: discord.Interaction, param: str):
+        def work():
+            from . import tuning
+            if tuning.revert(cfg.log_dir, param.strip(), journal):
+                return Reply(content=f"↩️ reverted {param}")
+            return Reply(content=f"{param} has no active override")
+        await run(inter, "revert-tuning", work)
+
+    @tree.command(name="tuning", description="Show active tuning overrides and pending proposals")
+    async def tuning_cmd(inter: discord.Interaction):
+        def work():
+            from . import tuning
+            overrides = tuning.load_overrides(cfg.log_dir)
+            proposals = [p for p in tuning.load_proposals(cfg.log_dir) if p["status"] == "pending"]
+            lines = []
+            if overrides:
+                lines.append("**Active overrides:**")
+                for k, v in overrides.items():
+                    lines.append(f"  `{k}` = {v}")
+            else:
+                lines.append("no active overrides")
+            if proposals:
+                lines.append("**Pending proposals:**")
+                for p in proposals:
+                    lines.append(f"  {tuning.format_proposal(p)}")
+            return Reply(content="\n".join(lines))
+        await run(inter, "tuning", work)
+
     @tree.command(name="review", description="Show the latest nightly review (pattern flags)")
     async def review_cmd(inter: discord.Interaction):
         def work():

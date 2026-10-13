@@ -2,6 +2,16 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.6.1 — 2026-10-13  (PATCH: bounded threshold tuning + /approve)
+- **`aureon_mt5/tuning.py`**: for each tunable parameter (`pre_stop`, `secure_at`, `ride_step`, `early_at`, `early_level`,
+  `chop_crosses`, `missed_grace_min`, `override_max_drift`, `heartbeat_stale_min`) — min, max, and max step per change defined
+  in `BOUNDS`. Strategy entry rules (`confirm_bars`, `confirm_gap`, etc.) are `NOT_TUNABLE`.
+- **Proposals**: at most 2 per week, each within bounds and one step max. `propose()` creates a pending proposal stored in
+  `logs/tuning_proposals.json`. Not approved within 72 h → expired. `/approve-tuning <id>` writes to `logs/overrides.json`
+  (loaded at start, hot-reloaded). `/reject-tuning <id>`, `/revert-tuning <param>`, `/tuning` shows active overrides + pending.
+- Journal: `tuning_proposed`, `tuning_applied`, `tuning_rejected`, `tuning_reverted`.
+- Strategy rules changed: NO.
+
 ## v2.6.0 — 2026-10-13  (MINOR: nightly review)
 - **`aureon_mt5/review.py`** (deterministic, no LLM): after the EOD review, scores the last 20 trading days from journal:
   entries and exits by session (Asia/London/NY) × actor (human/agent): n, win%, net pts, stops. Protect-stop hit rate per
