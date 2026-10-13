@@ -122,6 +122,12 @@ class SymbolAgent(threading.Thread):
         if g is not None and not g.enabled and not (cfg.enable_silver and symbol.upper().startswith("XAG")):
             g = None
         self.g = g
+        # v2.7.1: resolve guardian profile once at start (demo detection happens here)
+        try:
+            _demo = broker.is_demo() if not cfg.dry else None
+        except Exception:
+            _demo = None
+        self._resolved_profile = cfg.resolved_guardian_profile(_demo)
         self.off = cfg.server_utc_offset
         self.state: dict[int, dict] = journal.load_state(symbol)
         self.latest_signal: dict | None = None
@@ -1296,54 +1302,55 @@ class SymbolAgent(threading.Thread):
             if reason:
                 self._close(p, reason, f"{'✅' if p['points'] > 0 else '🛑'} CLOSED — {tag}", self.key("CLOSED", f"{p['ticket']}-{bar_key(bar_t, self.off)}"), st, jr, bar_t)
 
-    # ------------------------------------------------------------------ guardian: leg profile (v2.7.0)
+    # ------------------------------------------------------------------ guardian: leg profile (v2.7.0/v2.7.1)
     def _guard_leg(self, p, st, g, s, new_bar, bar_t, df, close, ef, es, sgn, gap, tag):
         """Leg-based guardian. Phase A = before move proven. Phase B = riding with the leg."""
         cfg = self.cfg; entry = p["price_open"]
         phase = st.get("leg_phase", "A")
+        arm_pts = max(g.early_at or 0, cfg.soft_arm_pts)  # v2.7.1: soft arm threshold
 
-        # Phase A → Phase B transition: peak >= secure_at
-        if phase == "A" and st["peak"] >= g.secure_at:
-            phase = "B"
-            st["leg_phase"] = "B"
+        # Phase A → Phase B transition: peak >= secure_at AND current points >= floor + buffer
+        if phase == "A" and st["peak"] >= g.secure_at and p["points"] >= cfg.ride_floor + cfg.ride_buffer:
             floor_pts = cfg.ride_floor
-            st["floor_pts"] = floor_pts
-            st["trail_pts"] = floor_pts
             sl = entry + s * floor_pts
             if self._move_sl(p, sl, f"FLOOR +{floor_pts:g}"):
+                phase = "B"
+                st["leg_phase"] = "B"
+                st["floor_pts"] = floor_pts
+                st["trail_pts"] = floor_pts
                 st["secured"] = floor_pts; self._save_state_now()
-            # partial close unchanged
-            if cfg.partial_close_pct > 0 and not st.get("partial_done") and not self.dry:
-                pr = broker.close_partial(p["ticket"], self.symbol, cfg.partial_close_pct / 100.0)
-                st["partial_done"] = True
-                if pr.ok:
-                    self.journal.log("partial", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], volume=pr.requested_sl, points=p["points"])
-            self.journal.log("move_proven", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"],
-                             peak=st["peak"], floor=floor_pts, guardian_profile="leg")
-            self.notify.send(self.key("MOVE_PROVEN", p["ticket"]), ctitle(self.symbol, f"MOVE PROVEN +{st['peak']:.1f} · floor +{floor_pts:g}", p["direction"]),
-                             [f"riding with the leg · SL floor at entry +{floor_pts:g}"],
-                             fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=entry, now=p["current"],
-                                                    points=p["points"], sl=entry + s * floor_pts, secured=floor_pts, peak=st["peak"]),
-                             color=EVENT_COLOURS["secured"], footer=cfooter(self.S.display_name, "leg guardian"))
+                # partial close unchanged
+                if cfg.partial_close_pct > 0 and not st.get("partial_done") and not self.dry:
+                    pr = broker.close_partial(p["ticket"], self.symbol, cfg.partial_close_pct / 100.0)
+                    st["partial_done"] = True
+                    if pr.ok:
+                        self.journal.log("partial", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], volume=pr.requested_sl, points=p["points"])
+                self.journal.log("move_proven", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"],
+                                 peak=st["peak"], floor=floor_pts, guardian_profile="leg")
+                self.notify.send(self.key("MOVE_PROVEN", p["ticket"]), ctitle(self.symbol, f"MOVE PROVEN +{st['peak']:.1f} · floor +{floor_pts:g}", p["direction"]),
+                                 [f"riding with the leg · SL floor at entry +{floor_pts:g}"],
+                                 fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=entry, now=p["current"],
+                                                        points=p["points"], sl=entry + s * floor_pts, secured=floor_pts, peak=st["peak"]),
+                                 color=EVENT_COLOURS["secured"], footer=cfooter(self.S.display_name, "leg guardian"))
+            # else: floor SL move rejected — stay in Phase A, retry next poll
 
         if phase == "A":
             # Phase A: broker SL stays at -pre_stop (hard). Soft trail on closed bars.
             _elk = cfg.early_lock_mode
-            if g.early_at is not None and st["peak"] >= g.early_at and not st.get("soft_trail_armed") and _elk != "off":
+            if g.early_at is not None and st["peak"] >= arm_pts and not st.get("soft_trail_armed") and _elk != "off":
                 st["soft_trail_armed"] = True
-                trail_level = lg.soft_trail_level(st["peak"], g.early_at, g.early_level, cfg.soft_giveback_pts, cfg.soft_giveback_frac)
+                trail_level = lg.soft_trail_level(st["peak"], arm_pts, g.early_level, cfg.soft_giveback_pts, cfg.soft_giveback_frac)
                 st["soft_lock"] = trail_level; st["soft_lock_t"] = bar_t; self._save_state_now()
-                lock_px = entry + s * trail_level
                 self.journal.log("early_lock", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], level=trail_level,
                                  peak=st["peak"], price=p["current"], soft=True, guardian_profile="leg")
                 self.notify.send(self.key("EARLY_LOCK", p["ticket"]), ctitle(self.symbol, f"SOFT TRAIL +{trail_level:.1f}", p["direction"]),
-                                 [f"+{g.early_at:g} seen — trailing lock at +{trail_level:.1f} (bar close) · broker SL stays at −{g.pre_stop:g}"],
+                                 [f"+{arm_pts:g} seen — trailing lock at +{trail_level:.1f} (bar close) · broker SL stays at −{g.pre_stop:g}"],
                                  fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=entry, now=p["current"],
                                                         points=p["points"], sl=p["sl"], peak=st["peak"]),
                                  color=EVENT_COLOURS["secured"], footer=cfooter(self.S.display_name, "leg guardian"))
             # Update soft trail level as peak grows
             if st.get("soft_trail_armed") and st.get("soft_lock") is not None:
-                new_trail = lg.soft_trail_level(st["peak"], g.early_at, g.early_level, cfg.soft_giveback_pts, cfg.soft_giveback_frac)
+                new_trail = lg.soft_trail_level(st["peak"], arm_pts, g.early_level, cfg.soft_giveback_pts, cfg.soft_giveback_frac)
                 if new_trail > st["soft_lock"]:
                     st["soft_lock"] = new_trail
 
@@ -1354,8 +1361,8 @@ class SymbolAgent(threading.Thread):
                     self.journal.log("soft_lock_exit", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"],
                                      close=close, level=st["soft_lock"], points_at_exit=p["points"], peak=st["peak"],
                                      guardian_profile="leg", exit_rule="soft_trail")
-                    self._close(p, f"soft trail — bar closed at {close:.2f} (lock +{st['soft_lock']:.1f})", f"SOFT TRAIL EXIT — {tag}",
-                                self.key("SOFT_LOCK_EXIT", p["ticket"]), st, "soft_trail", bar_t)
+                    self._close_leg(p, f"soft trail — bar closed at {close:.2f} (lock +{st['soft_lock']:.1f})",
+                                    tag, st, "soft_trail", bar_t)
                     return
 
             # P phase → cross confirmed
@@ -1367,14 +1374,13 @@ class SymbolAgent(threading.Thread):
         elif phase == "B":
             # Phase B: trail on closed bars, ride with the leg
             if new_bar:
-                # compute avg range for ATR trail
                 rng_col = df["high"].to_numpy() - df["low"].to_numpy()
                 avg_range = float(np.mean(rng_col[-20:])) if len(rng_col) >= 20 else float(np.mean(rng_col[-max(1, len(rng_col)):]))
-                # collect recent closed bars
                 bars_close = df["close"].to_numpy()[-cfg.ride_swing_bars:].tolist()
                 bars_low = df["low"].to_numpy()[-cfg.ride_swing_bars:].tolist()
                 bars_high = df["high"].to_numpy()[-cfg.ride_swing_bars:].tolist()
-                peak_px = entry + s * st["peak"] if s > 0 else entry - s * st["peak"]
+                # v2.7.1: peak_price correct for both directions
+                peak_px = entry + s * st["peak"]
 
                 old_trail = st.get("trail_pts", st.get("floor_pts", cfg.ride_floor))
                 new_trail = lg.phase_b_trail(bars_close, bars_low, bars_high, p["direction"],
@@ -1385,7 +1391,6 @@ class SymbolAgent(threading.Thread):
                     sl = entry + s * new_trail
                     if self._move_sl(p, sl, f"TRAIL +{new_trail:.1f}"):
                         st["trail_pts"] = new_trail; st["secured"] = new_trail; self._save_state_now()
-                        # card only when trail rises >= 3 pts from last reported
                         last_reported = st.get("trail_reported", st.get("floor_pts", cfg.ride_floor))
                         if new_trail - last_reported >= 3.0:
                             st["trail_reported"] = new_trail
@@ -1397,19 +1402,16 @@ class SymbolAgent(threading.Thread):
                                                                     points=p["points"], sl=sl, secured=new_trail, peak=st["peak"]),
                                              color=EVENT_COLOURS["secured"], footer=cfooter(self.S.display_name, "leg guardian"))
 
-            # Phase B exits on bar close
+            # Phase B exits on bar close — use st["leg"] for leg_alive (sticky)
             if new_bar:
                 against_f = lg.bar_closes_through_ema(close, ef, p["direction"])
                 against_s = lg.bar_closes_through_ema(close, es, p["direction"])
                 reason = jr = None
 
-                # a) EMA slow close → close
                 if against_s:
                     reason, jr = f"bar closed through EMA {self.S.slow} ({es:.2f})", "ema_slow_close"
-                # b) leg ends (EMAs crossed back) → close
-                elif not lg.leg_alive(self.leg, p["direction"], ef, es):
+                elif not lg.leg_alive(st.get("leg"), p["direction"], ef, es):
                     reason, jr = f"leg ended — EMA {self.S.fast}/{self.S.slow} crossed back", "leg_end"
-                # c) EMA fast close → tighten only (don't exit)
                 elif against_f:
                     low_buf = float(df["low"].iloc[-1]) - cfg.ride_buffer if s > 0 else None
                     high_buf = float(df["high"].iloc[-1]) + cfg.ride_buffer if s < 0 else None
@@ -1424,9 +1426,16 @@ class SymbolAgent(threading.Thread):
                                              trail=tighten_pts, guardian_profile="leg")
 
                 if reason:
-                    self._close(p, reason, f"{'✅' if p['points'] > 0 else '🛑'} CLOSED — {tag}",
-                                self.key("CLOSED", f"{p['ticket']}-{bar_key(bar_t, self.off)}"), st, jr, bar_t)
+                    self._close_leg(p, reason, tag, st, jr, bar_t)
                     return
+
+    def _close_leg(self, p, reason, tag, st, jr, bar_t):
+        """Close with profile + exit_rule in the card and journal."""
+        profile = st.get("guardian_profile", "leg")
+        label = f"{profile} · {jr}" if jr else profile
+        self._close(p, f"{reason} [{label}]",
+                    f"{'✅' if p['points'] > 0 else '🛑'} CLOSED — {tag}",
+                    self.key("CLOSED", f"{p['ticket']}-{bar_key(bar_t, self.off)}"), st, jr, bar_t)
 
     # ------------------------------------------------------------------ guardian
     def _guard(self, new_bar, bar_t, df, close, ef, es, sgn):
@@ -1523,26 +1532,29 @@ class SymbolAgent(threading.Thread):
                             self.key("OPP_CROSS", f"{p['ticket']}-{bar_key(bar_t, self.off)}"), st, "opposite_cross", bar_t)
                 continue
 
-            # v2.7.0: guardian profile — "leg" or "classic"
-            _is_leg = self.cfg.guardian_profile == "leg"
-            # Link guardian ↔ leg: attach/create self.leg for the same side if none
-            if _is_leg and p["ticket"] not in (st.get("_leg_linked") or set()):
-                if self.leg and self.leg["side"].upper() == p["direction"].upper():
-                    st["leg_id"] = id(self.leg)
-                elif not self.leg:
-                    # create a leg starting at this position's entry
-                    self.leg = {"side": p["direction"].upper(), "kind": "position", "start_t": st.get("entry_t", bar_t),
-                                "start_i_time": st.get("entry_t", bar_t), "start_px": p["price_open"],
-                                "best": max(0.0, p["points"]), "best_px": p["price_open"] + s * max(0.0, p["points"]),
-                                "best_t": bar_t, "against": 0.0, "steps_sent": 0}
-                    st["leg_id"] = id(self.leg)
-            _has_same_leg = _is_leg and self.leg is not None and self.leg["side"].upper() == p["direction"].upper()
+            # v2.7.0/v2.7.1: guardian profile — "leg" or "classic"
+            # sticky: once a ticket gets a profile, it keeps it (stored in st)
+            if "guardian_profile" not in st:
+                st["guardian_profile"] = self._resolved_profile
+            _is_leg = st["guardian_profile"] == "leg"
 
-            if _is_leg and _has_same_leg:
+            # v2.7.1: sticky leg ownership via st["leg"] snapshot
+            if _is_leg and "leg" not in st:
+                if self.leg and self.leg["side"].upper() == p["direction"].upper():
+                    st["leg"] = lg.make_leg_snapshot(self.leg)
+                else:
+                    # create a leg snapshot starting at this position's entry
+                    st["leg"] = {"side": p["direction"].upper(), "start_px": p["price_open"],
+                                 "start_t": st.get("entry_t", bar_t), "best": max(0.0, p["points"]),
+                                 "best_px": p["price_open"] + s * max(0.0, p["points"]), "against": 0.0}
+            # update the snapshot's best/against from the live leg if it matches
+            if _is_leg and st.get("leg") and self.leg and self.leg["side"].upper() == st["leg"]["side"].upper():
+                if self.leg["best"] > st["leg"]["best"]:
+                    st["leg"]["best"] = self.leg["best"]
+                    st["leg"]["best_px"] = self.leg["best_px"]
+
+            if _is_leg:
                 self._guard_leg(p, st, g, s, new_bar, bar_t, df, close, ef, es, sgn, gap, tag)
-            elif _is_leg and not _has_same_leg:
-                # position without a same-side leg → classic exits for safety
-                self._guard_classic(p, st, g, s, new_bar, bar_t, df, close, ef, es, sgn, gap, tag)
             else:
                 self._guard_classic(p, st, g, s, new_bar, bar_t, df, close, ef, es, sgn, gap, tag)
             if p["ticket"] not in self.state:
@@ -1567,9 +1579,8 @@ class SymbolAgent(threading.Thread):
             tutc = int(_time.time())
             if not st["news_done"] and any(r - g.news_flat_min * 60 <= tutc < r for r in self.news):
                 st["news_done"] = True
-                _leg_phase_b = _is_leg and st.get("leg_phase") == "B"
-                if _leg_phase_b:
-                    # Phase B in leg profile: tighten, don't close
+                if _is_leg and st.get("leg_phase") == "B":
+                    # v2.7.0 Phase B leg: tighten, don't close
                     news_sl = p["price_open"] + s * max(st.get("trail_pts", 0), p["points"] - 3)
                     if self._move_sl(p, news_sl, "NEWS TIGHTEN"):
                         trail_now = max(st.get("trail_pts", 0), p["points"] - 3)
@@ -1579,6 +1590,20 @@ class SymbolAgent(threading.Thread):
                                          fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"],
                                                                 points=p["points"], sl=news_sl, peak=st["peak"]),
                                          color=EVENT_COLOURS["news"], footer=cfooter(self.S.display_name))
+                elif _is_leg and st.get("leg_phase", "A") == "A":
+                    # v2.7.1 Phase A leg: do NOT close; cap broker SL at -pre_stop;
+                    # if soft lock armed, convert to hard SL at that level (never loosen)
+                    self._move_sl(p, p["price_open"] - s * g.pre_stop, "NEWS CAP")
+                    if st.get("soft_lock") is not None and st.get("soft_trail_armed"):
+                        hard_sl = p["price_open"] + s * st["soft_lock"]
+                        if self._move_sl(p, hard_sl, f"NEWS LOCK +{st['soft_lock']:.1f}"):
+                            st["secured"] = max(st.get("secured", 0), st["soft_lock"])
+                            self._save_state_now()
+                    self.notify.send(self.key("NEWS", p["ticket"]), ctitle(self.symbol, f"NEWS <{g.news_flat_min} MIN · CAPPED", p["direction"]),
+                                     [f"Phase A — SL capped, not closing" + (f" · soft lock converted to hard +{st.get('soft_lock', 0):.1f}" if st.get("soft_lock") else "")],
+                                     fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"],
+                                                            points=p["points"], sl=p["sl"], peak=st["peak"]),
+                                     color=EVENT_COLOURS["news"], footer=cfooter(self.S.display_name))
                 elif p["points"] >= g.secure_at * 0.1:
                     self._close(p, "news in <15 min", f"📰 BANKED before news — {tag}", self.key("NEWS", p["ticket"]), st, "news_flat", bar_t)
                 elif st["secured"] == 0:
@@ -1611,8 +1636,18 @@ class SymbolAgent(threading.Thread):
                     rb = next((r for r in self.journal.read(int(self.started_wall)) if r.get("event") == "state_rebuilt" and r.get("ticket") == p["ticket"]), None)
                     src = rb.get("source", "state file") if rb else "state file"
                 frozen = " · MODE MISMATCH (read-only)" if st.get("frozen") else ""
+                # v2.7.1: show guardian profile + leg phase in RESUMED
+                gp = st.get("guardian_profile", self._resolved_profile)
+                leg_info = ""
+                if gp == "leg":
+                    lp = st.get("leg_phase", "A")
+                    if lp == "B":
+                        leg_info = f" · leg B floor +{st.get('floor_pts', 0):g} trail +{st.get('trail_pts', 0):.1f}"
+                    else:
+                        sl_info = f"+{st.get('soft_lock', 0):.1f}" if st.get("soft_lock") else "—"
+                        leg_info = f" · leg A soft {sl_info}"
                 rlines.append(f"#{p['ticket']} {p['direction'].upper()} @ {p['price_open']:.2f} · {p['points']:+.1f} pts · "
-                              f"{ph} · SL {p['sl'] or '—'} · source: {src}{frozen}")
+                              f"{ph} · SL {p['sl'] or '—'} · {gp}{leg_info} · source: {src}{frozen}")
             self.notify.send(self.key("RESUMED", f"{pos[0]['ticket']}-{int(self.started_wall)}"),
                              ctitle(self.symbol, "RESUMED"),
                              rlines + ([f"alerts armed: {armed}"] if armed else []),

@@ -232,7 +232,8 @@ def news_block(ts_server: int, rules: Rules, server_offset_h: float) -> bool:
 def build(df: pd.DataFrame, rules: Rules, server_offset_h: float = 3.0, trade_from: int | None = None,
           day_end: int | None = None, m15=None, m1=None, guardian_profile: str = "classic",
           ride_floor: float = 4.0, ride_swing_bars: int = 6, ride_buffer: float = 1.0,
-          ride_atr_mult: float = 3.0, giveback_pts: float = 2.5, giveback_frac: float = 0.5) -> dict:
+          ride_atr_mult: float = 3.0, giveback_pts: float = 3.0, giveback_frac: float = 0.5,
+          soft_arm_pts: float = 5.0) -> dict:
     """`trade_from`: server-time epoch; crosses before it are context only (no entries, not counted).
     `day_end`: server-time epoch; the last bar before it closes any open trade with reason day_end (replay)."""
     gap = df["spread"].to_numpy()
@@ -311,12 +312,14 @@ def build(df: pd.DataFrame, rules: Rules, server_offset_h: float = 3.0, trade_fr
 
     def run_exit(jn: Journey, j: int, s: int, x: CrossInfo, guardian_profile: str = "classic",
                  ride_floor: float = 4.0, swing_bars: int = 6, ride_buffer: float = 1.0,
-                 atr_mult: float = 3.0, giveback_pts: float = 2.5, giveback_frac: float = 0.5):
+                 atr_mult: float = 3.0, giveback_pts: float = 3.0, giveback_frac: float = 0.5,
+                 _soft_arm_pts: float = 5.0):
         sl = -g.pre_stop; mfe = 0.0; mae = 0.0
         end_k = last_k if day_end is not None else n - 1
         phase = "A"  # leg profile phases
         floor_pts = ride_floor
         trail_pts = floor_pts
+        arm_pts = max(g.early_at or 0, _soft_arm_pts) if guardian_profile == "leg" else (g.early_at or 0)
         for k in range(j + 1, end_k + 1):
             fav = (high[k] - jn.entry_price) if s > 0 else (jn.entry_price - low[k])
             adv = (low[k] - jn.entry_price) if s > 0 else (jn.entry_price - high[k])
@@ -324,14 +327,20 @@ def build(df: pd.DataFrame, rules: Rules, server_offset_h: float = 3.0, trade_fr
             unreal = s * (close[k] - jn.entry_price)
             tk_utc = int(time[k]) - server_offset_h * 3600
             reason = None; px = float(close[k])
-            # 1) the SL in force at this bar's open (a lock armed on bar k is tested from bar k+1)
-            if rules.news_filter and any(r - rules.news_flat_min * 60 <= tk_utc < r for r in rules.news_times) and \
-                    (unreal >= rules.news_flat_min_profit or rules.news_flat_losers):
+            # 1) the SL in force at this bar's open
+            is_news = rules.news_filter and any(r - rules.news_flat_min * 60 <= tk_utc < r for r in rules.news_times) and \
+                    (unreal >= rules.news_flat_min_profit or rules.news_flat_losers)
+            if is_news:
                 if guardian_profile == "leg" and phase == "B":
                     # Phase B + news: tighten, don't close
                     news_trail = max(trail_pts, fav - 3)
                     if news_trail > trail_pts:
                         trail_pts = news_trail; sl = trail_pts
+                elif guardian_profile == "leg" and phase == "A":
+                    # v2.7.1 Phase A + news: do NOT close; cap SL, convert soft lock to hard
+                    if sl > -g.pre_stop:
+                        pass  # soft lock already acting as SL — keep it
+                    # don't set reason — no close
                 else:
                     reason = "news_flat"
             elif adv <= sl:
@@ -345,14 +354,14 @@ def build(df: pd.DataFrame, rules: Rules, server_offset_h: float = 3.0, trade_fr
             if reason is None:
                 if guardian_profile == "leg":
                     # --- LEG PROFILE ---
-                    # Phase A → B transition
-                    if phase == "A" and mfe >= g.secure_at:
+                    # Phase A → B transition: peak >= secure_at AND current bar >= floor + buffer
+                    if phase == "A" and mfe >= g.secure_at and unreal >= floor_pts + ride_buffer:
                         phase = "B"
                         sl = floor_pts; trail_pts = floor_pts
                         jn.target_index = jn.target_index if jn.target_index is not None else k
                     if phase == "A":
-                        # soft trailing lock: arm at early_at, trail with peak
-                        if g.early_at is not None and mfe >= g.early_at:
+                        # soft trailing lock: arm at arm_pts, trail with peak
+                        if g.early_at is not None and mfe >= arm_pts:
                             giveback = max(giveback_pts, giveback_frac * mfe)
                             new_lock = max(g.early_level, mfe - giveback)
                             if new_lock > sl:
@@ -366,7 +375,7 @@ def build(df: pd.DataFrame, rules: Rules, server_offset_h: float = 3.0, trade_fr
                         else:
                             swing_px = float(high[lo_b:k + 1].max()) + ride_buffer
                             swing_trail = jn.entry_price - swing_px
-                        # ATR trail
+                        # ATR trail — v2.7.1: peak_px correct for both directions
                         atr_lo = max(0, k - 19)
                         avg_rng = float(np.mean(high[atr_lo:k + 1] - low[atr_lo:k + 1]))
                         peak_px = jn.entry_price + s * mfe
@@ -378,13 +387,10 @@ def build(df: pd.DataFrame, rules: Rules, server_offset_h: float = 3.0, trade_fr
                         trail_pts = max(trail_pts, new_trail)
                         sl = trail_pts
                         # bar-close exits in Phase B
-                        # a) EMA slow close
                         if (close[k] < e50[k]) if s > 0 else (close[k] > e50[k]):
                             reason = "ema_slow_close"
-                        # b) leg end: EMAs crossed back
                         elif (s > 0 and e20[k] < e50[k]) or (s < 0 and e20[k] > e50[k]):
                             reason = "leg_end"
-                        # c) EMA fast close: tighten only
                         elif (close[k] < e20[k]) if s > 0 else (close[k] > e20[k]):
                             if s > 0:
                                 tighten_pts = float(low[k]) - ride_buffer - jn.entry_price
@@ -392,7 +398,6 @@ def build(df: pd.DataFrame, rules: Rules, server_offset_h: float = 3.0, trade_fr
                                 tighten_pts = jn.entry_price - (float(high[k]) + ride_buffer)
                             if tighten_pts > trail_pts:
                                 trail_pts = tighten_pts; sl = trail_pts
-                        # d) day end
                         if reason is None and k == end_k and day_end is not None and at_day_end and rules.day_end_close:
                             reason = "day_end"
                 else:
@@ -461,7 +466,7 @@ def build(df: pd.DataFrame, rules: Rules, server_offset_h: float = 3.0, trade_fr
         events.append(CrossEvent(k, int(time[k]), d, "EB" if s > 0 else "ES", x.entry_kind, info_fields(x, k)))
         run_exit(jn, k, s, x, guardian_profile=guardian_profile, ride_floor=ride_floor,
                  swing_bars=ride_swing_bars, ride_buffer=ride_buffer, atr_mult=ride_atr_mult,
-                 giveback_pts=giveback_pts, giveback_frac=giveback_frac)
+                 giveback_pts=giveback_pts, giveback_frac=giveback_frac, _soft_arm_pts=soft_arm_pts)
         jn.exit_rule = jn.exit_reason or ""
         jn.guardian_profile = guardian_profile
         busy_until = jn.exit_index

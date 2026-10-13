@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from dotenv import load_dotenv
 load_dotenv()   # load .env if present
 
-VERSION = "2.7.0"
+VERSION = "2.7.1"
 
 
 def _parse_lot_buttons(raw: str) -> list[float]:
@@ -74,9 +74,11 @@ class Config:
     early_lock_mode: str = os.environ.get("AUREON_EARLY_LOCK_MODE", "soft")   # soft | hard | off
     soft_fallback_min: int = int(os.environ.get("AUREON_SOFT_FALLBACK_MIN", "5"))
     # v2.7.0 guardian profile: "leg" (move-detector based) | "classic" (exact pre-v2.7.0 behaviour)
-    guardian_profile: str = os.environ.get("AUREON_GUARDIAN_PROFILE", "classic")
-    soft_giveback_pts: float = float(os.environ.get("AUREON_SOFT_GIVEBACK_PTS", "2.5"))
+    guardian_profile: str = os.environ.get("AUREON_GUARDIAN_PROFILE", "classic")  # "auto" = leg on demo; "classic" | "leg" explicit
+    guardian_profile_demo: str = os.environ.get("AUREON_GUARDIAN_PROFILE_DEMO", "leg")
+    soft_giveback_pts: float = float(os.environ.get("AUREON_SOFT_GIVEBACK_PTS", "3.0"))
     soft_giveback_frac: float = float(os.environ.get("AUREON_SOFT_GIVEBACK_FRAC", "0.5"))
+    soft_arm_pts: float = float(os.environ.get("AUREON_SOFT_ARM_PTS", "5"))
     ride_floor: float = float(os.environ.get("AUREON_RIDE_FLOOR", "4"))
     ride_swing_bars: int = int(os.environ.get("AUREON_RIDE_SWING_BARS", "6"))
     ride_buffer: float = float(os.environ.get("AUREON_RIDE_BUFFER", "1.0"))
@@ -120,3 +122,12 @@ class Config:
     enable_silver: bool = False
     dry: bool = False
     _test_skip_session: bool = False   # set True in tests to skip governor session_window (never in production)
+
+    def resolved_guardian_profile(self, is_demo: bool | None = None) -> str:
+        """Resolve guardian profile: explicit value > auto (leg on demo, classic on live).
+        is_demo=None (unknown) → classic (safe default)."""
+        if self.guardian_profile not in ("auto", ""):
+            return self.guardian_profile
+        if is_demo is True:
+            return self.guardian_profile_demo
+        return "classic"

@@ -2,6 +2,21 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.7.1 — 2026-10-13  (PATCH: leg guardian fixes)
+- **Default**: `AUREON_GUARDIAN_PROFILE=""` → auto: `leg` on demo (`broker.is_demo()`), `classic` on live.
+  `AUREON_GUARDIAN_PROFILE_DEMO=leg`. `/status` and RESUMED card show profile + phase per ticket.
+- **Phase A news**: do NOT close; cap broker SL at `−pre_stop`; if soft lock armed, convert to hard SL at that level.
+- **Sticky leg**: once a ticket enters `leg` profile it stays. `st["leg"]` snapshot persisted in `guardian_state.json`.
+  `leg_alive()` reads `st["leg"]`, not `self.leg` — opposite unconfirmed cross no longer switches to classic mid-ride.
+- **SHORT ATR trail**: `peak_px = entry + s * peak` (was `entry - s * peak` for shorts — double negative).
+- **Phase B entry guard**: transition A→B only when **current** points >= `ride_floor + ride_buffer` (not just peak).
+  If floor SL move rejected, stay A and retry. Never leave B without a floor.
+- **Soft trail arm**: `max(early_at, AUREON_SOFT_ARM_PTS=5)`; giveback default `3.0` (was 2.5).
+- **Restart**: `st["leg"]` rebuilt from journal; RESUMED card shows `leg A soft +2.1` / `leg B floor +4 trail +8.3`.
+- **CLOSED card**: shows `[leg · soft_trail]` / `[classic · ema_fast_turn]` for attribution.
+- **Replay parity**: `journeys.py` updated for all fixes above. `soft_arm_pts` in build/grid.
+- Strategy rules changed: YES — exits (leg profile only). Classic unchanged. SL never loosened.
+
 ## v2.7.0 — 2026-10-13  (MINOR: leg-based guardian profile)
 - **`aureon_mt5/leg_guardian.py`** (new, pure): `soft_trail_level()`, `phase_b_trail()`, `leg_alive()`, `bar_closes_through_ema()`.
 - **`aureon_mt5/agent.py`**: guardian logic split into `_guard_classic()` (exact pre-v2.7.0 behaviour) and `_guard_leg()` (move-detector based).
