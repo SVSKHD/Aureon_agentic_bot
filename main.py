@@ -396,6 +396,8 @@ def main():
             wd.tick()
             from aureon_mt5.daily_plan import tick as plan_tick
             plan_tick(cfg, agents, journal, notify)
+            from aureon_mt5.eod_review import tick as eod_tick
+            eod_tick(cfg, journal, notify)
             from aureon_mt5.control import check_auto_transitions
             from aureon_mt5.schedule import tick as schedule_tick
             for _sym in cfg.symbols:

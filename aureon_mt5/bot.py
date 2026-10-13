@@ -1152,6 +1152,17 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
                 return Reply(content=f"watchdog: error reading state — {e}")
         await run(inter, "watchdog", work)
 
+    @tree.command(name="eod", description="Run the end-of-day review now (or for a specific date)")
+    @app_commands.describe(date="YYYY-MM-DD (default: today)")
+    async def eod_cmd(inter: discord.Interaction, date: str = ""):
+        def work():
+            from .eod_review import run_review
+            result = run_review(cfg, journal, notify, date_str=date or None)
+            if result["card"]:
+                return Reply(card=result["card"])
+            return Reply(content=result.get("error", "EOD review unavailable"))
+        await run(inter, "eod", work)
+
     @tree.command(name="agent-on", description="Switch a symbol to AGENT mode for N minutes")
     @app_commands.describe(symbol="Symbol (default: first)", minutes="Duration in minutes (default: AUREON_AGENT_DEFAULT_MIN)")
     async def agent_on_cmd(inter: discord.Interaction, symbol: str = "", minutes: int | None = None):

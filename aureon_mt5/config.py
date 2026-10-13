@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from dotenv import load_dotenv
 load_dotenv()   # load .env if present
 
-VERSION = "2.5.2"
+VERSION = "2.5.3"
 
 
 def _parse_lot_buttons(raw: str) -> list[float]:
@@ -98,6 +98,7 @@ class Config:
     pre_alert_2050: bool = os.environ.get("AUREON_PRE_ALERT_2050", "1") == "1"
     pwin_floor: float = float(os.environ.get("AUREON_PWIN_FLOOR", "0"))
     pwin_wait_s: float = float(os.environ.get("AUREON_PWIN_WAIT_S", "15"))
+    eod_at: str = os.environ.get("AUREON_EOD_AT", "23:15")
     ctx_bars: int = int(os.environ.get("AUREON_CTX_BARS", "48"))
     ctx_max_chars: int = int(os.environ.get("AUREON_CTX_MAX_CHARS", "6000"))
     voice: bool = os.environ.get("AUREON_VOICE", "0") == "1"

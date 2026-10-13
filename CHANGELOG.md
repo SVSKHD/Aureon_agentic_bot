@@ -2,6 +2,15 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.5.3 — 2026-10-13  (PATCH: Codex end-of-day review)
+- **`aureon_mt5/eod_review.py`**: at `AUREON_EOD_AT` (default 23:15 IST) on trading days, builds a day pack from journal
+  (signals, decisions, orders, guardian actions, misses, governor blocks, costs, chop) and runs `codex exec` with a read-only
+  prompt: what went well, what cost points, rule violations, three observations. NO parameter changes, NO code edits.
+- Output: schema-validated JSON `{summary, wins[], costs[], violations[], observations[]}`; posted as one card
+  `📓 EOD REVIEW · Tue 13 Oct`. Invalid/timeout → card "EOD review unavailable (reason)".
+- `/eod [date]` runs on demand. Dedupe per date. Budget respected like other Codex calls.
+- Strategy rules changed: NO.
+
 ## v2.5.2 — 2026-10-13  (PATCH: ema2050 PRE-CROSS heads-up + p_win floor)
 - **ema2050 PRE-CROSS detection** (`strategies/ema2050/journeys.py`): ported from ema5080's P logic using EMA 20/50.
   CrossEvent label `"PRE"` emitted when: price closes through EMA20 for 2 bars, gap shrinking, gap <= 1.5× ATR, lines
