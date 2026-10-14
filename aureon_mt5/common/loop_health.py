@@ -2,7 +2,10 @@
 
 A 1 s asyncio ticker (on the bot loop) records when it last ran and how late it woke up. A plain watchdog thread
 evaluates it, so the alert still goes out when the loop itself is frozen. Cards are posted on state change only:
-BOT UNRESPONSIVE (lag > 2 s or gateway down > 60 s) and BOT RESPONSIVE (recovered)."""
+BOT UNRESPONSIVE (lag > 2 s or gateway down > 60 s) and BOT RESPONSIVE (recovered).
+
+v2.7.2: every disconnect / resume is logged with its duration; reconnect times are kept so the heartbeat card can say
+"gateway reconnects last 4 h: N". Before the first on_ready the gateway counts as down (gateway_down_for)."""
 from __future__ import annotations
 
 import asyncio
@@ -10,6 +13,15 @@ import threading
 import time as _time
 
 LAG_LIMIT_S = 2.0
+
+
+def _log(msg: str):
+    try:
+        from .. import telemetry
+        telemetry.info(msg)
+    except Exception:
+        pass
+
 GATEWAY_LIMIT_S = 60.0
 
 
@@ -22,6 +34,10 @@ class LoopMonitor:
         self.max_lag: float = 0.0                # worst lag seen since start
         self.latency: float | None = None        # Discord gateway heartbeat latency, seconds
         self.disconnected_since: float | None = None
+        self.created = clock()
+        self.ever_connected = False              # v2.7.2: on_ready seen at least once
+        self.reconnects: list[float] = []        # monotonic times of each resume after a disconnect
+        self.disconnects = 0
         self.unresponsive = False
         self.reason = ""
         self._thread: threading.Thread | None = None
@@ -42,12 +58,40 @@ class LoopMonitor:
                 except Exception:
                     self.latency = None
 
-    def gateway_down(self):
+    def gateway_down(self, why: str = "disconnect"):
         if self.disconnected_since is None:
             self.disconnected_since = self.clock()
+            self.disconnects += 1
+            _log(f"discord gateway DOWN ({why})")
 
-    def gateway_up(self):
+    def gateway_up(self, how: str = "resumed"):
+        now = self.clock()
+        if self.disconnected_since is not None:
+            dur = now - self.disconnected_since
+            self.reconnects = [t for t in self.reconnects if now - t <= 86400] + [now]
+            _log(f"discord gateway UP ({how}) after {dur:.1f} s down")
+        elif not self.ever_connected:
+            _log(f"discord gateway UP ({how}) {now - self.created:.1f} s after start")
+        self.ever_connected = True
         self.disconnected_since = None
+
+    def reconnects_since(self, seconds: float, now: float | None = None) -> int:
+        now = self.clock() if now is None else now
+        return sum(1 for t in self.reconnects if now - t <= seconds)
+
+    def gateway_down_for(self, now: float | None = None) -> float:
+        """Seconds the gateway has been down (counting from start until the first on_ready). 0 when up."""
+        now = self.clock() if now is None else now
+        if self.disconnected_since is not None:
+            return now - self.disconnected_since
+        if not self.ever_connected:
+            return now - self.created
+        return 0.0
+
+    def gateway_state(self, now: float | None = None) -> str:
+        if self.disconnected_since is not None:
+            return f"DOWN {self.gateway_down_for(now):.0f}s"
+        return "up" if self.ever_connected else "connecting"
 
     # -------------------------------------------------------------- readings
     def current_lag(self, now: float | None = None) -> float:
@@ -61,7 +105,8 @@ class LoopMonitor:
         lag = self.current_lag()
         lat = f"{self.latency * 1000:.0f} ms" if self.latency is not None else "—"
         gw = "DOWN" if self.disconnected_since is not None else "up"
-        return f"loop lag {lag:.1f} s (max {self.max_lag:.1f}) · gateway {gw} · latency {lat}"
+        return (f"loop lag {lag:.1f} s (max {self.max_lag:.1f}) · gateway {gw} · latency {lat}"
+                f" · reconnects 4 h: {self.reconnects_since(4 * 3600)}")
 
     # -------------------------------------------------------------- evaluation (watchdog thread)
     def check(self, now: float | None = None) -> str | None:

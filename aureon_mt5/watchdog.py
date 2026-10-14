@@ -32,6 +32,7 @@ class Watchdog:
         self._incidents: dict[str, dict] = {}
         self._heartbeat_posted: set[str] = set()
         self._discord_down_logged = False
+        self.monitor = None                         # v2.7.2: LoopMonitor (set by main) — gateway reconnects on the heartbeat
         self._load()
 
     # ---- persistence
@@ -178,6 +179,11 @@ class Watchdog:
                 return
         self._heartbeat_posted.add(slot_key)
         lines = [f"v{VERSION} · uptime {int((now - self.started) // 60)} min"]
+        if self.monitor is not None:
+            try:
+                lines.append(f"gateway {self.monitor.gateway_state()} · reconnects last 4 h: {self.monitor.reconnects_since(4 * 3600)}")
+            except Exception:
+                pass
         for sym, ag in self.agents.items():
             h = ag.health
             pos_n = len((getattr(ag, "snapshot", {}) or {}).get("positions", []))

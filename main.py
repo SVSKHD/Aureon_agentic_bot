@@ -48,9 +48,10 @@ def discarded_card(notify, res) -> None:
                 footer="Aureon MT5 · Auto-Update")
 
 
-def check_for_updates(notify, run=subprocess.run, execv=os.execv, log_dir: str = "logs", cwd: str | None = None) -> bool:
+def check_for_updates(notify, run=subprocess.run, exit_hook=None, log_dir: str = "logs", cwd: str | None = None) -> bool:
     """Server-authoritative: if origin/master moved, bring the checkout exactly to it (local edits → patch, then reset)
-    and restart. Restarts only after HEAD == origin/master; any failure keeps the current build running."""
+    and restart. Restarts only after HEAD == origin/master; any failure keeps the current build running.
+    v2.7.2: restart = exit(75) via `exit_hook`; the supervisor starts the new build (no os.execv)."""
     global _update_failed_at
     try:
         from aureon_mt5.common.updater import update_to_origin
@@ -71,8 +72,9 @@ def check_for_updates(notify, run=subprocess.run, execv=os.execv, log_dir: str =
                             {"name": "Action", "value": "Restarting now...", "inline": True}],
                     footer=f"Aureon MT5 · Auto-Update · {datetime.now(IST):%H:%M} IST")
         _time.sleep(2)
-        os.environ["AUREON_AUTO_RESTARTED"] = "1"
-        execv(sys.executable, [sys.executable] + sys.argv)
+        from aureon_mt5 import ops
+        ops.write_restart_marker(log_dir, "auto-update", f"{res['old'][:8]} -> {res['new'][:8]}")
+        (exit_hook or ops.hard_exit)(ops.EXIT_RESTART)
     except Exception as e:
         print(f"auto-update check failed: {e}")
     return False
@@ -336,11 +338,18 @@ def main():
     try:
         last_msg = subprocess.run(["git", "log", "-1", "--pretty=%s"], capture_output=True, text=True, timeout=10).stdout.strip()
         last_hash = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, timeout=10).stdout.strip()
-        manual_reason = os.environ.pop("AUREON_RESTART_REASON", "")
+        from aureon_mt5 import ops as _ops
+        marker = _ops.pop_restart_marker(cfg.log_dir) or {}          # v2.7.2: written before exit(75)
+        manual_reason = os.environ.pop("AUREON_RESTART_REASON", "") or (
+            f"manual:{marker.get('reason', '')}" if marker.get("kind") == "manual" else "")
+        if marker.get("kind") == "self-heal":
+            why = f"restarted · self-heal · {marker.get('reason', '')}"
+            health_notify.card("AUREON · MT5 · BACK ONLINE", f"Recovered from a hang by self-restart.\n{marker.get('reason', '')}\n"
+                               f"Running `{last_hash}` · {S.display_name}", footer="Aureon MT5 · self-heal")
         if manual_reason:
             why = f"restarted · {manual_reason}"
-            notify.card("AUREON · MT5 · BACK ONLINE", f"{manual_reason}\\nRunning `{last_hash}` · {S.display_name}")
-        if os.environ.get("AUREON_AUTO_RESTARTED"):
+            notify.card("AUREON · MT5 · BACK ONLINE", f"{manual_reason}\nRunning `{last_hash}` · {S.display_name}")
+        if os.environ.get("AUREON_AUTO_RESTARTED") or marker.get("kind") == "auto-update":
             why = f"restarted · auto-update · {last_hash}"
             notify.card("AUREON · MT5 · BACK ONLINE", f"Auto-update restart complete.\nRunning `{last_hash}` · {last_msg}",
                         fields=[{"name": "Version", "value": f"v{VERSION}", "inline": True},
@@ -366,11 +375,24 @@ def main():
                         fields=[{"name": "Enable explicitly", "value": "`--enable-silver`", "inline": True}],
                         footer="Aureon MT5")
     start_agents()
-    if cfg.bot_token: run_bot(cfg, agents, journal, notify, started, health_notify=health_notify, claude=claude, alerts=alerts, codex=codex)
+    monitor = None
+    if cfg.bot_token: monitor = run_bot(cfg, agents, journal, notify, started, health_notify=health_notify, claude=claude, alerts=alerts, codex=codex)
     else: print("no DISCORD_TOKEN — slash commands off, alerts via webhook only")
+
+    # v2.7.2: self-heal + dead-man's switch + logs/heartbeat.txt, on its own thread (never the Discord loop)
+    from aureon_mt5 import ops
+    from aureon_mt5.selfheal import HealthGuard
+    restart_exit = lambda code: ops.hard_exit(code, agents)
+    guard = HealthGuard(monitor=monitor, agents=agents, log_dir=cfg.log_dir, journal=journal, notify=health_notify,
+                        deadman_url=cfg.deadman_url, stale_bar_s=cfg.heartbeat_stale_min * 60, exit_hook=restart_exit,
+                        bot_expected=monitor is not None)
+    guard.start()
+    if cfg.deadman_url:
+        print("dead-man's switch: pinging AUREON_DEADMAN_URL every 60 s while healthy")
 
     from aureon_mt5.watchdog import Watchdog
     wd = Watchdog(health_notify or notify, journal, cfg, agents)
+    wd.monitor = monitor
 
     was_open = broker.market_open(cfg.symbols[0], cfg.server_utc_offset, cfg.dry); report_day = None; last_update_check = 0
     review_day = None; codex_review_day = None
@@ -379,7 +401,7 @@ def main():
             now = _time.time()
             if now - last_update_check >= AUTO_UPDATE_INTERVAL:
                 last_update_check = now
-                check_for_updates(notify, log_dir=cfg.log_dir)
+                check_for_updates(notify, log_dir=cfg.log_dir, exit_hook=restart_exit)
             is_open = broker.market_open(cfg.symbols[0], cfg.server_utc_offset, cfg.dry)
             if was_open and not is_open:
                 notify.send(f"{cfg.mode}:ALL:MARKET:closed-{date.today()}", "AUREON · MT5 · MARKET CLOSED", ["agents sleeping"], footer=f"{S.display_name} · {datetime.now(IST):%H:%M} IST")

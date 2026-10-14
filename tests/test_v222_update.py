@@ -102,8 +102,8 @@ def test_dirty_tree_card_posted_once_and_restart(repos, monkeypatch):
     monkeypatch.setattr(main, "_time", SimpleNamespace(sleep=lambda s: None, time=lambda: 0.0))
     write(os.path.join(repos.server, "main.py"), "local hotfix\n")
     notify, execv = Mock(), Mock()
-    main.check_for_updates(notify, execv=execv, log_dir=repos.logs, cwd=repos.server)
-    main.check_for_updates(notify, execv=execv, log_dir=repos.logs, cwd=repos.server)       # now current: silent
+    main.check_for_updates(notify, exit_hook=execv, log_dir=repos.logs, cwd=repos.server)
+    main.check_for_updates(notify, exit_hook=execv, log_dir=repos.logs, cwd=repos.server)       # now current: silent
     titles = [c.args[0] for c in notify.card.call_args_list]
     assert sum("LOCAL EDITS DISCARDED · main.py" in t for t in titles) == 1
     assert "patch saved" in notify.card.call_args_list[0].args[1]
@@ -118,9 +118,9 @@ def test_network_failure_never_execs_and_card_once_per_hour(monkeypatch):
         return SimpleNamespace(returncode=128, stdout="", stderr="Could not resolve host: github.com")
     notify, execv = Mock(), Mock()
     for _ in range(3):
-        main.check_for_updates(notify, run=run, execv=execv, log_dir="unused")
+        main.check_for_updates(notify, run=run, exit_hook=execv, log_dir="unused")
     clock["t"] += 3601
-    main.check_for_updates(notify, run=run, execv=execv, log_dir="unused")
+    main.check_for_updates(notify, run=run, exit_hook=execv, log_dir="unused")
     assert not execv.called and notify.card.call_count == 2
     assert all(c.args[0] == "AUREON · MT5 · UPDATE FAILED" for c in notify.card.call_args_list)
 
@@ -129,7 +129,7 @@ def test_network_failure_never_execs_and_card_once_per_hour(monkeypatch):
 def test_restart_aborts_before_stopping_agents_when_update_fails():
     ag = SimpleNamespace(stop=Mock(), join=Mock())
     journal, notify, execv = Mock(), Mock(), Mock()
-    out = ops.restart_process({"XAUUSD": ag}, journal, notify, "op", "test", argv=["main.py"], executor=execv,
+    out = ops.restart_process({"XAUUSD": ag}, journal, notify, "op", "test", argv=["main.py"], exit_hook=execv,
                               update=lambda: {"status": "failed", "error": "git fetch failed", "discarded": []})
     assert out is False and not execv.called and not ag.stop.called
     assert "RESTART ABORTED" in notify.card.call_args[0][0]
@@ -139,7 +139,7 @@ def test_restart_updates_then_execs(repos, monkeypatch):
     monkeypatch.delenv("AUREON_RESTART_REASON", raising=False)
     ag = SimpleNamespace(stop=Mock(), join=Mock())
     execv = Mock()
-    ops.restart_process({"XAUUSD": ag}, Mock(), Mock(), "op", "test", argv=["main.py"], executor=execv,
+    ops.restart_process({"XAUUSD": ag}, Mock(), Mock(), "op", "test", argv=["main.py"], exit_hook=execv, log_dir=repos.logs,
                         update=lambda: update_to_origin(repos.logs, cwd=repos.server))
     assert head_is_origin(repos.server) and ag.stop.called and execv.called
     monkeypatch.delenv("AUREON_RESTART_REASON", raising=False)
