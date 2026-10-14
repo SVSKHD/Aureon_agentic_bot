@@ -1,4 +1,4 @@
-# Aureon MT5 v2.6.2
+# Aureon MT5 v2.7.2
 
 You place the trade. Aureon detects (per selected EMA mode), fires a Discord gunshot, then manages what you placed:
 protect → secure +10 → ride in +5 steps → close on the fast-EMA turn → news safeguard. Reports and slash commands.
@@ -19,6 +19,25 @@ protected (SL never loosened) but receive no strategy rules; a `⚠️ MODE MISM
     python main.py --mode ema5080 --symbols XAUUSD            # gold, live (demo account first!)
     python main.py --dry --mode ema5080 --symbols XAUUSD      # synthetic bars, no MT5 modifications
     python main.py --mode ema5080 --symbols XAUUSD,XAGUSD --enable-silver   # silver guardian is EXPERIMENTAL; off unless enabled
+
+Production: run it under the supervisor (auto-restart, hang kill, boot start) — **[docs/SERVICE.md](docs/SERVICE.md)**:
+
+    powershell -ExecutionPolicy Bypass -File .\scripts\aureon_service.ps1 -Action install
+
+## Dead-man's switch (v2.7.2) — know when Aureon is dead, from outside
+Aureon pings `AUREON_DEADMAN_URL` every 60 s from a background thread (not the Discord loop), **only while** the event-loop
+lag is < 5 s, the Discord gateway is connected, every agent thread is alive (and refreshed its snapshot in the last 5 min)
+and, while the market is open, a closed bar was processed in the last 15 min. Dead, frozen or disconnected → pings stop →
+the external service alerts you.
+
+1. healthchecks.io → *Add Check* → period **1 minute**, grace **5 minutes** (any URL that alerts on missed GETs works).
+2. Integrations: email, SMS/phone call, Telegram, Discord (a channel the bot does not own) …
+3. `.env`: `AUREON_DEADMAN_URL=https://hc-ping.com/<uuid>` → restart. Startup prints `dead-man's switch: pinging …`.
+4. Test: stop the service → the check goes *down* after ~6 min.
+
+Fallback without an external service: `AUREON_DEADMAN_TELEGRAM=<bot token>`, `AUREON_DEADMAN_TELEGRAM_CHAT=<chat id>`, then
+`scripts\aureon_service.ps1 -Action install-fallback` — Task Scheduler runs `scripts/deadman_fallback.py` every 5 min and posts
+"Aureon down" when `logs/heartbeat.txt` is older than 5 min. `/status` shows the heartbeat line.
 
 ## Verify
     python detect.py --mode ema5080 --date 2026-10-05         # every P / cross / skip of the day: raw ts, server, IST, EMAs

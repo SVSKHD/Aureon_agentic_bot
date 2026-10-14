@@ -2,6 +2,37 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.7.2 — 2026-10-14  (PATCH: self-healing + outside-visible liveness)
+Symptom: `/status` and `/restart` → "The application did not respond", bot offline, no 08:00 heartbeat after the 04:00 card.
+`respond()` already defers first, so the process was dead, frozen or off the gateway — and nothing outside it could tell.
+- **Supervisor** (`scripts/aureon_service.ps1`, `docs/SERVICE.md`): NSSM service (boot start) or, without NSSM, a logon
+  Scheduled Task, running a PowerShell launcher loop: restart on any exit, crash backoff 5 s → 30 s → 2 min (reset after
+  10 min up), kill + restart when `logs/heartbeat.txt` is > 5 min old (hang), stdout/stderr → `logs/service.log` (10 MB × 5).
+- **Exit 75 = restart**: `/restart`, `/mode` and auto-update stop agents, write `logs/restart_marker.json`, exit 75; the
+  supervisor restarts. No `os.execv`. The marker drives the BACK ONLINE card. `/mode` refuses when the process was started
+  with `--mode/--symbols` (the supervisor would restart with the old flags). Fixed a literal `\n` in the manual BACK ONLINE card.
+- **`aureon_mt5/selfheal.py` `HealthGuard`** (plain thread, never the Discord loop, no MT5 calls):
+  - `logs/heartbeat.txt` every 30 s (ISO time · version · lag · gateway · health); shown on `/status`.
+  - **Dead-man's switch** `AUREON_DEADMAN_URL`: GET every 60 s only while loop lag < 5 s, gateway connected, every agent
+    thread alive and its snapshot < 5 min old, and a closed bar < 15 min old while the market is open.
+  - **Self-restart**: loop lag > 30 s, or gateway down > 5 min (incl. never connected / Discord thread died) → journal
+    `self_restart` + `logs/aureon.log` + webhook card "⚠️ Aureon frozen — restarting" → exit 75 (once).
+  - **Stall dump**: loop lag > 3 s → every thread's stack to `logs/stall-<time>.txt`, once per stall.
+- **Fallback alarm** `scripts/deadman_fallback.py` (Task Scheduler every 5 min, `-Action install-fallback`): Telegram
+  "Aureon down" / "Aureon back" from `logs/heartbeat.txt` age. `AUREON_DEADMAN_TELEGRAM` + `AUREON_DEADMAN_TELEGRAM_CHAT`.
+- **Loop blockers removed** (found by an AST scan of the async code in `bot.py`):
+  - a failed command's `telemetry.failure` posted the webhook (requests, 15 s timeout) **on the event loop** — now in a worker;
+  - card-edit hooks waited 10 s on a loop future — would freeze the loop if called from the loop thread; now scheduled there;
+  - `alerts.set_message` (store lock + file write) and `mark_ask_decided` (file write) ran on the loop — now off it;
+  - dedicated `ThreadPoolExecutor(max_workers=16)` for `off_loop` / all former `asyncio.to_thread` calls, so stuck MT5 calls
+    cannot starve command work (asyncio's default pool is cpu+4 = 6 on a 2-core VPS).
+  Charts, replays, compare, reports already run in `work()` off the loop; Claude/Codex subprocesses on their own worker
+  threads; nightly review / calibration on the supervisor thread — none on the Discord thread.
+- **Gateway**: every disconnect / resume logged with its duration; first connect logged; Discord `client.run` exit logged and
+  marks the gateway down; 💓 heartbeat card shows `gateway up · reconnects last 4 h: N`; `/status` Bot line too.
+- Tests: `tests/test_v272_selfheal.py`.
+- Strategy rules changed: NO
+
 ## v2.7.1 — 2026-10-13  (PATCH: leg guardian fixes)
 - **Default**: `AUREON_GUARDIAN_PROFILE=""` → auto: `leg` on demo (`broker.is_demo()`), `classic` on live.
   `AUREON_GUARDIAN_PROFILE_DEMO=leg`. `/status` and RESUMED card show profile + phase per ticket.

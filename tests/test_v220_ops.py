@@ -37,20 +37,18 @@ def test_mode_rejects_open_positions_and_unverified_snapshots(tmp_path):
     assert "AUREON_SYMBOLS=XAUUSD,XAGUSD" in env.read_text(encoding="utf-8")
 
 
-def test_restart_stops_joins_posts_and_execs(monkeypatch):
-    monkeypatch.delenv("AUREON_RESTART_REASON", raising=False)
+def test_restart_stops_joins_posts_and_exits_75(tmp_path):
     ag = SimpleNamespace(stop=Mock(), join=Mock())
     journal, notify, execv = Mock(), Mock(), Mock()
     ops.restart_process({"XAUUSD": ag}, journal, notify, "operator",
-                        "test", argv=["main.py", "--mode", "ema2050"],
-                        executor=execv, update=lambda: {"status": "current", "discarded": []})
+                        "test", argv=["main.py", "--mode", "ema2050"], log_dir=str(tmp_path),
+                        exit_hook=execv, update=lambda: {"status": "current", "discarded": []})
     notify.card.assert_called_once()
     journal.log.assert_called_once()
     ag.stop.assert_called_once()
     ag.join.assert_called_once_with(timeout=5)
-    assert execv.called
-    assert "AUREON_RESTART_REASON" in __import__("os").environ
-    monkeypatch.delenv("AUREON_RESTART_REASON", raising=False)
+    execv.assert_called_once_with(75)
+    assert ops.pop_restart_marker(str(tmp_path))["reason"] == "test"
 
 
 def test_crash_three_repeats_pauses_and_logs():

@@ -138,6 +138,13 @@ def status_card(sym: str, ag, cfg, journal=None, monitor=None, claude=None, code
         _field("Codex", claude_status_word(ag, codex)),                            # v2.3.0 (shown only, never applied)
         _field("Bot", _bot_line(monitor), False),
     ]
+    try:                                                                            # v2.7.2: what the outside world sees
+        from .selfheal import read_heartbeat
+        hb = read_heartbeat(cfg.log_dir)
+        if hb:
+            fields.append(_field("Heartbeat", hb[:1024], False))
+    except Exception:
+        pass
     return _embed(f"{sym} · MT5 · STATUS", f"AUREON MT5 v{VERSION} · {S.display_name} · {age_text(ag)}", color=color, fields=fields,
                   footer=f"{S.display_name} · {datetime.now(IST):%H:%M} IST")
 
@@ -460,9 +467,29 @@ class Reply:
     source: str = "cache"           # cache | live — logged per command
 
 
+# v2.7.2: a dedicated pool for off-loop work. asyncio's default executor is min(32, cpu+4) — 6 threads on a 2-core VPS — and
+# wait_for() cannot kill a thread stuck in an MT5 call, so a few hung calls could starve every later command.
+OFF_LOOP_WORKERS = 16
+_OFF_LOOP_POOL = None
+
+
+def off_loop_pool():
+    global _OFF_LOOP_POOL
+    if _OFF_LOOP_POOL is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _OFF_LOOP_POOL = ThreadPoolExecutor(max_workers=OFF_LOOP_WORKERS, thread_name_prefix="aureon-offloop")
+    return _OFF_LOOP_POOL
+
+
+async def in_pool(fn, *args, **kwargs):
+    """Run a blocking call on the dedicated pool (no timeout) — the replacement for asyncio.to_thread in this module."""
+    import functools
+    return await asyncio.get_running_loop().run_in_executor(off_loop_pool(), functools.partial(fn, *args, **kwargs))
+
+
 async def off_loop(fn, *args, timeout: float = CMD_TIMEOUT):
     """Run blocking work (MT5, matplotlib, files, subprocess) in a worker thread with a hard timeout."""
-    return await asyncio.wait_for(asyncio.to_thread(fn, *args), timeout)
+    return await asyncio.wait_for(in_pool(fn, *args), timeout)
 
 
 def discord_kwargs(reply: Reply) -> dict:
@@ -503,9 +530,18 @@ async def respond(inter, name: str, work, *, notify=None, journal=None, ephemera
         except Exception:
             pass
         if notify is not None:
+            # v2.7.2: telemetry.failure posts a webhook (requests, up to 15 s) — never on the event loop
+            def report(e=e):
+                try:
+                    raise e
+                except Exception:
+                    try:
+                        telemetry.failure(notify, journal, title="AUREON COMMAND FAILED", key=f"cmd:{name}:{type(e).__name__}",
+                                          action=f"/{name}", exc=e, retry="run the command again")
+                    except Exception:
+                        pass
             try:
-                telemetry.failure(notify, journal, title="AUREON COMMAND FAILED", key=f"cmd:{name}:{type(e).__name__}",
-                                  action=f"/{name}", exc=e, retry="run the command again")
+                await in_pool(report)                       # the user already has the followup; the loop stays free
             except Exception:
                 pass
         else:
@@ -816,6 +852,7 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
     client = discord.Client(intents=discord.Intents.default())
     tree = app_commands.CommandTree(client)
     monitor = LoopMonitor(health_notify or notify)
+    bot_thread: list = [None]
 
     def run(inter, name, work, **kw):
         """Every command goes through respond(): defer first, work off the loop, one followup, errors always reported."""
@@ -831,15 +868,22 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
         em.set_footer(text=(item.get("footer") or "Aureon MT5")[:2048])
         return em
 
+    def _edit_message(coro) -> bool:
+        """v2.7.2: from a worker thread wait (≤10 s) for the edit; ON the loop thread schedule it — waiting there on a
+        future that needs the loop would freeze the loop for the full timeout."""
+        if threading.current_thread() is bot_thread[0]:
+            client.loop.create_task(coro)
+            return True
+        asyncio.run_coroutine_threadsafe(coro, client.loop).result(timeout=10)
+        return True
+
     def _claude_edit(key, fld) -> bool:
         """v1.10.0 (called from the Claude worker thread): add the Claude field to the posted ask card if it is still open."""
         item = pending.get(key)
         if not item or item.get("decided") or not item.get("message"):
             return False
         item["fields"] = list(item.get("fields") or []) + [fld]
-        fut = asyncio.run_coroutine_threadsafe(item["message"].edit(embed=_ask_embed(item)), client.loop)
-        fut.result(timeout=10)
-        return True
+        return _edit_message(item["message"].edit(embed=_ask_embed(item)))
 
     notify.claude_edit_hook = _claude_edit
 
@@ -856,9 +900,7 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             else:
                 fields.append({"name": name, "value": str(value), "inline": False})
         item["fields"] = fields
-        fut = asyncio.run_coroutine_threadsafe(item["message"].edit(embed=_ask_embed(item)), client.loop)
-        fut.result(timeout=10)
-        return True
+        return _edit_message(item["message"].edit(embed=_ask_embed(item)))
 
     notify.card_edit_hook = _card_edit
 
@@ -907,12 +949,12 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
                 await inter.response.send_message(f"already answered: {self.item['decided']}", ephemeral=True); return
             self.item["decided"] = decision
             await inter.response.defer()
-            r = await asyncio.to_thread(ask_decision, cfg, agents, journal, self.item, decision, inter.user, notify, lots=lots)
+            r = await in_pool(ask_decision, cfg, agents, journal, self.item, decision, inter.user, notify, lots=lots)
             # v2.3.9: mark ask decided for miss tracking
             m = self.item.get("meta", {})
             ag = agents.get(m.get("symbol"))
-            if ag is not None:
-                ag.mark_ask_decided(self.item.get("key", ""), decision, placed=r.get("placed", False))
+            if ag is not None:                                    # v2.7.2: writes a file — off the loop
+                await in_pool(ag.mark_ask_decided, self.item.get("key", ""), decision, placed=r.get("placed", False))
             for c in self.children: c.disabled = True
             sugg = float(m.get("lots") or cfg.max_lots)
             if decision == "TAKE":
@@ -952,7 +994,7 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
         notify.bot_ready = True
         while not client.is_closed():
             try:
-                item = await asyncio.to_thread(notify.ask_queue.get, True, 2.0)
+                item = await in_pool(notify.ask_queue.get, True, 2.0)
             except Exception:
                 continue
             try:
@@ -963,8 +1005,8 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
                 msg = await ch.send(embed=em, view=view, files=files)
                 item["message"] = msg; pending[item["key"]] = item
                 if (item.get("meta") or {}).get("kind") == "alert" and alerts is not None:      # v2.0.2: message id on the alert
-                    try:
-                        alerts.set_message(item["meta"]["alert_id"], msg.id, getattr(ch, "id", None))
+                    try:                                          # v2.7.2: store lock + file write — off the loop
+                        await in_pool(alerts.set_message, item["meta"]["alert_id"], msg.id, getattr(ch, "id", None))
                     except Exception:
                         pass
                 while len(pending) > 50: pending.pop(next(iter(pending)))
@@ -972,7 +1014,7 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
                 print("  (ask post failed:", e, ") — falling back to webhook")
                 notify.sent.discard(item["key"]); notify.bot_ready = False
                 try:                                     # webhook post is blocking I/O — never on the event loop
-                    await asyncio.to_thread(notify.send, item["key"], item["title"], [item["description"]], item.get("png"),
+                    await in_pool(notify.send, item["key"], item["title"], [item["description"]], item.get("png"),
                                             fields=item.get("fields"), color=item.get("color"), footer=item.get("footer"))
                 finally:
                     notify.bot_ready = True
@@ -1031,7 +1073,7 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
                 await inter.response.send_message(f"already answered: {self.item['decided']}", ephemeral=True); return
             self.item["decided"] = side
             await inter.response.defer()
-            r = await asyncio.to_thread(alert_decision, cfg, agents, journal, alerts, self.item, side, inter.user, notify, lots=lots)
+            r = await in_pool(alert_decision, cfg, agents, journal, alerts, self.item, side, inter.user, notify, lots=lots)
             for c in self.children: c.disabled = True
             dec_value = f"**{r['line']}** · {inter.user.display_name} · {datetime.now(IST):%H:%M} IST — {r['text']}"[:1024]
             self.item["fields"] = [f for f in (self.item.get("fields") or []) if f.get("name") != "Decision"] + \
@@ -1340,7 +1382,7 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
 
     @client.event
     async def on_ready():
-        monitor.gateway_up()
+        monitor.gateway_up("ready")
         if not getattr(client, "_aureon_started", False):
             client._aureon_started = True
             try:
@@ -1354,12 +1396,17 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
         print(f"discord bot ready as {client.user}")
 
     @client.event
+    async def on_connect():
+        if monitor.ever_connected:
+            monitor.gateway_up("connect")
+
+    @client.event
     async def on_disconnect():
         monitor.gateway_down()
 
     @client.event
     async def on_resumed():
-        monitor.gateway_up()
+        monitor.gateway_up("resumed")
 
     @tree.command(name="status", description="Read primary symbol health and trade status")
     async def status(inter: discord.Interaction):
@@ -1739,9 +1786,9 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
     from . import ops
 
     def _restart_later(*args):
-        # after the followup is sent: restart_process stops agents and re-execs (the process does not return)
+        # after the followup is sent: restart_process stops agents and exits 75; the supervisor restarts the process
         threading.Timer(2.0, ops.restart_process, args=(agents, journal, notify) + args,
-                        kwargs={"log_dir": cfg.log_dir}).start()
+                        kwargs={"log_dir": cfg.log_dir, "exit_hook": lambda code: ops.hard_exit(code, agents)}).start()
 
     @tree.command(name="restart", description="Admin: stop agents cleanly and restart process; requires role")
     @app_commands.describe(reason="Reason shown on the BACK ONLINE card")
@@ -1883,7 +1930,14 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
 
     def _runner():
         asyncio.set_event_loop(asyncio.new_event_loop())
-        client.run(cfg.bot_token, log_handler=None)
+        try:
+            client.run(cfg.bot_token, log_handler=None)
+            telemetry.info("discord client.run returned — bot offline")
+        except BaseException as e:                       # login failure, fatal gateway error, …
+            telemetry.info(f"discord client.run died: {e!r}")
+        # v2.7.2: the bot thread is gone — mark the gateway down so the health guard self-restarts after 5 min
+        monitor.gateway_down("bot thread exited")
 
-    threading.Thread(target=_runner, daemon=True, name="discord-bot").start()
+    bot_thread[0] = threading.Thread(target=_runner, daemon=True, name="discord-bot")
+    bot_thread[0].start()
     return monitor

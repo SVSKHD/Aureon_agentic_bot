@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from dotenv import load_dotenv
 load_dotenv()   # load .env if present
 
-VERSION = "2.7.1"
+VERSION = "2.7.2"
 
 
 def _parse_lot_buttons(raw: str) -> list[float]:
@@ -61,6 +61,8 @@ class Config:
     supabase_ping: bool = os.environ.get("AUREON_SUPABASE_PING", "0") == "1"   # minute heartbeat to Supabase — off on the free plan
     watchdog: bool = os.environ.get("AUREON_WATCHDOG", "1") == "1"
     heartbeat_hours: float = float(os.environ.get("AUREON_HEARTBEAT_HOURS", "4"))
+    # v2.7.2 dead-man's switch: pinged every 60 s only while healthy (healthchecks.io or any URL); empty = off
+    deadman_url: str | None = os.environ.get("AUREON_DEADMAN_URL") or None
     streak_half_after: int = int(os.environ.get("AUREON_STREAK_HALF_AFTER", "0"))
     chop_crosses: int = int(os.environ.get("AUREON_CHOP_CROSSES", "5"))
     missed_grace_min: int = int(os.environ.get("AUREON_MISSED_GRACE_MIN", "5"))
