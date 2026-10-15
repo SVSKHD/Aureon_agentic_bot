@@ -2,6 +2,58 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.8.0 — 2026-10-15  (MINOR: Claude chart/reads + guardian rules behind env; defaults unchanged)
+Why: 2026-10-15 02:05 server — five XAUUSD longs from 4103.5 were closed at 4102.3 (−1.2) by rule 1 in `_guard` ("opposite P →
+close (flip)") on a short P that never closed through EMA 80, with EMA 50 still rising and M15 bull. Price then ran to 4150. The exit
+rule had less context than the entry rule (`journeys._entry_checks` needs session, M15, slope, news), and there was no giveback-from-
+peak exit anywhere (only `claude_advisor.pullback_reason`, which only asks).
+- **Chart to Claude** (`claude_cli.call(image=)`, `stage_image`, `CliResult.image`): the card's PNG is copied to `<workdir>/snaps/`,
+  the CLI gets `--allowedTools Read` and a CHART trailer (structure only; numbers from the SNAPSHOT). No image → command and prompt
+  byte-identical (tested). `AUREON_CLAUDE_IMAGE_EVENTS=P,CROSS,READ`. Ledger and verdict journal carry `image`. Codex `_invoke`
+  accepts and drops `image`.
+- **`READ` decisions** `HOLD|EXIT|ENTER|SKIP` (ENTER needs a side; TIGHTEN rejected). **`/claude-read [symbol]`** → `read_now()`:
+  frozen frame, cached position (no broker call), chart, `READ_RULES`; contradictions dropped (ENTER/SKIP in a trade, HOLD/EXIT flat);
+  journal `claude_read` (`acted=False`). Shown only.
+- **Structure-gated flip** `AUREON_FLIP_REQUIRE_STRUCTURE=0|1`, `FLIP_MIN_EVIDENCE=2`, `FLIP_GAP_X_RANGE=0.5`: `_flip_evidence()`
+  (close through EMA80 · EMA50 slope against · M15 against via the new cached `_m15_state()` · gap wide). Held → journal
+  `opposite_p_ignored`, `OPPOSITE P · HOLDING` card, `request_flip_read()`. Closed → the `exit` row carries `flip_evidence`.
+- **Giveback** `AUREON_GIVEBACK_PCT=0` (off), `GIVEBACK_ARM=10`: bar CLOSE kept ≤ (1 − pct) of the peak → `giveback` close.
+- **Setup stop** `AUREON_SETUP_STOP=0` (+ `SETUP_MAX_DD=10`, `SETUP_MAX_DD_X_RANGE=0`, `SETUP_SWING_BARS=6`, `SETUP_BUFFER=1.0`):
+  new pure `aureon_mt5/setup.py` (`setup_checks`, `setup_alive`, `structure_stop_pts` = `leg_guardian.phase_b_trail` with
+  `atr_mult=0`). Classic: PROTECT at the structure stop, raised each bar while `secured == 0` (journal `structure_sl`),
+  `setup_invalidated` exit on a CLOSE before `pre_stop` (journal `setup_invalidated` with the failed checks), `pre_timeout` paused while
+  the lines converge (`pre_timeout_paused`, once). After SECURE the staircase/giveback/`ema_fast_turn` run unchanged. `leg`: only the
+  invalidation exit. `st["setup"|"setup_alive"|"cap_pts"|"dist_to_cap"|"bars_in_dd"]` (computed when the setup stop is on or Claude is
+  attached) ride into the Claude snapshot.
+- **Claude votes** (Claude only; Codex no-op): `request_open_read` at first sight of a NEW ticket (`AUREON_CLAUDE_OPEN_READ=1`, shown
+  only in every mode, edits the ask card's `CLAUDE VERDICT` when there is one) and `maybe_drawdown` (`DD_READ_AT=3`, `DD_READ_STEP=2`,
+  last chance within 2 pts of the cap, `DD_READS_PER_TRADE=3`). `apply_pullback` gets an `EXIT` branch: in profit → close (manage);
+  losing → close only for `trigger == "drawdown"` in manage with `AUREON_CLAUDE_EXIT_LOSING=1` and above the cap (`claude_cut_loss`);
+  otherwise shown. All closes go through one `_guardian_close` → `agent._close` (the hard-rule test still counts one call site).
+- `/advisor-report`: "READ votes by trigger" — p_win buckets and HOLD/EXIT vs the trade's `final_points` (`advisor_board.read_grades`).
+- Decisions taken while building (worth a look):
+  - In the P phase a long's EMA fast is below EMA slow by definition, so the `ema_order` check is `None` (not applicable) until the
+    cross — otherwise every P-phase trade would be "invalidated" at once under `SETUP_STOP=1`.
+  - A held opposite P does not skip the rest of that poll's guardian rules (stops, timeout, invalidation still run); only a flip close
+    ends the ticket's poll.
+  - The `swing` check compares the close with the PRIOR bars' lows/highs (the current bar's own low is always ≤ its close).
+- Tests: `test_v280_claude_read.py`, `test_v280_flip_giveback.py`, `test_v280_setup_stop.py`, `test_v280_claude_votes.py`;
+  `tests/conftest.py` starts tests with the open READ off (older rigs pop the advisor queue); v2.8.0 tests turn it on.
+- **Replay of the 02:05 trade** (`python tests/fixtures/replay_20261015.py`). ⚠️ The M5 bars are SYNTHETIC
+  (`tests/fixtures/make_xauusd_20261015.py`, rebuilt from the incident numbers: EMA80 ≈ 4098.7, gap ≈ 1.0 vs avg range ≈ 2.8, M15 bull):
+  the machine this was built on has no `logs/journal*.jsonl` and no MT5. Re-run with the real bars before trusting these numbers.
+  - defaults (v2.7.2): initial SL 4097.5 · worst close −3.0 · closed 02:05 at 4102.30 (−1.2, `p_flip`) — the incident, reproduced.
+  - `AUREON_FLIP_REQUIRE_STRUCTURE=1`: P SHORT held (0/2 evidence) · worst close −3.0 · SECURE +10 at 02:35, stopped at 4113.50
+    (+10.0) by the next bar's wick on the synthetic bars.
+  - `AUREON_GIVEBACK_PCT=50`: no effect on this trade — with the default flip it is closed at 02:05 before the giveback can arm; with
+    `FLIP_REQUIRE_STRUCTURE=1` the SECURE +10 lock exits first (peak +10.2: a 50 % giveback level, +5.1, sits below the +10 lock).
+  - `AUREON_SETUP_STOP=1`: initial SL 4098.85 (swing low 4099.9 − 1.0, cap −10) · worst close −2.5 · **stopped at 01:55 at 4099.67
+    (−3.8)** — the per-bar raise (as specified) lifts the stop with the 6-bar swing low during the grind into the entry, and the
+    pullback's low touches it. Without the per-bar raise the initial 4098.85 would have held (lowest low 4099.3). Not what the brief
+    expected ("held, worst close ≈ −3"); left as specified and flagged — options: raise only once the trade is above entry, or raise
+    only on a confirmed higher swing low.
+- Strategy rules changed: NO (defaults) — YES with AUREON_FLIP_REQUIRE_STRUCTURE=1, AUREON_GIVEBACK_PCT>0 or AUREON_SETUP_STOP=1 — Claude cut-loss only with AUREON_CLAUDE_EXIT_LOSING=1
+
 ## v2.7.2 — 2026-10-14  (PATCH: self-healing + outside-visible liveness)
 Symptom: `/status` and `/restart` → "The application did not respond", bot offline, no 08:00 heartbeat after the 04:00 card.
 `respond()` already defers first, so the process was dead, frozen or off the gateway — and nothing outside it could tell.

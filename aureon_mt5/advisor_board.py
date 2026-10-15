@@ -56,3 +56,45 @@ def tag_text(t: str | None) -> str:
 def clear():
     with _lock:
         _board.clear()
+
+
+# ----------------------------------------------------------------------------- v2.8.0 READ grading by trigger
+def read_grades(logs: list[dict], source: str = "claude") -> list[dict]:
+    """Pair each READ verdict on a position (trigger open / drawdown / opposite P held) with the trade's final points from the
+    `closed` journal row of the same ticket. Rows: {trigger, decision, p_win, points, graded, ticket}. Measurement only."""
+    final = {r.get("ticket"): r.get("final_points") for r in logs if r.get("event") == "closed" and r.get("final_points") is not None}
+    out = []
+    for r in logs:
+        if r.get("event") != f"{source}_verdict" or r.get(f"{source}_event") != "READ" or not r.get("decision"):
+            continue
+        pts = final.get(r.get("ticket"))
+        out.append({"trigger": r.get("trigger") or "—", "decision": r.get("decision"), "p_win": r.get("p_win"),
+                    "points": float(pts) if pts is not None else None, "graded": pts is not None, "ticket": r.get("ticket")})
+    return out
+
+
+def read_buckets(rows: list[dict]) -> dict[str, dict]:
+    """Per trigger: n graded, p_win buckets (<0.4 / 0.4–0.6 / >=0.6) → n, win %, avg final points; EXIT vs HOLD avg points."""
+    out: dict[str, dict] = {}
+    for r in rows:
+        if not r["graded"]:
+            continue
+        t = out.setdefault(r["trigger"], {"n": 0, "buckets": {}, "by_decision": {}})
+        t["n"] += 1
+        if r["p_win"] is not None:
+            b = "<0.4" if r["p_win"] < 0.4 else "0.4-0.6" if r["p_win"] < 0.6 else ">=0.6"
+            bb = t["buckets"].setdefault(b, {"n": 0, "wins": 0, "pts": 0.0})
+            bb["n"] += 1; bb["wins"] += int(r["points"] > 0); bb["pts"] += r["points"]
+        d = t["by_decision"].setdefault(r["decision"], {"n": 0, "pts": 0.0})
+        d["n"] += 1; d["pts"] += r["points"]
+    return out
+
+
+def read_buckets_text(b: dict[str, dict]) -> str:
+    lines = []
+    for trig, t in sorted(b.items()):
+        bk = " · ".join(f"p_win {k}: {v['n']} · {round(100 * v['wins'] / v['n'])}% win · {v['pts'] / v['n']:+.1f}"
+                        for k, v in sorted(t["buckets"].items()))
+        dec = " · ".join(f"{k} {v['n']} avg {v['pts'] / v['n']:+.1f}" for k, v in sorted(t["by_decision"].items()))
+        lines.append(f"{trig} (n={t['n']}): {bk or 'no p_win'} | {dec}")
+    return "\n".join(lines)

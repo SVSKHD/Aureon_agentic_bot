@@ -22,6 +22,7 @@ def append(log_dir, kind, result, source="claude"):
            "error": (result.error or "")[:160], "timed_out": bool(result.timed_out),
            "decision": (result.verdict or {}).get("decision"),
            "total_cost_usd": getattr(result, "total_cost_usd", None),
+           "image": bool(getattr(result, "image", False)),                     # v2.8.0: a chart went with the call
            **{k: (int(usage.get(k, 0) or 0) if isinstance(usage, dict) else None) for k in KEYS}}
     if source != "claude":
         row["source"] = source

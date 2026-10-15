@@ -106,6 +106,12 @@ def advisor_report(cfg, agents, journal, period="week", now=None, gather=None):
             continue
         pb = result.pullback if src == "claude" else result.codex_pullback
         fields += advisor_fields(label, st, st["confidence"], usage[src], pb, applies)
+        if src == "claude":                                       # v2.8.0: open / drawdown / flip-held READs vs the trade result
+            from .advisor_board import read_buckets, read_buckets_text, read_grades
+            rb = read_buckets(read_grades(logs, src))
+            if rb:
+                fields.append({"name": f"{label} · READ votes by trigger (final points)", "value": read_buckets_text(rb)[:1024],
+                               "inline": False})
     h = result.h2h or {}
     if h.get("both"):
         fields.append({"name": "Head-to-head · Claude vs Codex",
