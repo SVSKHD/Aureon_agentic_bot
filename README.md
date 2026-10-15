@@ -1,4 +1,4 @@
-# Aureon MT5 v2.7.2
+# Aureon MT5 v2.8.0
 
 You place the trade. Aureon detects (per selected EMA mode), fires a Discord gunshot, then manages what you placed:
 protect → secure +10 → ride in +5 steps → close on the fast-EMA turn → news safeguard. Reports and slash commands.
@@ -23,6 +23,28 @@ protected (SL never loosened) but receive no strategy rules; a `⚠️ MODE MISM
 Production: run it under the supervisor (auto-restart, hang kill, boot start) — **[docs/SERVICE.md](docs/SERVICE.md)**:
 
     powershell -ExecutionPolicy Bypass -File .\scripts\aureon_service.ps1 -Action install
+
+## v2.8.0 — Claude sees the chart, the guardian sees the setup
+Everything that can change a trade is behind an env knob that defaults to OFF (v2.7.2 behaviour); see `.env.example`.
+
+- **Chart to Claude**: live P / CROSS calls (and every READ) attach the card's chart (`AUREON_CLAUDE_IMAGE_EVENTS`). The CLI gets
+  `--allowedTools Read` and the prompt ends with a CHART trailer: the picture is for structure only, every number comes from the
+  SNAPSHOT. Without an image the command and prompt are byte-identical to v2.7.2. `claude_replay.py` (run.py --claude) stays text-only.
+  Codex never gets a chart.
+- **`/claude-read [symbol]`**: Claude reads the chart + the open position now — HOLD/EXIT in a trade, ENTER/SKIP when flat. Shown
+  only; journaled `claude_read`; positions come from the agent's cached snapshot (no broker call).
+- **Structure-gated flip** (`AUREON_FLIP_REQUIRE_STRUCTURE=1`): an opposite P closes the trade only with ≥ `FLIP_MIN_EVIDENCE` of:
+  close through EMA80 · EMA50 slope against · M15 against · gap ≥ `FLIP_GAP_X_RANGE` × avg range. Otherwise `OPPOSITE P · HOLDING`
+  (journal `opposite_p_ignored`), the guardian keeps managing, and Claude gets a flip-held READ.
+- **Giveback** (`AUREON_GIVEBACK_PCT`, armed at `GIVEBACK_ARM`): close on a bar CLOSE that gave back that share of the peak.
+- **Setup stop** (`AUREON_SETUP_STOP=1`, classic profile): initial SL = swing low/high ∓ `SETUP_BUFFER`, capped at −`SETUP_MAX_DD`
+  (or × range); raised with the swing while under water; closes on a bar CLOSE that invalidates the setup (EMA order after the cross,
+  close beyond EMA80 ∓ buffer, M15 against, prior swing broken — unknown checks never fail); P timeout paused while the lines converge.
+  After SECURE the staircase takes over unchanged. The `leg` profile gets only the invalidation exit.
+- **Claude votes**: one READ when a position is first seen (`AUREON_CLAUDE_OPEN_READ`, shown only, p_win graded in `/advisor-report`)
+  and event-driven READs under water (`AUREON_DD_READ_AT` / `_STEP` / `_READS_PER_TRADE`). A drawdown EXIT may cut a losing trade
+  only in `manage` with `AUREON_CLAUDE_EXIT_LOSING=1`. Budget: +1 call per trade at open, +0–3 in drawdown — set
+  `AUREON_CLAUDE_MAX_CALLS=100`.
 
 ## Dead-man's switch (v2.7.2) — know when Aureon is dead, from outside
 Aureon pings `AUREON_DEADMAN_URL` every 60 s from a background thread (not the Discord loop), **only while** the event-loop

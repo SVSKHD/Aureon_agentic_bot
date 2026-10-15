@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from dotenv import load_dotenv
 load_dotenv()   # load .env if present
 
-VERSION = "2.7.2"
+VERSION = "2.8.0"
 
 
 def _parse_lot_buttons(raw: str) -> list[float]:
@@ -104,6 +104,28 @@ class Config:
     claude_max_calls: int = int(os.environ.get("AUREON_CLAUDE_MAX_CALLS", "30"))      # per IST day, all symbols
     claude_timeout: float = float(os.environ.get("AUREON_CLAUDE_TIMEOUT", "90"))      # seconds per call
     claude_workdir: str = os.environ.get("AUREON_CLAUDE_WORKDIR", "") or os.path.join(os.path.expanduser("~"), "aureon_claude")
+    # v2.8.0 the chart goes with these Claude events (P, CROSS, READ); "" = never. Prompt text only — never changes a trade.
+    claude_image_events: tuple = tuple(e.strip().upper() for e in os.environ.get("AUREON_CLAUDE_IMAGE_EVENTS", "P,CROSS,READ").split(",")
+                                       if e.strip())
+    # v2.8.0 structure-gated flip (0 = v2.7.2: any opposite P closes) — evidence needed before an opposite P closes the trade
+    flip_require_structure: bool = os.environ.get("AUREON_FLIP_REQUIRE_STRUCTURE", "0") == "1"
+    flip_min_evidence: int = int(os.environ.get("AUREON_FLIP_MIN_EVIDENCE", "2"))
+    flip_gap_x_range: float = float(os.environ.get("AUREON_FLIP_GAP_X_RANGE", "0.5"))
+    # v2.8.0 giveback exit on a bar CLOSE once peak >= ARM (0 = off)
+    giveback_pct: float = float(os.environ.get("AUREON_GIVEBACK_PCT", "0"))
+    giveback_arm: float = float(os.environ.get("AUREON_GIVEBACK_ARM", "10"))
+    # v2.8.0 setup-aware stop (classic profile; 0 = v2.7.2 fixed −pre_stop and 12-bar timeout)
+    setup_stop: bool = os.environ.get("AUREON_SETUP_STOP", "0") == "1"
+    setup_max_dd: float = float(os.environ.get("AUREON_SETUP_MAX_DD", "10"))
+    setup_max_dd_x_range: float = float(os.environ.get("AUREON_SETUP_MAX_DD_X_RANGE", "0"))
+    setup_swing_bars: int = int(os.environ.get("AUREON_SETUP_SWING_BARS", "6"))
+    setup_buffer: float = float(os.environ.get("AUREON_SETUP_BUFFER", "1.0"))
+    # v2.8.0 Claude votes: one READ at open (shown only) and event-driven READs in drawdown
+    claude_open_read: bool = os.environ.get("AUREON_CLAUDE_OPEN_READ", "1") == "1"
+    claude_dd_read_at: float = float(os.environ.get("AUREON_DD_READ_AT", "3"))
+    claude_dd_read_step: float = float(os.environ.get("AUREON_DD_READ_STEP", "2"))
+    claude_dd_reads_per_trade: int = int(os.environ.get("AUREON_DD_READS_PER_TRADE", "3"))
+    claude_exit_losing: bool = os.environ.get("AUREON_CLAUDE_EXIT_LOSING", "0") == "1"
     # v1.11.0 weekly compare: optional Claude self-review of its wrong calls after the Saturday COMPARE card (counts toward the budget)
     compare_claude_review: bool = os.environ.get("AUREON_COMPARE_CLAUDE_REVIEW", "0") == "1"
     calib_min_n: int = int(os.environ.get("AUREON_CALIB_MIN_N", "30"))

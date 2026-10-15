@@ -12,6 +12,7 @@ import pytest
 from aureon_mt5 import ops, selfheal
 from aureon_mt5.common.loop_health import LoopMonitor
 from aureon_mt5.selfheal import EXIT_RESTART, HealthGuard
+from aureon_mt5.config import VERSION
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -130,7 +131,7 @@ def test_heartbeat_written_every_30s(tmp_path):
     g.tick()
     path = tmp_path / "heartbeat.txt"
     first = path.read_text(encoding="utf-8")
-    assert "v2.7.2" in first and "lag=0.0s" in first and "gateway=up" in first and "health=ok" in first
+    assert f"v{VERSION}" in first and "lag=0.0s" in first and "gateway=up" in first and "health=ok" in first
     _advance(mon, mono, wall, 10); agents["XAUUSD"].is_alive = lambda: False; g.tick()
     assert path.read_text(encoding="utf-8") == first              # < 30 s: not rewritten
     _advance(mon, mono, wall, 25); g.tick()

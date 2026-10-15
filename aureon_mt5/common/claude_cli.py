@@ -19,7 +19,12 @@ IST = timezone(timedelta(hours=5, minutes=30))
 
 ENTRY_EVENTS = ("P", "CROSS", "RE", "ENTER", "ALERT")   # ENTER = ema2050 pullback-entry bar · ALERT = /alert card add-on (v2.0.0)
 MAX_EVIDENCE = 12
-DECISIONS = {**{e: ("TAKE", "SKIP") for e in ENTRY_EVENTS}, "pullback": ("HOLD", "TIGHTEN", "CLOSE")}
+DECISIONS = {**{e: ("TAKE", "SKIP") for e in ENTRY_EVENTS}, "pullback": ("HOLD", "TIGHTEN", "CLOSE"),
+             "READ": ("HOLD", "EXIT", "ENTER", "SKIP")}          # v2.8.0: /claude-read, flip-held, open and drawdown reads
+CHART_TRAILER = ("\n\nCHART: read the image file {rel} (M5 candles, both EMAs, session bands, the marked bar and any SL/secure "
+                 "levels) BEFORE answering. Use it ONLY for structure — wick clusters, consolidation width, whipsaw, nearby swing "
+                 "highs/lows, how clean the EMA break is. Every number (prices, EMAs, gap, ATR, news minutes) comes from the SNAPSHOT "
+                 "text, never from the picture.")
 CONFIDENCE = ("low", "medium", "high")
 MAX_REASON_WORDS = 20
 AUTH_MARKERS = ("not logged in", "please run /login", "/login", "login required", "authenticat", "unauthorized", "401",
@@ -42,6 +47,7 @@ class CliResult:
     model: str = ""                      # v2.0.1: the model id the CLI reported in its JSON result (when present)
     usage: dict | None = None            # v2.2.1: token counts the CLI reported (input/output/cache), for the usage ledger
     total_cost_usd: float | None = None  # v2.2.1: CLI-reported cost of the call (metadata only)
+    image: bool = False                  # v2.8.0: a chart was attached to this call
 
 
 # ----------------------------------------------------------------------------- environment
@@ -109,6 +115,8 @@ def validate(v: dict, event: str) -> dict:
             raise ValueError("tighten_to not a number")
     if dec == "TIGHTEN" and tt is None:
         raise ValueError("TIGHTEN without tighten_to")
+    if event == "READ" and dec == "ENTER" and side is None:
+        raise ValueError("ENTER without side")
     # v2.5.1: rationale replaces reason for ranker mode; accept both
     reason_text = v.get("rationale") or v.get("reason") or ""
     words = str(reason_text).split()
@@ -198,31 +206,53 @@ def resolve_bin(name: str) -> str:
     return shutil.which(name) or name                        # Windows: finds claude.cmd / claude.exe
 
 
+def stage_image(image: str | None, workdir: str) -> str | None:
+    """v2.8.0: copy the chart PNG into <workdir>/snaps/ (the CLI may only Read inside its cwd). Returns the relative path or None."""
+    if not image or not os.path.isfile(image):
+        return None
+    try:
+        dst_dir = os.path.join(workdir, "snaps")
+        os.makedirs(dst_dir, exist_ok=True)
+        name = os.path.basename(image)
+        shutil.copyfile(image, os.path.join(dst_dir, name))
+        return f"snaps/{name}"
+    except OSError:
+        return None
+
+
 def call(prompt: str, model: str, *, event: str, bin: str = "claude", workdir: str = ".", timeout: float = 90.0,
-         run=subprocess.run) -> CliResult:
-    """One `claude -p` call. The prompt goes in on stdin; cwd = an empty work folder outside the repo."""
+         run=subprocess.run, image: str | None = None) -> CliResult:
+    """One `claude -p` call. The prompt goes in on stdin; cwd = an empty work folder outside the repo.
+    v2.8.0: `image` (a chart PNG) is staged into the workdir and the CLI may use its Read tool on it — for structure only.
+    Without an image the command and the prompt are exactly as before."""
     t0 = _time.monotonic()
     cmd = [resolve_bin(bin), "-p", "--output-format", "json", "--model", model]
+    rel = None
     try:
         os.makedirs(workdir, exist_ok=True)
+        rel = stage_image(image, workdir)
+        if rel:
+            cmd += ["--allowedTools", "Read"]
+            prompt = prompt + CHART_TRAILER.format(rel=rel)
         r = run(cmd, input=prompt, capture_output=True, text=True, encoding="utf-8", errors="replace",
                 cwd=workdir, timeout=timeout, env=clean_env())
     except subprocess.TimeoutExpired:
-        return CliResult(False, error=f"timeout after {timeout:g} s", timed_out=True, latency_s=_time.monotonic() - t0)
+        return CliResult(False, error=f"timeout after {timeout:g} s", timed_out=True, latency_s=_time.monotonic() - t0, image=bool(rel))
     except FileNotFoundError:
         return CliResult(False, error=f"'{bin}' not found — install Claude Code or set AUREON_CLAUDE_BIN", auth_error=True,
-                         latency_s=_time.monotonic() - t0)
+                         latency_s=_time.monotonic() - t0, image=bool(rel))
     except Exception as e:
-        return CliResult(False, error=f"CLI failed: {e!r}"[:200], latency_s=_time.monotonic() - t0)
+        return CliResult(False, error=f"CLI failed: {e!r}"[:200], latency_s=_time.monotonic() - t0, image=bool(rel))
     lat = _time.monotonic() - t0
     out = r.stdout or ""
     if r.returncode != 0:
         res = parse_output(out, event) if out.strip().startswith("{") else CliResult(False)
         msg = res.error or (r.stderr or out or f"exit {r.returncode}").strip()[:200]
         return CliResult(False, error=msg, auth_error=res.auth_error or _is_auth(msg) or _is_auth(r.stderr or ""), latency_s=lat,
-                         raw=out[:500])
+                         raw=out[:500], image=bool(rel))
     res = parse_output(out, event)
     res.latency_s = lat
+    res.image = bool(rel)
     return res
 
 

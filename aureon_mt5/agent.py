@@ -29,6 +29,7 @@ from .strategies.ema5080.trend import find_reentries, state_of
 from . import alerts as alerts_mod
 from .common.chop import chop_state as _chop_state
 from . import leg_guardian as lg
+from . import setup as setup_mod
 import os
 import numpy as np
 
@@ -369,6 +370,49 @@ class SymbolAgent(threading.Thread):
                 parts.append(f"{tf} —")
         txt = " · ".join(parts); self._htf_cache = (key, txt)
         return txt
+
+    def _m15_state(self) -> str | None:
+        """v2.8.0: raw M15 50/80 state on closed bars ("BULLISH · PULLBACK", …), cached per M5 bar. Any failure → None
+        (None never counts as evidence or as a failed setup check)."""
+        cache = getattr(self, "_m15_cache", None)
+        if cache is not None and cache[0] == self.last_bar:
+            return cache[1]
+        state = None
+        try:
+            d = broker.bars_tf(self.symbol, "M15", 300, self.cfg.source, self.off)
+            d = self.S.add_emas(d.iloc[:-1] if len(d) > 1 else d)      # closed bars only
+            cf, cs = self.S.ema_cols
+            state = state_of(float(d["close"].iloc[-1]), float(d[cf].iloc[-1]), float(d[cs].iloc[-1]))
+        except Exception:
+            state = None
+        self._m15_cache = (self.last_bar, state)
+        return state
+
+    def _flip_evidence(self, p, df, close, ef, es, gap) -> list[str]:
+        """v2.8.0: what on the closed P bar says the trade's structure is really broken (AUREON_FLIP_REQUIRE_STRUCTURE)."""
+        s = 1 if p["direction"] == "long" else -1
+        cf, cs = self.S.ema_cols
+        ev = []
+        if (close < es) if s > 0 else (close > es):
+            ev.append(f"close through EMA{self.S.slow}")
+        try:
+            f = df[cf].to_numpy()
+            slope = float(f[-1] - f[-4]) if len(f) >= 4 else 0.0
+            if slope * s < 0:
+                ev.append(f"EMA{self.S.fast} slope against")
+        except Exception:
+            pass
+        try:
+            m15 = self._m15_state()
+        except Exception:
+            m15 = None
+        if m15 and m15.upper().startswith("BEAR" if s > 0 else "BULL"):
+            ev.append("M15 against")
+        rng = (df["high"] - df["low"]).to_numpy()
+        avg = float(rng[-21:-1].mean()) if len(rng) > 21 else float(rng.mean()) if len(rng) else 0.0
+        if len(gap) and avg > 0 and abs(float(gap[-1])) >= self.cfg.flip_gap_x_range * avg:
+            ev.append(f"gap wide: {abs(float(gap[-1])):.1f} vs avg range {avg:.1f}")
+        return ev
 
     def _warnings(self, df) -> list[str]:
         w = []
@@ -793,7 +837,7 @@ class SymbolAgent(threading.Thread):
                                   "sl": stop, "chop": _chop, "chop_crosses": _chop_n, **self._suggested(r.price - stop)})
             self.track_ask(re_key, r.side, "reentry", r.price, bar_t, self._suggested(r.price - stop).get("lots"), stop)
             for adv in self.advisors():
-                adv.request_entry(self, "reentry", r.side, bar_t, df, card_key=re_key)
+                adv.request_entry(self, "reentry", r.side, bar_t, df, card_key=re_key, png=png)
 
     # ------------------------------------------------------------------ session dividers as cards
     def _session(self, df, bar_t, close, ef, es):
@@ -970,7 +1014,7 @@ class SymbolAgent(threading.Thread):
                           (close - s * g.pre_stop) if g else None)
             if kind in ("P", "cross"):                                       # v1.10.0: enqueue only — never blocks the poll
                 for adv in self.advisors():
-                    adv.request_entry(self, kind, side, bar_t, df, card_key=ask_key)
+                    adv.request_entry(self, kind, side, bar_t, df, card_key=ask_key, png=png)
 
     # ------------------------------------------------------------------ v2.0.0 price alerts (every poll, on the guardian's tick)
     def _tick(self, df) -> dict | None:
@@ -1122,7 +1166,7 @@ class SymbolAgent(threading.Thread):
                                 fields=fields, color=colour, footer=cfooter(self.S.display_name, f"bar {ist(bar_t, off)}"))
                 self.track_ask(ask_key, side, kind, close, bar_t, self._suggested(g.pre_stop).get("lots") if g else None, stop)
                 for adv in self.advisors():                                    # the ENTER bar only — never raw CROSS / MULTI
-                    adv.request_entry(self, "enter", side, bar_t, df, card_key=ask_key)
+                    adv.request_entry(self, "enter", side, bar_t, df, card_key=ask_key, png=png)
 
     # ------------------------------------------------------------------ guardian helpers
     def _locked(self, p: dict) -> float:
@@ -1161,7 +1205,9 @@ class SymbolAgent(threading.Thread):
 
     def _close(self, p, reason, title, key, st, journal_reason=None, bar_t=None):
         event_name = {"p_flip": "FLIP CLOSE", "news_flat": "BANKED BEFORE NEWS", "claude_close": "CLAUDE CLOSED",
-                      "opposite_cross": "OPPOSITE CROSS · CLOSED"}.get(journal_reason or "", None)
+                      "opposite_cross": "OPPOSITE CROSS · CLOSED", "giveback": "GIVEBACK · CLOSED",
+                      "setup_invalidated": "SETUP INVALIDATED · CLOSED",
+                      "claude_cut_loss": "CLAUDE CUT LOSS"}.get(journal_reason or "", None)
         if bar_t is not None and st.get("closing_bar") == bar_t:
             return                                      # one close attempt per bar
         st["closing_bar"] = bar_t
@@ -1170,7 +1216,8 @@ class SymbolAgent(threading.Thread):
             self.closed_by_aureon.add(p["ticket"])
         self.health["last_broker_action"] = f"close {r.status} {datetime.now(IST):%H:%M:%S}"
         self.journal.log("exit", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], points=p["points"],
-                         reason=journal_reason or reason, auto=bool(r.ok), alert_id=st.get("alert_id"))
+                         reason=journal_reason or reason, auto=bool(r.ok), alert_id=st.get("alert_id"),
+                         **({"flip_evidence": st["flip_evidence"]} if journal_reason == "p_flip" and st.get("flip_evidence") else {}))
         if r.ok:
             self.notify.send(key, ctitle(self.symbol, event_name or ("CLOSED " + ("WIN" if p["points"] > 0 else "LOSS")), p["direction"]), [reason],
                              fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"],
@@ -1275,14 +1322,27 @@ class SymbolAgent(threading.Thread):
             against_s = (close < es) if s > 0 else (close > es)
             separating = st["pre"] and len(gap) >= 3 and abs(gap[-1]) > abs(gap[-2]) > abs(gap[-3])
             reason = jr = None
+            # v2.8.0 AUREON_SETUP_STOP: a CLOSE that kills the setup ends the trade; converging lines pause the P timeout
+            _setup_on = self.cfg.setup_stop and st.get("setup") is not None and st["secured"] < g.secure_level
+            _dead = _setup_on and not setup_mod.setup_alive(st["setup"])
+            _paused = (_setup_on and st.get("setup_alive") and st["pre"] and st["bars"] >= g.pre_timeout_bars and st["secured"] == 0
+                       and len(gap) >= 2 and abs(gap[-1]) < abs(gap[-2]))
+            if _paused and not st.get("timeout_paused_logged"):
+                st["timeout_paused_logged"] = True
+                self.journal.log("pre_timeout_paused", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], bars=st["bars"],
+                                 points=p["points"], gap=round(float(gap[-1]), 2))
             if st["secured"] >= g.secure_level and against_f:
                 reason, jr = f"bar closed through EMA {self.S.fast} ({ef:.2f}) — ride over", "ema_fast_turn"
+            elif _dead:
+                reason, jr = f"setup invalidated: {', '.join(setup_mod.failed_checks(st['setup']))}", "setup_invalidated"
+                self.journal.log("setup_invalidated", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"],
+                                 failed=setup_mod.failed_checks(st["setup"]), close=close, points=p["points"])
             elif st["pre"] and p["points"] <= -g.pre_stop and not (
                     self.cfg.respect_manual_sl and p["sl"] and abs(p["price_open"] - p["sl"]) > g.pre_stop + 1e-6):
                 reason, jr = f"P failed: {p['points']:+.2f}, lines not crossed", "pre_stop"
             elif separating and st["bars"] >= 2:
                 reason, jr = f"P aborted: EMA {self.S.fast}/{self.S.slow} separating again before the cross", "pre_abort"
-            elif st["pre"] and st["bars"] >= g.pre_timeout_bars and st["secured"] == 0 and not st.get("timeout_hold"):
+            elif st["pre"] and st["bars"] >= g.pre_timeout_bars and st["secured"] == 0 and not st.get("timeout_hold") and not _paused:
                 if p["points"] > 0 or (self.cfg.respect_manual_sl and p.get("tp")):
                     st["timeout_hold"] = True
                     be = p["price_open"] + s * 0.5 if p["points"] > 1.0 else None
@@ -1365,6 +1425,13 @@ class SymbolAgent(threading.Thread):
                                     tag, st, "soft_trail", bar_t)
                     return
 
+            # v2.8.0 AUREON_SETUP_STOP: a CLOSE that kills the setup ends the trade (no second stop in the leg profile)
+            if new_bar and cfg.setup_stop and st.get("setup") is not None and not setup_mod.setup_alive(st["setup"]):
+                self.journal.log("setup_invalidated", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"],
+                                 failed=setup_mod.failed_checks(st["setup"]), close=close, points=p["points"], guardian_profile="leg")
+                self._close_leg(p, f"setup invalidated: {', '.join(setup_mod.failed_checks(st['setup']))}", tag, st, "setup_invalidated", bar_t)
+                return
+
             # P phase → cross confirmed
             if st["pre"] and sgn == s:
                 st["pre"] = False; self._save_state_now()
@@ -1437,6 +1504,41 @@ class SymbolAgent(threading.Thread):
                     f"{'✅' if p['points'] > 0 else '🛑'} CLOSED — {tag}",
                     self.key("CLOSED", f"{p['ticket']}-{bar_key(bar_t, self.off)}"), st, jr, bar_t)
 
+    # ------------------------------------------------------------------ v2.8.0 setup view (AUREON_SETUP_STOP / Claude snapshot)
+    def _setup_wanted(self) -> bool:
+        return bool(self.cfg.setup_stop) or any(getattr(a, "SOURCE", "") == "claude" for a in self.advisors())
+
+    def _setup_cap(self, df) -> float:
+        rng = (df["high"] - df["low"]).to_numpy()
+        avg = float(rng[-20:].mean()) if len(rng) else 0.0
+        return setup_mod.cap_points(self.cfg.setup_max_dd, self.cfg.setup_max_dd_x_range, avg)
+
+    def _structure_stop(self, p, df, cap, current_pts) -> tuple[float, float | None]:
+        """(points from entry, swing price) for the setup stop on the latest closed bars."""
+        n = self.cfg.setup_swing_bars
+        lows = df["low"].to_numpy()[-n:].tolist(); highs = df["high"].to_numpy()[-n:].tolist()
+        pts = setup_mod.structure_stop_pts(p["direction"], p["price_open"], lows, highs, n, self.cfg.setup_buffer, cap, current_pts)
+        swing = (min(lows) if p["direction"] == "long" else max(highs)) if lows else None
+        return pts, swing
+
+    def _update_setup(self, p, st, s, new_bar, df, close, ef, es):
+        """Per ticket: st["setup"], st["setup_alive"], st["cap_pts"], st["dist_to_cap"], st["bars_in_dd"] (closed bars only)."""
+        if not (new_bar or "setup" not in st):
+            return
+        n = self.cfg.setup_swing_bars
+        prior = df.iloc[:-1]
+        checks = setup_mod.setup_checks(p["direction"], close, ef, es, self.cfg.setup_buffer,
+                                        prior["low"].to_numpy()[-n:].tolist(), prior["high"].to_numpy()[-n:].tolist(), n,
+                                        self._m15_state())
+        if st.get("pre"):
+            checks["ema_order"] = None          # P phase: the lines have not crossed yet by definition — not a failure
+        st["setup"] = checks; st["setup_alive"] = setup_mod.setup_alive(checks)
+        cap = st.get("cap_pts") or self._setup_cap(df); st["cap_pts"] = cap
+        under = max(0.0, (p["price_open"] - close) * s)
+        st["dist_to_cap"] = round(cap - under, 2)
+        if new_bar:
+            st["bars_in_dd"] = 0 if (close - p["price_open"]) * s >= 0 else int(st.get("bars_in_dd", 0)) + 1
+
     # ------------------------------------------------------------------ guardian
     def _guard(self, new_bar, bar_t, df, close, ef, es, sgn):
         g = self.g; cf, cs = self.S.ema_cols
@@ -1467,6 +1569,7 @@ class SymbolAgent(threading.Thread):
         for p in pos:
             s = 1 if p["direction"] == "long" else -1
             alert_id = None
+            open_read_key = False                                # v2.8.0: False = not first sight; else the ask card key (or None)
             if p["ticket"] not in self.state:                    # v1.11.0: first sight of a trade (compare: 'Me · TAKEN')
                 # v2.3.6: try journal reconstruction before creating fresh state
                 rebuilt, src = self.journal.rebuild_state_for_ticket(p["ticket"])
@@ -1487,6 +1590,8 @@ class SymbolAgent(threading.Thread):
                     pa_card_key = None
                 self.journal.log("position_seen", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"],
                                  side="LONG" if s > 0 else "SHORT", entry=p["price_open"], open_time=p.get("time"), alert_id=alert_id)
+                if rebuilt is None:                                                # a new trade, not a restart
+                    open_read_key = pa_card_key
                 if alert_id:                                                       # v2.0.2: the card shows the ticket (≤ 1 poll)
                     self.notify.edit_card(pa_card_key or alerts_mod.key_for(self.symbol, alert_id),
                                           {"Decision": f"ATTACHED · ticket {p['ticket']} · {p['direction'].upper()} @ {p['price_open']:.2f}"
@@ -1509,21 +1614,67 @@ class SymbolAgent(threading.Thread):
             tag = f"{self.symbol} #{p['ticket']} {p['direction'].upper()} @ {p['price_open']:.2f}"
             if st.get("frozen"):
                 continue                                   # mode mismatch: keep SL, apply no strategy rules
+            if self._setup_wanted():                                           # v2.8.0
+                self._update_setup(p, st, s, new_bar, df, close, ef, es)
+            if open_read_key is not False:
+                for adv in self.advisors():                                    # v2.8.0: one READ at open (Claude; shown only)
+                    adv.request_open_read(self, p, st, bar_t, df, card_key=open_read_key)
+            _structure = self.cfg.setup_stop and st.get("guardian_profile", self._resolved_profile) != "leg"
 
             # 0) protect a naked position (never touch an existing manual SL here)
             if not p["sl"]:
-                sl = p["price_open"] - s * g.pre_stop
+                if _structure:                                                 # v2.8.0: the stop is the setup
+                    cap = st.get("cap_pts") or self._setup_cap(df)
+                    pts, swing = self._structure_stop(p, df, cap, -cap)
+                    sl = p["price_open"] + s * pts
+                    text = (f"initial stop {'−' if pts < 0 else '+'}{abs(pts):.1f} (structure: swing {'low' if s > 0 else 'high'} "
+                            f"{swing:.1f} {'−' if s > 0 else '+'} {self.cfg.setup_buffer:.1f}, cap −{cap:g})")
+                else:
+                    sl = p["price_open"] - s * g.pre_stop
+                    text = f"initial stop −{g.pre_stop:g}"
                 if self._move_sl(p, sl, "PROTECT"):
                     self.journal.log("protected", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], sl=sl)
-                    self.notify.send(self.key("PROTECTED", p["ticket"]), ctitle(self.symbol, "PROTECTED", p["direction"]), [f"initial stop −{g.pre_stop:g}"],
+                    self.notify.send(self.key("PROTECTED", p["ticket"]), ctitle(self.symbol, "PROTECTED", p["direction"]), [text],
                                      fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"], points=p["points"], sl=sl),
                                      color=EVENT_COLOURS["protected"], footer=cfooter(self.S.display_name))
+                    if _structure:
+                        p = {**p, "sl": sl}                                    # (v2.7.2 path keeps p unchanged this poll)
+            elif _structure and new_bar and st["secured"] == 0:
+                # v2.8.0: the structure stop follows the swing up (never loosens; _move_sl refuses a worse level anyway)
+                cap = st.get("cap_pts") or self._setup_cap(df)
+                cur = (p["sl"] - p["price_open"]) * s
+                pts, swing = self._structure_stop(p, df, cap, cur)
+                if pts > cur + 1e-9:
+                    lvl = p["price_open"] + s * pts
+                    if self._move_sl(p, lvl, "STRUCTURE SL"):
+                        self.journal.log("structure_sl", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], swing=swing, cap=cap,
+                                         level=lvl, points=round(pts, 2))
+                        p = {**p, "sl": lvl}
 
             # 1) opposite P → close (flip). The replacement trade is yours to place.
+            #    v2.8.0 AUREON_FLIP_REQUIRE_STRUCTURE=1: only when the structure confirms (>= FLIP_MIN_EVIDENCE items)
             if sig and not sig["consumed"] and sig["kind"] == "P" and sig["bar_time"] == bar_t and sig["direction"] != p["direction"].upper():
                 sig["consumed"] = True
-                self._close(p, f"opposite P ({sig['direction']}) — flip", f"🔁 FLIP CLOSE — {tag}", self.key("FLIP", f"{p['ticket']}-{bar_key(bar_t, self.off)}"), st, "p_flip", bar_t)
-                continue
+                ev = self._flip_evidence(p, df, close, ef, es, gap) if self.cfg.flip_require_structure else None
+                if ev is None or len(ev) >= self.cfg.flip_min_evidence:
+                    if ev is None:
+                        self._close(p, f"opposite P ({sig['direction']}) — flip", f"🔁 FLIP CLOSE — {tag}", self.key("FLIP", f"{p['ticket']}-{bar_key(bar_t, self.off)}"), st, "p_flip", bar_t)
+                    else:
+                        st["flip_evidence"] = ev
+                        self._close(p, f"opposite P ({sig['direction']}) — flip · structure confirms: {', '.join(ev)}", f"🔁 FLIP CLOSE — {tag}",
+                                    self.key("FLIP", f"{p['ticket']}-{bar_key(bar_t, self.off)}"), st, "p_flip", bar_t)
+                    continue
+                # held: the structure does not confirm the opposite P — keep the SL, keep managing by the other rules
+                self.journal.log("opposite_p_ignored", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], direction=sig["direction"],
+                                 evidence=ev, points=p["points"], peak=st["peak"])
+                self.notify.send(self.key("FLIP_HOLD", f"{p['ticket']}-{bar_key(bar_t, self.off)}"), ctitle(self.symbol, "OPPOSITE P · HOLDING", p["direction"]),
+                                 [f"P {sig['direction']} formed but structure does not confirm ({len(ev)}/{self.cfg.flip_min_evidence}: "
+                                  f"{', '.join(ev) or 'none'}) — keeping the SL, not flipping"],
+                                 fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"],
+                                                        points=p["points"], sl=p["sl"] or None, secured=st.get("secured"), peak=st["peak"]),
+                                 color=EVENT_COLOURS["info"], footer=cfooter(self.S.display_name, "guardian"))
+                for adv in self.advisors():
+                    adv.request_flip_read(self, p, st, bar_t, df, evidence=ev)
 
             # 1b) v2.0.0 (ema2050): the next CONFIRMED opposite cross closes the trade (same confirm rule as the entry)
             cc = self.last_confirmed_cross
@@ -1531,6 +1682,16 @@ class SymbolAgent(threading.Thread):
                 self._close(p, f"confirmed opposite cross ({cc['direction']}) — the leg is over", f"🔁 OPPOSITE CROSS — {tag}",
                             self.key("OPP_CROSS", f"{p['ticket']}-{bar_key(bar_t, self.off)}"), st, "opposite_cross", bar_t)
                 continue
+
+            # 1c) v2.8.0 giveback from peak on a bar CLOSE (AUREON_GIVEBACK_PCT, armed at GIVEBACK_ARM). Off by default.
+            if new_bar and self.cfg.giveback_pct > 0 and st["peak"] >= self.cfg.giveback_arm:
+                pts_at_close = (close - p["price_open"]) * s                 # the bar CLOSE, never the tick
+                kept = pts_at_close / st["peak"] if st["peak"] > 0 else 1.0
+                if kept <= 1.0 - self.cfg.giveback_pct / 100.0:
+                    self._close(p, f"gave back {100 * (1 - kept):.0f}% of peak +{st['peak']:.1f} (closed {pts_at_close:+.1f})",
+                                (f"✅ GIVEBACK EXIT — {tag}" if pts_at_close > 0 else f"🛑 GIVEBACK EXIT — {tag}"),
+                                self.key("GIVEBACK", f"{p['ticket']}-{bar_key(bar_t, self.off)}"), st, "giveback", bar_t)
+                    continue
 
             # v2.7.0/v2.7.1: guardian profile — "leg" or "classic"
             # sticky: once a ticket gets a profile, it keeps it (stored in st)
@@ -1572,6 +1733,7 @@ class SymbolAgent(threading.Thread):
                 codes = self._advise(p, st, bar_t, df, ef, es, g)
                 for adv in self.advisors():                                  # v1.10.0: enqueue only (one job per pullback, per advisor)
                     adv.maybe_pullback(self, p, st, bar_t, df, codes or ())
+                    adv.maybe_drawdown(self, p, st, bar_t, df)               # v2.8.0: event-driven READs under water
                 if st["bars"] and st["bars"] % self.SNAPSHOT_BARS == 0:
                     self._snapshot(p, st, bar_t)
 

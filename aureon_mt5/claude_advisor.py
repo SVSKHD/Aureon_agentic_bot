@@ -45,6 +45,28 @@ KIND_TO_EVENT = {"P": "P", "cross": "CROSS", "reentry": "RE", "enter": "ENTER", 
 EMA_NAMES = {"ema5080": ("EMA 50", "EMA 80"), "ema2050": ("EMA 20", "EMA 50")}
 TREND_PULLBACK = ("PULLBACK", "WEAKENING", "CHALLENGED")
 
+READ_RULES = ("OPERATOR READ (/claude-read): the operator asks what to do RIGHT NOW on the latest closed bar. Nothing you say is "
+              "applied — the guardian owns the SL and the operator places or closes trades. Answer with one JSON object and nothing "
+              "else: {\"decision\": \"HOLD|EXIT|ENTER|SKIP\", \"side\": \"BUY|SELL|null\", \"confidence\": \"low|medium|high\", "
+              "\"rationale\": \"<= 20 words\", \"risks\": [...], \"evidence\": [...]}. If the SNAPSHOT has a position "
+              "(entry/sl/open_profit present): decide HOLD or EXIT for THAT position only (side = its side). Never TIGHTEN or move the "
+              "SL. If there is no position: decide ENTER (side required, only when this mode's rules are met on this bar and "
+              "news/session/governor/chop allow) or SKIP. SKIP is the default when in doubt; a flat day is not a mistake.")
+
+
+OPEN_RULES = ("OPEN READ: the operator just took this trade on the signal in the SNAPSHOT. Rate it: decision HOLD or EXIT, "
+              "p_win 0–1, risks. HOLD is the default; EXIT only if the entry breaks a rule of this mode.")
+DD_RULES = ("DRAWDOWN READ: the trade is under water but the setup is still alive by the rules. Is this a pullback or a failure? "
+            "HOLD unless you see structure the rules do not. EXIT means take this loss now rather than wait for the stop at −{cap}.")
+FLIP_RULES = ("FLIP HELD: an opposite P formed but the structure did not confirm it, so the guardian kept the trade "
+              "(flip_evidence lists what did confirm). Decide HOLD or EXIT for this position.")
+READ_TRIGGERS = ("open", "drawdown", "opposite P held")
+
+
+def read_prompt_text(base: str, extra: str = "") -> str:
+    return base + "\n\n" + READ_RULES + (("\n\n" + extra) if extra else "")
+
+
 REVIEW_PROMPT = ("You are reviewing one trading day of Aureon, an XAUUSD M5 EMA 50/80 assistant. A human placed every trade.\n"
                  "Below are the day's journal events (signals, decisions, guardian actions, exits, Claude verdicts).\n"
                  "Write a plain-text review, max 150 words, no code fences: 1) what worked, 2) what cost points, "
@@ -147,7 +169,9 @@ def build_snapshot(agent, event: str, side: str, bar_t: int, df, *, position: di
                      "retrace_pct": round(100 * max(0.0, peak - pts) / peak, 1) if peak > 0 else None,
                      "bars_since_peak": int(max(0, (bar_t - int(peak_t)) // BAR_S)) if peak_t else None,
                      "closed_through_slow_ema": bool((close < e80) if long else (close > e80)),
-                     "dist_to_sl": round(abs(float(position.get("current", close)) - sl), 2) if sl else None})
+                     "dist_to_sl": round(abs(float(position.get("current", close)) - sl), 2) if sl else None,
+                     # v2.8.0 setup view (the guardian's per-ticket checks; None until computed)
+                     "setup": st.get("setup"), "setup_alive": st.get("setup_alive"), "dist_to_cap": st.get("dist_to_cap")})
     return snap
 
 
@@ -171,7 +195,8 @@ def _day_stats(agent) -> tuple[float, int]:
 
 SNAPSHOT_KEEP = ("gap", "dist_to_fast_ema_pts", "swing_against_last6_pts", "atr20", "avg_range", "crosses_today", "bars_since_cross",
                  "confirm_state", "session", "trend_state", "minutes_to_news", "day_pnl_pts", "trades_today", "retrace_pct",
-                 "retrace_from_peak_pts", "bars_since_peak", "mae_so_far", "closed_through_slow_ema", "dist_to_sl", "peak", "open_profit")
+                 "retrace_from_peak_pts", "bars_since_peak", "mae_so_far", "closed_through_slow_ema", "dist_to_sl", "peak", "open_profit",
+                 "setup", "setup_alive", "dist_to_cap", "trigger")
 
 
 def _compact(snap: dict) -> dict:
@@ -204,12 +229,13 @@ class ClaudeAdvisor:
         self.budget = Budget(os.path.join(cfg.log_dir, f"{self.SOURCE}_budget.json"), self.max_calls)
         self._call_lock = threading.Lock()                  # one CLI call at a time, worker and commands alike
         self.fired: dict[tuple, float] = {}                 # (symbol, ticket) -> peak when the pullback verdict was requested
+        self.dd_fired: dict[tuple, dict] = {}               # v2.8.0 (symbol, ticket) -> {"trough", "last_chance"} at the last drawdown read
         self._unavail_last: dict[str, float] = {}
         self._budget_day: str | None = None
         self.stats = {"login": None, "last_verdict": None, "last_error": "", "latencies": deque(maxlen=50), "dropped": 0,
                       # v2.0.1 /claude attachment card
                       "version": None, "bin_path": self._resolve_bin(), "version_error": "",
-                      "calls_by_event": {"entry": 0, "pullback": 0, "alert": 0, "review": 0, "test": 0},
+                      "calls_by_event": {"entry": 0, "pullback": 0, "alert": 0, "review": 0, "test": 0, "read": 0},
                       "fast_exit_cancels": 0, "detach_cancels": 0, "last_latency": None,
                       "reported_models": {}, "last_verdict_by_symbol": {}}
         self._worker: threading.Thread | None = None
@@ -249,9 +275,14 @@ class ClaudeAdvisor:
     def _version(self) -> dict:
         return claude_cli.version(self.cfg.claude_bin)
 
-    def _invoke(self, prompt: str, model: str, event: str, *, free_text: bool = False):
+    def _invoke(self, prompt: str, model: str, event: str, *, free_text: bool = False, image=None):
+        kw = {"image": image} if image is not None else {}       # v2.8.0: older fakes / callers take no image kwarg
         return self.caller(prompt, model, event=event, bin=self.cfg.claude_bin, workdir=self.cfg.claude_workdir,
-                           timeout=self.cfg.claude_timeout)
+                           timeout=self.cfg.claude_timeout, **kw)
+
+    def wants_image(self, event: str) -> bool:
+        """v2.8.0: attach the chart to this event's call (AUREON_CLAUDE_IMAGE_EVENTS). Codex never gets one."""
+        return self.SOURCE == "claude" and str(event).upper() in tuple(getattr(self.cfg, "claude_image_events", ()) or ())
 
     def _inbox(self, agent):
         return getattr(agent, f"{self.ATTR}_inbox", None)
@@ -358,14 +389,17 @@ class ClaudeAdvisor:
             return False
 
     # ------------------------------------------------------------------ triggers (agent thread; enqueue only)
-    def request_entry(self, agent, kind: str, side: str, bar_t: int, df, card_key: str | None = None) -> bool:
+    def request_entry(self, agent, kind: str, side: str, bar_t: int, df, card_key: str | None = None, png: str | None = None) -> bool:
         event = KIND_TO_EVENT.get(kind)
         if not event or not self.advises(agent.S):
             return False
         snap = build_snapshot(agent, event, side, bar_t, df, kind=kind)
-        return self._enqueue({"type": "entry", "event": event, "symbol": agent.symbol, "side": side, "bar_t": bar_t,
-                              "off": agent.off, "snapshot": snap, "card_key": card_key, "agent": agent,
-                              "model": self.entry_model, "mode_name": agent.S.name, "display": agent.S.display_name})
+        job = {"type": "entry", "event": event, "symbol": agent.symbol, "side": side, "bar_t": bar_t,
+               "off": agent.off, "snapshot": snap, "card_key": card_key, "agent": agent,
+               "model": self.entry_model, "mode_name": agent.S.name, "display": agent.S.display_name}
+        if png and self.wants_image(event):                       # v2.8.0: the card's chart goes with the call
+            job["png"] = png
+        return self._enqueue(job)
 
     def pullback_reason(self, agent, p: dict, st: dict, advisor_codes) -> str | None:
         long = p["direction"] == "long"
@@ -415,23 +449,111 @@ class ClaudeAdvisor:
 
     def forget(self, symbol: str, ticket):
         self.fired.pop((symbol, ticket), None)
+        self.dd_fired.pop((symbol, ticket), None)
+
+    # ------------------------------------------------------------------ v2.8.0 READs on a position (agent thread; enqueue only)
+    def _request_read(self, agent, p: dict, st: dict, bar_t: int, df, *, trigger: str, extra: str, kind: str | None = None,
+                      snap_extra: dict | None = None, card_key: str | None = None) -> bool:
+        """One READ job on a live position. Claude only (Codex: no-op). The verdict is applied/shown on the agent thread by
+        drain() → apply_pullback(), after the guardian ran for that poll."""
+        if self.SOURCE != "claude" or not self.advises(agent.S):
+            return False
+        side = p["direction"].upper()
+        snap = build_snapshot(agent, "READ", side, bar_t, df, position=p, st=st, kind=kind)
+        snap["trigger"] = trigger
+        snap.update(snap_extra or {})
+        job = {"type": "read", "event": "READ", "symbol": agent.symbol, "side": side, "ticket": p["ticket"], "bar_t": bar_t,
+               "off": agent.off, "snapshot": snap, "agent": agent, "open_profit": p["points"], "trigger": trigger, "extra": extra,
+               "model": self.entry_model, "mode_name": agent.S.name, "display": agent.S.display_name, "card_key": card_key,
+               "sl": p.get("sl") or None}
+        if self.wants_image("READ"):
+            job["df"] = df.copy()                               # the chart is rendered on the worker, never on the poll
+        return self._enqueue(job)
+
+    def request_flip_read(self, agent, p: dict, st: dict, bar_t: int, df, *, evidence) -> bool:
+        """v2.8.0: the guardian held through an opposite P (structure did not confirm) — ask HOLD / EXIT."""
+        return self._request_read(agent, p, st, bar_t, df, trigger="opposite P held", extra=FLIP_RULES,
+                                  snap_extra={"flip_evidence": list(evidence or [])})
+
+    def request_open_read(self, agent, p: dict, st: dict, bar_t: int, df, card_key: str | None = None) -> bool:
+        """v2.8.0: one READ when a position is first seen. Shown only in every mode — never closes."""
+        if not getattr(self.cfg, "claude_open_read", False):
+            return False
+        sig = getattr(agent, "latest_signal", None)
+        kind = sig["kind"] if (sig and sig.get("direction") == p["direction"].upper() and sig.get("bar_time") == bar_t) else None
+        return self._request_read(agent, p, st, bar_t, df, trigger="open", extra=OPEN_RULES, kind=kind, card_key=card_key)
+
+    def maybe_drawdown(self, agent, p: dict, st: dict, bar_t: int, df) -> bool:
+        """v2.8.0: event-driven READs while the trade is under water on the CLOSE and the setup is still alive:
+        first drawdown >= DD_READ_AT, each new trough >= DD_READ_STEP deeper, one last chance when <= 2 pts from the cap.
+        At most DD_READS_PER_TRADE per ticket."""
+        cfg = self.cfg
+        if self.SOURCE != "claude" or not self.advises(agent.S) or float(getattr(cfg, "claude_dd_read_at", 0) or 0) <= 0:
+            return False
+        if st.get("setup_alive") is not True:
+            return False
+        s = 1 if p["direction"] == "long" else -1
+        close = float(df["close"].iloc[-1])
+        under = (float(p["price_open"]) - close) * s
+        if under < cfg.claude_dd_read_at:
+            return False
+        if int(st.get("dd_reads", 0)) >= int(cfg.claude_dd_reads_per_trade):
+            return False
+        cap = float(st.get("cap_pts") or cfg.setup_max_dd)
+        dist = float(st["dist_to_cap"]) if st.get("dist_to_cap") is not None else cap - under
+        key = (agent.symbol, p["ticket"]); arm = self.dd_fired.get(key)
+        last_chance = dist <= 2.0
+        if arm is not None and not (under >= arm["trough"] + cfg.claude_dd_read_step or (last_chance and not arm["last_chance"])):
+            return False
+        self.dd_fired[key] = {"trough": max(under, arm["trough"] if arm else 0.0),
+                              "last_chance": bool(last_chance or (arm or {}).get("last_chance"))}
+        st["dd_reads"] = int(st.get("dd_reads", 0)) + 1
+        extra = {"mae_so_far": round(float(st.get("mae", min(0.0, p["points"]))), 2), "bars_in_drawdown": int(st.get("bars_in_dd", 0)),
+                 "dist_to_cap": round(dist, 2), "setup": st.get("setup"), "setup_alive": st.get("setup_alive"),
+                 "drawdown_on_close": round(under, 2), "last_chance": last_chance}
+        return self._request_read(agent, p, st, bar_t, df, trigger="drawdown", extra=DD_RULES.format(cap=f"{cap:g}"), snap_extra=extra)
+
+    def _process_read(self, job: dict):
+        """Worker: chart (optional) → READ call → keep HOLD/EXIT → agent inbox (applied after the guardian)."""
+        png = None
+        if job.get("df") is not None:
+            png = self._render_chart(job["agent"], job["df"], job["side"], f"claude-{job['trigger']}".replace(" ", "-"), job.get("sl"))
+        job.pop("df", None)
+        if png:
+            job["png"] = png
+        res = self._call(self.read_prompt(job["snapshot"], job.get("extra", "")), job["model"], "READ", image=png)
+        if res is None:
+            self._journal(job, None, latency=0.0, acted=False, stale=False, error="budget used"); return
+        v = res.verdict if res.ok else None
+        err = res.error or "no verdict"
+        if v is not None and v["decision"] not in ("HOLD", "EXIT"):
+            err = f"{v['decision']} is not valid on an open position"; v = None
+        if v is None:
+            self._journal(job, None, latency=res.latency_s, acted=False, stale=False, error=err); return
+        v["side"] = _side_word(job["side"])
+        self.stats["last_verdict"] = f"{job['symbol']} READ ({job['trigger']}) {v['decision']} · {v['confidence']} · {datetime.now(IST):%H:%M} IST"
+        self.stats["last_verdict_by_symbol"][job["symbol"]] = f"{datetime.now(IST):%H:%M} IST {v['decision']}"
+        job["latency"] = res.latency_s; job["verdict"] = v
+        inbox = self._inbox(job["agent"])
+        if inbox is not None:
+            inbox.put(job)
 
     # ------------------------------------------------------------------ the call (worker / command threads)
     def _call(self, prompt: str, model: str, event: str, *, kind_override: str | None = None,
-              free_text: bool = False) -> claude_cli.CliResult | None:
+              free_text: bool = False, image: str | None = None) -> claude_cli.CliResult | None:
         """None = budget used (no call made)."""
         if not self.budget.take():
             self._budget_card(); return None
         with self._call_lock:
-            res = self._invoke(prompt, model, event, free_text=free_text)
+            res = self._invoke(prompt, model, event, free_text=free_text, image=image)
         from .claude_usage import append as append_usage
         try:
-            append_usage(self.cfg.log_dir, kind_override or {"pullback": "pullback", "ALERT": "alert", "review": "review", "test": "test"}.get(event, "entry"),
+            append_usage(self.cfg.log_dir, kind_override or {"pullback": "pullback", "ALERT": "alert", "review": "review", "test": "test", "READ": "read"}.get(event, "entry"),
                          res, source=self.SOURCE)
         except OSError as exc:
             telemetry.info(f"{self.LABEL} usage ledger unavailable: {exc!r}")
         self.stats["latencies"].append(res.latency_s); self.stats["last_latency"] = res.latency_s
-        kind = {"pullback": "pullback", "ALERT": "alert", "review": "review", "test": "test"}.get(event, "entry")
+        kind = {"pullback": "pullback", "ALERT": "alert", "review": "review", "test": "test", "READ": "read"}.get(event, "entry")
         self.stats["calls_by_event"][kind] = self.stats["calls_by_event"].get(kind, 0) + 1
         if getattr(res, "model", ""):
             self.stats["reported_models"][kind] = res.model
@@ -452,10 +574,78 @@ class ClaudeAdvisor:
                 f"ema_fast/ema_slow in the snapshot are {fast}/{slow}.\n\n")
         return head + self.rules.strip() + "\n\nSNAPSHOT:\n" + json.dumps(snapshot, default=str)
 
+    def read_prompt(self, snapshot: dict, extra: str = "") -> str:
+        """v2.8.0: the advisor prompt + READ_RULES (+ a trigger paragraph: OPEN_RULES / DD_RULES / flip-held)."""
+        return read_prompt_text(self.prompt_for(snapshot), extra)
+
+    def _render_chart(self, agent, df, side: str | None, title_extra: str, stop: float | None = None) -> str | None:
+        """A chart of the frozen frame for a READ call. Any failure → None (never blocks the read)."""
+        try:
+            from .common.context_chart import context_chart
+            return context_chart(df, agent.symbol, agent.S.display_name, agent.S.fast, agent.S.slow, agent.S.ema_cols, agent.off,
+                                 agent.chart_dir, marker={"index": len(df) - 1, "side": (side or "LONG").upper(), "label": "READ",
+                                                          "stop": stop}, bars=120, title_extra=title_extra)
+        except Exception as e:
+            telemetry.info(f"{self.SOURCE} read chart failed: {e!r}")
+            return None
+
+    # ------------------------------------------------------------------ v2.8.0 /claude-read (Discord command thread, blocking)
+    def read_now(self, agent) -> dict:
+        """What to do RIGHT NOW on the latest closed bar. Shown only: nothing is applied, no broker call (positions come from the
+        agent's cached snapshot). Returns {ok, verdict, error, png, snapshot, position, latency, stale, budget_used}."""
+        out = {"ok": False, "verdict": None, "error": "", "png": None, "snapshot": None, "position": None, "latency": 0.0,
+               "stale": False, "budget_used": False}
+        frame = getattr(agent, "last_df", None)
+        if frame is None or len(frame) == 0:
+            out["error"] = "no cached closed-bar frame yet"; return out
+        df = frame.copy()
+        bar_t = int(df["time"].iloc[-1])
+        cache = getattr(agent, "snapshot", None) or {}
+        position = next(iter(cache.get("positions") or []), None)
+        st = None
+        if position is not None:
+            states = cache.get("state") or {}
+            st = states.get(position["ticket"], states.get(str(position["ticket"]), {}))
+        side = position["direction"].upper() if position else ""
+        snap = build_snapshot(agent, "READ", side, bar_t, df, position=position, st=st)
+        snap["position_open"] = position is not None
+        snap["ticket"] = position["ticket"] if position else None
+        out["snapshot"] = snap; out["position"] = position
+        if self.budget.used() >= self.max_calls:
+            out["budget_used"] = True; out["error"] = "daily budget used — no call made"; return out
+        png = self._render_chart(agent, df, side or None, "claude-read", (position or {}).get("sl") or None) if self.wants_image("READ") else None
+        out["png"] = png
+        res = self._call(self.read_prompt(snap), self.entry_model, "READ", kind_override="read", image=png)
+        if res is None:
+            out["budget_used"] = True; out["error"] = "daily budget used — no call made"; return out
+        out["latency"] = res.latency_s
+        out["stale"] = now_server(agent.off) >= bar_t + 2 * BAR_S
+        v = res.verdict if res.ok else None
+        err = "" if v is not None else (res.error or "no verdict")
+        if v is not None:
+            allowed = ("HOLD", "EXIT") if position else ("ENTER", "SKIP")
+            if v["decision"] not in allowed:
+                err = (f"{v['decision']} is not valid " + ("with an open position" if position else "without a position"))
+                v = None
+            elif position:
+                v["side"] = _side_word(side)                     # HOLD / EXIT are about THAT position
+        out.update(ok=v is not None, verdict=v, error=err)
+        try:
+            self.journal.log(f"{self.SOURCE}_read", source=self.SOURCE, symbol=agent.symbol, bar=bar_t,
+                             decision=(v or {}).get("decision"), side=(v or {}).get("side"), confidence=(v or {}).get("confidence"),
+                             reason=(v or {}).get("reason"), risks=(v or {}).get("risks") or [], evidence=(v or {}).get("evidence") or [],
+                             error=err or None, stale=bool(out["stale"]), image=bool(res.image or png), ticket=snap["ticket"],
+                             open_profit=snap.get("open_profit"), acted=False, snapshot_fields=_compact(snap))
+        except Exception as e:
+            telemetry.info(f"{self.SOURCE} read journal failed: {e!r}")
+        return out
+
     def process(self, job: dict):
         if job["type"] == "review":
             self.daily_review(job.get("day"), force=job.get("force", False)); return
-        res = self._call(self.prompt_for(job["snapshot"]), job["model"], job["event"])
+        if job["type"] == "read":
+            self._process_read(job); return
+        res = self._call(self.prompt_for(job["snapshot"]), job["model"], job["event"], image=job.get("png"))
         if res is None:
             self._journal(job, None, latency=0.0, acted=False, stale=False, error="budget used")
             if job["type"] == "alert":
@@ -522,6 +712,8 @@ class ClaudeAdvisor:
             note = "STALE — arrived after the next bar closed; not acted"
         elif dec == "HOLD":
             note = "hold — guardian keeps managing by its rules"
+        elif job.get("trigger") == "open":
+            note = f"open read — {dec} shown only, never applied"
         elif not self.manage:
             note = f"advisory mode — {dec} shown, not applied"
         elif dec == "TIGHTEN":
@@ -542,13 +734,32 @@ class ClaudeAdvisor:
             if p["points"] <= 0:
                 note = f"not in profit ({p['points']:+.2f}) — CLOSE shown, not acted"
             else:
-                agent._close(p, f"Claude: {v['reason'] or 'trend turning'}", "CLAUDE CLOSED",
-                             agent.key("CLAUDE_CLOSED", f"{p['ticket']}-{bar_key(job['bar_t'], agent.off)}"), st, "claude_close", agent.last_bar)
-                acted = p["ticket"] in getattr(agent, "closed_by_aureon", set())
+                acted = self._guardian_close(agent, job, p, st, f"Claude: {v['reason'] or 'trend turning'}", "CLAUDE_CLOSED", "claude_close")
                 note = "closed in profit (MT5 confirmed)" if acted else "close failed — see the failure alert"
+        elif dec == "EXIT":                                              # v2.8.0 READ verdicts
+            cap = float(st.get("cap_pts") or getattr(self.cfg, "setup_max_dd", 10.0))
+            if p["points"] > 0:
+                acted = self._guardian_close(agent, job, p, st, f"Claude: {v['reason'] or 'exit'}", "CLAUDE_CLOSED", "claude_close")
+                note = "closed in profit (MT5 confirmed)" if acted else "close failed — see the failure alert"
+            elif job.get("trigger") == "drawdown" and getattr(self.cfg, "claude_exit_losing", False) and p["points"] > -cap:
+                acted = self._guardian_close(agent, job, p, st, f"Claude: cut loss {p['points']:+.1f} — {v['reason']}", "CLAUDE_CUT",
+                                             "claude_cut_loss")
+                note = f"loss cut at {p['points']:+.1f} (MT5 confirmed)" if acted else "close failed — see the failure alert"
+            else:
+                note = "EXIT shown, not acted (losing)"
         self._journal(job, v, latency=job.get("latency", 0.0), acted=acted, stale=stale, note=note)
+        if job.get("trigger") == "open" and p is not None and job.get("card_key"):
+            if self.notify.edit_card(job["card_key"], {f"{self.TAG} VERDICT": f"{advisor_board.verdict_line(self.SOURCE, v, stale)} · "
+                                                                               f"p_win {v.get('p_win') if v.get('p_win') is not None else '—'}"}):
+                return acted                                    # the ask card carries the open read
         self._pullback_card(agent, job, v, p, st, note, acted, stale)
         return acted
+
+    def _guardian_close(self, agent, job, p, st, reason: str, key_name: str, journal_reason: str) -> bool:
+        """The ONLY close path for a verdict: the guardian's own _close (MT5 → confirm → journal → card). True when closed."""
+        title = {"claude_close": "CLAUDE CLOSED", "claude_cut_loss": "CLAUDE CUT LOSS"}.get(journal_reason, "CLAUDE CLOSED")
+        agent._close(p, reason, title, agent.key(key_name, f"{p['ticket']}-{bar_key(job['bar_t'], agent.off)}"), st, journal_reason, agent.last_bar)
+        return p["ticket"] in getattr(agent, "closed_by_aureon", set())
 
     # ------------------------------------------------------------------ daily review
     def review_events(self, day: str) -> list[dict]:
@@ -625,6 +836,7 @@ class ClaudeAdvisor:
                              bar=job.get("bar_t"), ticket=job.get("ticket"), open_profit=job.get("open_profit"),
                              trigger=job.get("trigger"), error=error or None, note=note or None,
                              evidence=(v or {}).get("evidence") or [], alert_id=job.get("alert_id"),
+                             image=bool(job.get("png")), p_win=(v or {}).get("p_win"),
                              snapshot_fields=_compact(job.get("snapshot") or {}))
         except Exception as e:
             telemetry.info(f"{self.SOURCE} journal failed: {e!r}")
@@ -686,10 +898,13 @@ class ClaudeAdvisor:
 
     def _pullback_card(self, agent, job, v, p, st, note, acted, stale):
         dec = v["decision"]
-        if acted and dec in ("TIGHTEN", "CLOSE"):
-            if dec == "CLOSE":
+        if acted and dec in ("TIGHTEN", "CLOSE", "EXIT"):
+            if dec in ("CLOSE", "EXIT"):
                 return                                   # the guardian's _close already posted CLAUDE CLOSED after MT5 confirmed
             title = f"{self.TAG} TIGHTENED"; colour = EVENT_COLOURS["secured"]
+        elif job.get("event") == "READ":
+            title = f"{self.TAG} READ · {str(job.get('trigger') or '').upper()}"
+            colour = EVENT_COLOURS["flip"] if dec != "HOLD" else EVENT_COLOURS["info"]
         else:
             title = f"{self.TAG} PULLBACK VERDICT"; colour = EVENT_COLOURS["flip"] if dec != "HOLD" else EVENT_COLOURS["info"]
         others = advisor_board.record(f"pb:{agent.symbol}:{job['ticket']}:{job['bar_t']}", self.SOURCE, v, stale)

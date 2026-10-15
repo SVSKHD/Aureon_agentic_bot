@@ -392,6 +392,25 @@ ADVISOR_INFO = {
 }
 
 
+def claude_read_text(sym: str, r: dict) -> str:
+    """v2.8.0 /claude-read reply text (pure, testable)."""
+    from . import advisor_board
+    snap = r.get("snapshot") or {}
+    p = r.get("position")
+    pos_line = (f"#{p['ticket']} {p['direction'].upper()} @ {float(p['price_open']):.2f} · {float(p['points']):+.1f} pts · "
+                f"SL {p.get('sl') or '—'}") if p else "no open position"
+    head = f"{sym} · bar {snap.get('bar_time_ist', '—')} IST · {pos_line}"
+    if r.get("budget_used"):
+        return f"{head}\n⛔ daily Claude budget used — no call made"
+    v = r.get("verdict")
+    if v is None:
+        return f"{head}\nClaude read unavailable · {r.get('error') or 'no verdict'} · nothing changed"
+    risks = ", ".join(v.get("risks") or []) or "—"
+    return (f"{head}\n{advisor_board.verdict_line('claude', v)}{' · ⌛ STALE' if r.get('stale') else ''}\n"
+            f"risks: {risks}\nSHOWN ONLY · {'chart read' if r.get('png') else 'text only'} · CLI {float(r.get('latency') or 0):.1f}s · "
+            "no orders or SL changes")
+
+
 def advisor_card(adv, cfg, agents: dict | None = None, source: str = "claude", login_line: str | None = None) -> dict:
     """v2.0.1 /claude, v2.3.0 /codex: header (mode, bin, version, login), models, budget, one ATTACHED/REVIEW/OFF line per agent."""
     agents = agents or {}
@@ -1722,6 +1741,7 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             "claude-rules": "Pending rule proposals — read-only",
             "claude-rules-approve": "Approve rule proposal — manual operator",
             "claude-report": "Alias of /advisor-report — historical, read-only",
+            "claude-read": "Read chart + position now (HOLD/EXIT or ENTER/SKIP) — consumes usage; shown only",
         },
         "Codex": {
             "codex": "Health, login and attachment — read-only; verdicts shown, never applied",
@@ -1869,6 +1889,19 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             n = claude.detach(ag, str(user))
             return Reply(content=f"⚪ {sym} · {ag.S.display_name} · DETACHED · {n} queued job(s) cancelled · guardian and signals unaffected")
         await run(inter, "claude-detach", work)
+
+    @tree.command(name="claude-read", description="Claude reads the chart + position now (HOLD/EXIT or ENTER/SKIP); shown only")
+    @app_commands.describe(symbol="XAUUSD or XAGUSD (default: primary)")
+    async def claude_read_cmd(inter: discord.Interaction, symbol: str = ""):
+        def work():
+            if claude is None:
+                return Reply(content="Claude add-on is off (`AUREON_CLAUDE=off`) — set advisory|manage and restart")
+            sym = (symbol or cfg.symbols[0]).upper(); ag = agents.get(sym)
+            if ag is None:
+                return Reply(content=f"{sym}: not running (configured: {', '.join(cfg.symbols)})")
+            r = claude.read_now(ag)
+            return Reply(content=claude_read_text(sym, r), file=r.get("png"), source="live")
+        await run(inter, "claude-read", work, timeout=claude_wait)
 
     @tree.command(name="claude-test", description="Verify Claude login by consuming one CLI test call")
     async def claude_test(inter: discord.Interaction):

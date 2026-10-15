@@ -73,7 +73,8 @@ class CodexAdvisor(ClaudeAdvisor):
         return {"ok": ok, "version": v if ok else "", "path": self._resolve_bin(),
                 "error": "" if ok else f"'{self.cfg.codex_bin}' not found or not runnable — install the Codex CLI or set AUREON_CODEX_BIN"}
 
-    def _invoke(self, prompt: str, model: str, event: str, *, free_text: bool = False):
+    def _invoke(self, prompt: str, model: str, event: str, *, free_text: bool = False, image=None):
+        # v2.8.0: Codex gets no chart — `image` is accepted and dropped
         timeout = max(float(self.cfg.codex_timeout), REVIEW_TIMEOUT_S) if free_text else float(self.cfg.codex_timeout)
         return self.caller(prompt, event=event, binary=self.cfg.codex_bin, workdir=self.cfg.codex_workdir, timeout=timeout,
                            model=model or None, free_text=free_text)
