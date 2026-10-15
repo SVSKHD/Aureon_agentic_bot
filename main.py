@@ -138,9 +138,19 @@ def greet(notify, cfg, S, why, news_line):
             {"name": "IST", "value": f"{datetime.now(IST):%H:%M}", "inline": True},
             {"name": "News", "value": news_line, "inline": False},
             {"name": "Rules", "value": S.describe(), "inline": False},
+            {"name": "Features", "value": features_field(cfg), "inline": False},
         ],
         footer=f"{S.display_name} · {datetime.now(IST):%H:%M} IST",
     )
+
+
+def features_field(cfg) -> str:
+    """v2.10.0: one line per feature group; `*` = set from Discord (differs from .env)."""
+    try:
+        from aureon_mt5 import features
+        return "\n".join(features.summary_compact(cfg, features.load_overrides(cfg.log_dir)))[:1024] + "\n(* = set from Discord)"
+    except Exception as e:
+        return f"unavailable: {e!r}"[:200]
 
 
 def supervise(agents: dict, factory, notify, mode: str) -> list[str]:
@@ -260,6 +270,7 @@ def main():
     ap.add_argument("--webhook"); ap.add_argument("--token"); ap.add_argument("--enable-silver", action="store_true")
     a = ap.parse_args()
     cfg = Config()
+    from aureon_mt5 import features as _features                     # v2.10.0: Discord overrides (logs/features.json) win over .env
     try:
         cfg.mode = resolve_mode(a.mode); S = get_strategy(cfg.mode)
     except UnknownMode as e:
@@ -271,6 +282,10 @@ def main():
     if a.token: cfg.bot_token = a.token
 
     notify = Notifier(cfg.webhook); journal = Journal(cfg.log_dir); telemetry.setup(cfg.log_dir)
+    feature_overrides = _features.load_overrides(cfg.log_dir)
+    if feature_overrides:
+        _features.apply(cfg, feature_overrides)
+        print("feature overrides (Discord): " + ", ".join(f"{k}={v}" for k, v in feature_overrides.items()))
     health_notify = Notifier(cfg.health_webhook) if cfg.health_webhook else notify
     def process_excepthook(typ, value, tb):
         import traceback
@@ -376,7 +391,9 @@ def main():
                         footer="Aureon MT5")
     start_agents()
     monitor = None
-    if cfg.bot_token: monitor = run_bot(cfg, agents, journal, notify, started, health_notify=health_notify, claude=claude, alerts=alerts, codex=codex)
+    bot_repair: dict | None = {}                                   # filled below; the bot reads it lazily
+    if cfg.bot_token: monitor = run_bot(cfg, agents, journal, notify, started, health_notify=health_notify, claude=claude, alerts=alerts, codex=codex,
+                                        repair=bot_repair)
     else: print("no DISCORD_TOKEN — slash commands off, alerts via webhook only")
 
     # v2.7.2: self-heal + dead-man's switch + logs/heartbeat.txt, on its own thread (never the Discord loop)
@@ -389,6 +406,16 @@ def main():
     guard.start()
     if cfg.deadman_url:
         print("dead-man's switch: pinging AUREON_DEADMAN_URL every 60 s while healthy")
+
+    # v2.10.0 repair agent: detect on the health tick; propose on the Claude worker; a human applies (/repair-apply)
+    from aureon_mt5 import repair as _repair
+    repairer = _repair.Repairer(cfg, journal, health_notify)
+    def _auto_propose(inc):
+        if claude is not None:
+            claude._enqueue({"type": "repair", "event": "repair", "symbol": "ALL", "n": inc["id"], "repairer": repairer})
+    guard.detector = _repair.Detector(cfg, journal, health_notify, agents, on_new=_auto_propose)
+    if bot_repair is not None:
+        bot_repair["repairer"] = repairer
 
     from aureon_mt5.watchdog import Watchdog
     wd = Watchdog(health_notify or notify, journal, cfg, agents)

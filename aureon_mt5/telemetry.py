@@ -8,6 +8,8 @@ import traceback
 
 _log = logging.getLogger("aureon")
 _last: dict[str, float] = {}
+from collections import deque as _deque
+RECENT: "_deque[dict]" = _deque(maxlen=200)   # v2.10.0: every failure (with traceback) for the repair Detector
 BACKOFF_S = 300   # the same failure key is posted at most every 5 minutes
 
 
@@ -29,6 +31,11 @@ def failure(notify, journal, *, title: str, key: str, mode: str = "", symbol: st
     rec = dict(mode=mode, symbol=symbol, ticket=ticket, action=action, requested=requested, current=current, bid=bid, ask=ask,
                retcode=retcode, comment=comment, last_error=last_error, exc=repr(exc) if exc else None)
     _log.error(f"{title} · {rec}\n{tb}")
+    try:
+        RECENT.append({"t": _time.time(), "title": title, "key": key, "action": action, "retcode": retcode,
+                       "exc_type": type(exc).__name__ if exc else None, "exc": repr(exc) if exc else None, "tb": tb})
+    except Exception:
+        pass
     if journal is not None:
         journal.log("error", title=title, **{k: v for k, v in rec.items() if v not in (None, "")})
     now = _time.time()

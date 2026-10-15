@@ -1,4 +1,4 @@
-# Aureon MT5 v2.8.0
+# Aureon MT5 v2.10.0
 
 You place the trade. Aureon detects (per selected EMA mode), fires a Discord gunshot, then manages what you placed:
 protect → secure +10 → ride in +5 steps → close on the fast-EMA turn → news safeguard. Reports and slash commands.
@@ -23,6 +23,40 @@ protected (SL never loosened) but receive no strategy rules; a `⚠️ MODE MISM
 Production: run it under the supervisor (auto-restart, hang kill, boot start) — **[docs/SERVICE.md](docs/SERVICE.md)**:
 
     powershell -ExecutionPolicy Bypass -File .\scripts\aureon_service.ps1 -Action install
+
+## v2.10.0 — live toggles, full /commands, gated self-repair, zero-lag context, regime gate
+Nothing here changes a trade by default; `tests/test_strategy_pins.py` pins the strategy and the guardian at defaults.
+
+**Feature toggles** (`aureon_mt5/features.py`). Every env-gated feature has one registry row (env name, type, range, group,
+hot, loud). `/features [group]` shows each value with its source (`discord` > `env` > `default`); `/feature-set name value
+[force]` (admin) changes it live — `logs/features.json`, applied in place on `Config`, so the guardian sees it on its next bar;
+non-hot features (`setup_stop`, `setup_max_dd`) are refused with a position open unless `force:true`; loud changes post
+`FEATURE CHANGED`. `/feature-reset`, `/feature-help`. The boot card and the daily plan show a `Features` line per group
+(`*` = set from Discord). `/commands` now documents every registered command (a test enforces it).
+
+**Repair agent** (`aureon_mt5/repair.py`) — detect → propose → a human applies. Incidents (unhandled exceptions, a command
+failing twice in 10 min, Claude verdicts failing to parse ≥ 3/day, unreadable journal lines, chart failures ≥ 3/day, stale frames
+with MT5 connected) get one card each (`INCIDENT #n`). `/repair n` (admin, or automatically with `AUREON_REPAIR_AGENT=propose`)
+drafts a fix in a `repair/<n>` git worktree from origin/master with `claude -p` (or `codex exec`), runs the tests, refuses any
+patch touching strategies / guardian functions / broker / journeys / leg_guardian / setup / .env / VERSIONING.md / VERSION, and
+posts `REPAIR #n` with the stat. `/repair-apply n` (admin) applies, tests, commits, pushes and restarts; any failure reverts.
+`/repairs`, `/repair-discard n`. Broker rejects, MT5 disconnects and losing trades are never incidents.
+
+**Zero-lag context** (`AUREON_ZL_CONTEXT=1`, `aureon_mt5/common/zl.py`): ZLEMA 50/80, HMA 55, TEMA 50, ADX 5/14 ± DI, ATR 14,
+KAMA 10, session VWAP — no lookahead. Claude's snapshot gets a `zl` block, the chart gets dotted ZL lines and an ADX(5) strip.
+`AUREON_FLIP_USE_ZL=1` adds "ZL cross against" as flip evidence. No signal rule reads them.
+**Backtest**: `python tools/replay_guardian.py --bars <file> [--trade MM-DDTHH:MM,long] [--signal MM-DDTHH:MM,short] --compare
+--set giveback_pct=50 --set flip_require_structure=1` — the live `_guard` bar by bar, stops honoured intrabar, no Claude, no
+Discord; per-combination trades, win rate, avg win/loss, total, max drawdown, close reasons → `logs/replay/<date>.json`.
+
+**Regime gate** (`aureon_mt5/regime.py`). Every entry must lead away from drawdown. There is no max-trades cap — if the market is
+clean all day, every valid setup is tradeable; if it whipsaws all day, there are no trades that day. The gate is a regime,
+computed on every closed bar, not a counter. Score = min(whipsaw half: EMA crosses in 2 h, flat gap, failed P's; energy half:
+ADX 14, DI spread, range compression) → `CLEAN | CHOPPY | DEAD` with hysteresis. `AUREON_REGIME_GATE=off` (journal only) ·
+`show` (REGIME line on entry cards) · `block` (CHOPPY/DEAD: the signal is carded "CHOP · not tradeable", no ask, no Claude entry
+read, `/take` refused; `NO-TRADE REGIME` / `NO-TRADE DAY` cards). Open positions are never touched by the regime. Backtest with
+`--set regime_gate=block`: `entries_blocked` → would-have-lost / would-have-won; the gate is acceptable when blocked losers ≥ 3 ×
+blocked winners. Thresholds are tuned through `tuning.propose`, citing the replay JSON.
 
 ## v2.8.0 — Claude sees the chart, the guardian sees the setup
 Everything that can change a trade is behind an env knob that defaults to OFF (v2.7.2 behaviour); see `.env.example`.

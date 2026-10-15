@@ -84,6 +84,12 @@ def plan_card(cfg, agents: dict, journal, now: datetime | None = None) -> dict:
         {"name": "Chop", "value": chop_line, "inline": False},
         {"name": "Governor", "value": gov_line, "inline": False},
     ]
+    try:                                                         # v2.10.0: what is switched on today
+        from . import features
+        fields.append({"name": "Features", "value": "\n".join(features.summary_compact(cfg, features.load_overrides(cfg.log_dir)))[:1024],
+                       "inline": False})
+    except Exception:
+        pass
     return {"title": f"🗓 DAILY PLAN · {date_str}", "lines": [], "fields": fields,
             "footer": f"v{VERSION} · {now:%H:%M} IST"}
 

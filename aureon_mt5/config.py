@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from dotenv import load_dotenv
 load_dotenv()   # load .env if present
 
-VERSION = "2.8.0"
+VERSION = "2.10.0"
 
 
 def _parse_lot_buttons(raw: str) -> list[float]:
@@ -126,6 +126,22 @@ class Config:
     claude_dd_read_step: float = float(os.environ.get("AUREON_DD_READ_STEP", "2"))
     claude_dd_reads_per_trade: int = int(os.environ.get("AUREON_DD_READS_PER_TRADE", "3"))
     claude_exit_losing: bool = os.environ.get("AUREON_CLAUDE_EXIT_LOSING", "0") == "1"
+    # v2.10.0 (aureon_mt5/features.py registers every toggle; /feature-set changes them live)
+    flip_use_zl: bool = os.environ.get("AUREON_FLIP_USE_ZL", "0") == "1"
+    zl_context: bool = os.environ.get("AUREON_ZL_CONTEXT", "0") == "1"
+    repair_agent: str = os.environ.get("AUREON_REPAIR_AGENT", "off").strip().lower()
+    repair_engine: str = os.environ.get("AUREON_REPAIR_ENGINE", "claude").strip().lower()
+    repair_model: str = os.environ.get("AUREON_REPAIR_MODEL", "opus")
+    repair_timeout: float = float(os.environ.get("AUREON_REPAIR_TIMEOUT", "900"))
+    regime_gate: str = os.environ.get("AUREON_REGIME_GATE", "off").strip().lower()
+    regime_choppy: float = float(os.environ.get("AUREON_REGIME_CHOPPY", "0.45"))
+    regime_dead: float = float(os.environ.get("AUREON_REGIME_DEAD", "0.25"))
+    regime_clean: float = float(os.environ.get("AUREON_REGIME_CLEAN", "0.55"))
+    regime_clean_bars: int = int(os.environ.get("AUREON_REGIME_CLEAN_BARS", "4"))
+    no_trade_day_frac: float = float(os.environ.get("AUREON_NO_TRADE_DAY_FRAC", "0.6"))
+    # regime score weights (sum need not be 1; the score is clipped to [0, 1])
+    regime_weights: dict = field(default_factory=lambda: {"crosses": 0.30, "flat_gap": 0.20, "adx": 0.20, "di": 0.10,
+                                                          "failed_p": 0.10, "compression": 0.10})
     # v1.11.0 weekly compare: optional Claude self-review of its wrong calls after the Saturday COMPARE card (counts toward the budget)
     compare_claude_review: bool = os.environ.get("AUREON_COMPARE_CLAUDE_REVIEW", "0") == "1"
     calib_min_n: int = int(os.environ.get("AUREON_CALIB_MIN_N", "30"))

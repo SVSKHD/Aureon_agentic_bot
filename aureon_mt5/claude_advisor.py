@@ -54,6 +54,9 @@ READ_RULES = ("OPERATOR READ (/claude-read): the operator asks what to do RIGHT 
               "news/session/governor/chop allow) or SKIP. SKIP is the default when in doubt; a flat day is not a mistake.")
 
 
+ZL_RULES = ("ZL block = lower-lag view of the same EMAs; use it to judge whether the P is early or late and whether a flip is "
+            "real (ADX rising with DI in the trade's favour = alive). It does not override the mode's rules.")
+REGIME_RULES = "REGIME block = the bot's own read of whipsaw; in CHOPPY/DEAD default to SKIP and say why."
 OPEN_RULES = ("OPEN READ: the operator just took this trade on the signal in the SNAPSHOT. Rate it: decision HOLD or EXIT, "
               "p_win 0–1, risks. HOLD is the default; EXIT only if the entry breaks a rule of this mode.")
 DD_RULES = ("DRAWDOWN READ: the trade is under water but the setup is still alive by the rules. Is this a pullback or a failure? "
@@ -146,6 +149,13 @@ def build_snapshot(agent, event: str, side: str, bar_t: int, df, *, position: di
         snap["spread_warning"] = " · ".join(agent._warnings(df)) or None
     except Exception:
         pass
+    if "zl50" in df:                                                   # v2.10.0 AUREON_ZL_CONTEXT
+        from .common.zl import zl_block
+        snap["zl"] = zl_block(df)
+    reg = getattr(agent, "regime", None)                               # v2.10.0 regime: computed always, shown to Claude only
+    if reg and getattr(agent.cfg, "regime_gate", "off") != "off":       # when the gate is show|block (defaults: prompt unchanged)
+        snap["regime"] = {"state": reg.get("state"), "score": reg.get("score"), "reasons": list(reg.get("reasons") or [])[:5],
+                          "since_bars": reg.get("since_bars"), "no_trade_day": bool(reg.get("no_trade_day"))}
     try:
         if kind:
             snap["track_record"] = agent._evidence_field(kind, side, bar_t)[0]["value"]
@@ -196,7 +206,7 @@ def _day_stats(agent) -> tuple[float, int]:
 SNAPSHOT_KEEP = ("gap", "dist_to_fast_ema_pts", "swing_against_last6_pts", "atr20", "avg_range", "crosses_today", "bars_since_cross",
                  "confirm_state", "session", "trend_state", "minutes_to_news", "day_pnl_pts", "trades_today", "retrace_pct",
                  "retrace_from_peak_pts", "bars_since_peak", "mae_so_far", "closed_through_slow_ema", "dist_to_sl", "peak", "open_profit",
-                 "setup", "setup_alive", "dist_to_cap", "trigger")
+                 "setup", "setup_alive", "dist_to_cap", "trigger", "zl", "regime")
 
 
 def _compact(snap: dict) -> dict:
@@ -297,6 +307,27 @@ class ClaudeAdvisor:
     @property
     def manage(self) -> bool:
         return self.mode == "manage"
+
+    # ------------------------------------------------------------------ v2.10.0 live mode change (/feature-set claude_mode)
+    def set_mode(self, mode: str) -> str:
+        """Switch off/review/advisory/manage at runtime (manage is derived from mode). Journals claude_mode_changed."""
+        new = normalise_mode(mode) if self.SOURCE == "claude" else self.mode
+        old = self.mode
+        if new == old:
+            return new
+        self.mode = new
+        if new != "off":
+            self.start()
+        try:
+            self.journal.log(f"{self.SOURCE}_mode_changed", old=old, new=new)
+        except Exception:
+            pass
+        return new
+
+    def rebind(self, agents) -> None:
+        """After a mode change: hooks on every agent this advisor now advises, none where it no longer does."""
+        for ag in (agents.values() if isinstance(agents, dict) else agents or ()):
+            setattr(ag, self.ATTR, self if self.advises(ag.S) else None)
 
     # ------------------------------------------------------------------ worker
     def start(self):
@@ -572,7 +603,8 @@ class ClaudeAdvisor:
         fast, slow = (names["fast"], names["slow"]) if isinstance(names, dict) else names
         head = (f"MODE: {snapshot.get('mode', '?')} — fast EMA = {fast}, slow EMA = {slow}. Apply the section for this mode; "
                 f"ema_fast/ema_slow in the snapshot are {fast}/{slow}.\n\n")
-        return head + self.rules.strip() + "\n\nSNAPSHOT:\n" + json.dumps(snapshot, default=str)
+        extra = "".join(f"\n\n{t}" for k, t in (("zl", ZL_RULES), ("regime", REGIME_RULES)) if snapshot.get(k))
+        return head + self.rules.strip() + extra + "\n\nSNAPSHOT:\n" + json.dumps(snapshot, default=str)
 
     def read_prompt(self, snapshot: dict, extra: str = "") -> str:
         """v2.8.0: the advisor prompt + READ_RULES (+ a trigger paragraph: OPEN_RULES / DD_RULES / flip-held)."""
@@ -645,6 +677,8 @@ class ClaudeAdvisor:
             self.daily_review(job.get("day"), force=job.get("force", False)); return
         if job["type"] == "read":
             self._process_read(job); return
+        if job["type"] == "repair":                             # v2.10.0: serialised with every other CLI call; daily budget
+            job["repairer"].propose(job["n"], lock=self._call_lock, budget=self.budget); return
         res = self._call(self.prompt_for(job["snapshot"]), job["model"], job["event"], image=job.get("png"))
         if res is None:
             self._journal(job, None, latency=0.0, acted=False, stale=False, error="budget used")
