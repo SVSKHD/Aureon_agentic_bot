@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from dotenv import load_dotenv
 load_dotenv()   # load .env if present
 
-VERSION = "2.10.1"
+VERSION = "2.11.0"
 
 
 def _parse_lot_buttons(raw: str) -> list[float]:
@@ -40,6 +40,13 @@ def _num(env: str, default: str, kind=float):
         PARSE_PROBLEMS.append({"name": env.lower().replace("aureon_", ""), "env": env, "value": raw,
                                "issue": f"not a {'number' if kind is float else 'whole number'}", "fallback": default})
         return kind(default)
+
+
+def _event_set(env: str, default: str) -> tuple:
+    """v2.11.0 comma list → upper-case tuple; off / none / - → ()."""
+    raw = os.environ.get(env, default)
+    return tuple(dict.fromkeys(x.strip().upper() for x in raw.replace(" ", ",").split(",")
+                               if x.strip() and x.strip().upper() not in ("OFF", "NONE", "-")))
 
 
 @dataclass
@@ -174,6 +181,24 @@ class Config:
     tuning_replay_days: int = _num("AUREON_TUNING_REPLAY_DAYS", "30", int)
     tuning_shadow_sessions: int = _num("AUREON_TUNING_SHADOW_SESSIONS", "3", int)
     tuning_auto_per_week: int = _num("AUREON_TUNING_AUTO_PER_WEEK", "1", int)
+    # v2.11.0 notifications: Discord mentions, the asks channel, the push layer, the action console (no trading change)
+    discord_user_id: str = os.environ.get("AUREON_DISCORD_USER_ID", "").strip()          # <@id> on trade-class cards only
+    discord_asks_webhook: str = os.environ.get("AUREON_DISCORD_ASKS_WEBHOOK", "").strip() # trade-class copies (phone: All messages)
+    discord_mention_events: tuple = field(default_factory=lambda: _event_set("AUREON_DISCORD_MENTION_EVENTS", "ASK,FILLED,CLOSED,STOP"))
+    push: tuple = field(default_factory=lambda: _event_set("AUREON_PUSH", "off"))          # () | NTFY,PUSHOVER,TELEGRAM
+    push_images: bool = os.environ.get("AUREON_PUSH_IMAGES", "0") == "1"
+    push_loss_alert_pts: float = _num("AUREON_PUSH_LOSS_ALERT_PTS", "5", float)
+    ntfy_url: str = os.environ.get("AUREON_NTFY_URL", "https://ntfy.sh").strip().rstrip("/")
+    ntfy_topic: str = os.environ.get("AUREON_NTFY_TOPIC", "").strip()
+    ntfy_token: str = os.environ.get("AUREON_NTFY_TOKEN", "").strip()
+    pushover_token: str = os.environ.get("AUREON_PUSHOVER_TOKEN", "").strip()
+    pushover_user: str = os.environ.get("AUREON_PUSHOVER_USER", "").strip()
+    telegram_token: str = os.environ.get("AUREON_TELEGRAM_TOKEN", "").strip()
+    telegram_chat: str = os.environ.get("AUREON_TELEGRAM_CHAT", "").strip()
+    console_bind: str = os.environ.get("AUREON_CONSOLE_BIND", "127.0.0.1:8787").strip()
+    console_token: str = os.environ.get("AUREON_CONSOLE_TOKEN", "").strip()
+    console_allow_public: bool = os.environ.get("AUREON_CONSOLE_ALLOW_PUBLIC", "0") == "1"
+    console_url: str = os.environ.get("AUREON_CONSOLE_URL", "").strip().rstrip("/")     # how the phone reaches it (Tailscale)
     # regime score weights (sum need not be 1; the score is clipped to [0, 1])
     regime_weights: dict = field(default_factory=lambda: {"crosses": 0.30, "flat_gap": 0.20, "adx": 0.20, "di": 0.10,
                                                           "failed_p": 0.10, "compression": 0.10})
@@ -251,6 +276,66 @@ def validate(cfg, environ=None, pre_stop: float = 6.0) -> list[dict]:
         out.append({"name": "regime_thresholds", "env": "AUREON_REGIME_DEAD/CHOPPY/CLEAN",
                     "value": f"{cfg.regime_dead:g}/{cfg.regime_choppy:g}/{cfg.regime_clean:g}",
                     "issue": "need DEAD < CHOPPY <= CLEAN", "fallback": "0.25/0.45/0.55", "group": "regime"})
+    out += _notify_problems(cfg, env)
+    return out
+
+
+LOOPBACK = ("127.0.0.1", "localhost", "::1")
+
+
+def console_host_port(bind: str) -> tuple[str, int]:
+    """'127.0.0.1:8787' → ('127.0.0.1', 8787); '[::1]:8787' too. ValueError on garbage."""
+    b = str(bind or "").strip()
+    host, _, port = b.rpartition(":")
+    host = host.strip("[]")
+    if not host or not port.isdigit() or not (0 < int(port) < 65536):
+        raise ValueError(f"not host:port: {bind!r}")
+    return host, int(port)
+
+
+def _notify_problems(cfg, env) -> list[dict]:
+    """v2.11.0: mentions, push backends, the console (bind / token)."""
+    out = []
+    uid = str(getattr(cfg, "discord_user_id", "") or "")
+    if uid and not uid.isdigit():
+        out.append({"name": "discord_user_id", "env": "AUREON_DISCORD_USER_ID", "value": uid, "issue": "not a user id (digits)",
+                    "fallback": "no mentions", "group": "notify"})
+    hook = str(getattr(cfg, "discord_asks_webhook", "") or "")
+    if hook and not hook.startswith("https://"):
+        out.append({"name": "discord_asks_webhook", "env": "AUREON_DISCORD_ASKS_WEBHOOK", "value": hook[:40],
+                    "issue": "not an https webhook URL", "fallback": "no asks channel", "group": "notify"})
+    push = tuple(b.upper() for b in (getattr(cfg, "push", ()) or ()))
+    need = {"NTFY": ("ntfy_topic",), "PUSHOVER": ("pushover_token", "pushover_user"), "TELEGRAM": ("telegram_token", "telegram_chat")}
+    for b in push:
+        miss = [a for a in need.get(b, ()) if not getattr(cfg, a, "")]
+        if miss:
+            out.append({"name": "push", "env": "AUREON_PUSH", "value": ",".join(push).lower(),
+                        "issue": f"{b.lower()} needs " + ", ".join("AUREON_" + a.upper() for a in miss), "fallback": f"{b.lower()} off",
+                        "group": "notify"})
+    tok = str(getattr(cfg, "console_token", "") or "")
+    if tok and len(tok) < 32:
+        out.append({"name": "console_token", "env": "AUREON_CONSOLE_TOKEN", "value": f"<{len(tok)} chars>",
+                    "issue": "shorter than 32 characters", "fallback": "console off", "group": "notify"})
+    bind = str(getattr(cfg, "console_bind", "") or "")
+    try:
+        host, port = console_host_port(bind)
+    except ValueError:
+        out.append({"name": "console_bind", "env": "AUREON_CONSOLE_BIND", "value": bind, "issue": "not host:port",
+                    "fallback": "127.0.0.1:8787", "group": "notify"})
+    else:
+        if host not in LOOPBACK:
+            if getattr(cfg, "console_allow_public", False):
+                out.append({"name": "console_public", "env": "AUREON_CONSOLE_ALLOW_PUBLIC", "value": "1",
+                            "issue": f"⚠️ CONSOLE LISTENS ON {host}:{port} — anyone who can reach it and has the token can TAKE / CLOSE",
+                            "fallback": "allowed (AUREON_CONSOLE_ALLOW_PUBLIC=1)", "group": "notify"})
+            else:
+                out.append({"name": "console_bind", "env": "AUREON_CONSOLE_BIND", "value": bind,
+                            "issue": "non-loopback bind refused without AUREON_CONSOLE_ALLOW_PUBLIC=1",
+                            "fallback": f"127.0.0.1:{port}", "group": "notify"})
+    if push and not (tok and len(tok) >= 32 and getattr(cfg, "console_url", "")):
+        out.append({"name": "push_actions", "env": "AUREON_CONSOLE_URL", "value": str(getattr(cfg, "console_url", "") or ""),
+                    "issue": "push without a console URL + token has no TAKE / SKIP / READ buttons",
+                    "fallback": "pushes without actions", "group": "notify"})
     return out
 
 
@@ -267,6 +352,19 @@ def apply_fallbacks(cfg, problems: list[dict]) -> list[str]:
     for p in problems:
         if p["name"] == "regime_thresholds":
             cfg.regime_dead, cfg.regime_choppy, cfg.regime_clean = 0.25, 0.45, 0.55; changed.append(p["name"]); continue
+        if p["name"] == "discord_user_id":
+            cfg.discord_user_id = ""; changed.append(p["name"]); continue
+        if p["name"] == "discord_asks_webhook":
+            cfg.discord_asks_webhook = ""; changed.append(p["name"]); continue
+        if p["name"] == "console_token":
+            cfg.console_token = ""; changed.append(p["name"]); continue
+        if p["name"] == "console_bind":
+            cfg.console_bind = p["fallback"]; changed.append(p["name"]); continue
+        if p["name"] == "push" and p["fallback"].endswith(" off"):
+            off = p["fallback"].split()[0].upper()
+            cfg.push = tuple(b for b in cfg.push if b.upper() != off); changed.append(f"push:{off.lower()}"); continue
+        if p["name"] in ("console_public", "push_actions"):
+            continue
         try:
             f = F.get(p["name"])
         except ValueError:

@@ -292,11 +292,17 @@ def main():
     boot_problems = validate_cfg(cfg)
     if boot_problems:
         fixed = apply_fallbacks(cfg, [p for p in boot_problems if p.get("group") in ("guardian", "regime", "claude", "server", "repair",
-                                                                                  "context", "plan")])
+                                                                                  "context", "plan", "notify")])
         journal.log("boot_check", problems=boot_problems, fallbacks=fixed)
         health_notify.card("AUREON · MT5 · BOOT CHECK", "\n".join(f"⚠️ `{p['env']}`={p['value'] or '∅'} — {p['issue']} → {p['fallback']}"
                                                                 for p in boot_problems)[:3900],
                            footer="Aureon MT5 · /env-check shows this any time")
+    # v2.11.0: mentions / asks channel / push from the first card on (after the BOOT CHECK fallbacks)
+    from aureon_mt5.push import Push
+    push = Push(cfg, journal)
+    notify.configure(cfg, push=push)
+    if health_notify is not notify:
+        health_notify.configure(cfg, push=push)
     def process_excepthook(typ, value, tb):
         import traceback
         trace = "\n".join("".join(traceback.format_exception(typ, value, tb)).splitlines()[-15:])
@@ -421,8 +427,26 @@ def main():
     start_agents()
     monitor = None
     bot_repair: dict | None = {}                                   # filled below; the bot reads it lazily
+    # v2.11.0 notifications: mentions + asks channel (notify), the push layer, the action console (one shared actions path)
+    from aureon_mt5.actions import Actions
+    actions = Actions(cfg, agents, journal, notify, claude=claude, alerts=alerts)
+    push.handler = actions.run
+    push.start()
+    if push.backends():
+        print("push: " + ", ".join(push.backends()))
+    console_srv = None
+    if cfg.console_token:
+        from aureon_mt5 import console as _console
+        console_srv = _console.ConsoleServer(cfg, _console.create_app(
+            cfg, actions, journal, tokens=push.tokens, chart_dir=os.path.join(cfg.log_dir, "charts"),
+            state_fn=lambda: _console.console_state(cfg, agents, actions, notify, started=started)))
+        why = console_srv.start()
+        print(f"console: {why or 'listening on ' + cfg.console_bind}")
+        journal.log("console_start", bind=cfg.console_bind, ok=not why, why=why or None)
+    import atexit
+    atexit.register(lambda: (console_srv.stop() if console_srv else None, push.stop()))
     if cfg.bot_token: monitor = run_bot(cfg, agents, journal, notify, started, health_notify=health_notify, claude=claude, alerts=alerts, codex=codex,
-                                        repair=bot_repair)
+                                        repair=bot_repair, actions=actions)
     else: print("no DISCORD_TOKEN — slash commands off, alerts via webhook only")
 
     # v2.7.2: self-heal + dead-man's switch + logs/heartbeat.txt, on its own thread (never the Discord loop)

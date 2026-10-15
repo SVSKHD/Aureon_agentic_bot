@@ -54,7 +54,7 @@ def clear_halt(log_dir: str) -> dict | None:
     return prev
 
 
-def close_all_positions(symbols: list[str], dry: bool = False, retries: int = 3) -> list[dict]:
+def close_all_positions(symbols: list[str], dry: bool = False, retries: int = 3, comment: str = "aureon-halt") -> list[dict]:
     """Close every open position on every symbol. Returns per-ticket results."""
     results = []
     for sym in symbols:
@@ -65,7 +65,7 @@ def close_all_positions(symbols: list[str], dry: bool = False, retries: int = 3)
         for p in pos:
             ok = False; last_r = None
             for attempt in range(retries):
-                r = broker.close(p["ticket"], sym, comment="aureon-halt")
+                r = broker.close(p["ticket"], sym, comment=comment)
                 last_r = r
                 if r.ok:
                     ok = True; break

@@ -1015,7 +1015,7 @@ class SymbolAgent(threading.Thread):
                              fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"],
                                                     points=pts, sl=p["sl"] or None, secured=st.get("secured"), peak=peak,
                                                     extra={"If closed now": f"**{pts:+.2f}** banked"}),
-                             color=EVENT_COLOURS["flip"], footer=cfooter(self.S.display_name, "advisor"))
+                             color=EVENT_COLOURS["flip"], footer=cfooter(self.S.display_name, "advisor"), event="POSITION_ASK")
         return [code for code, _ in reasons]
 
     def _snapshot(self, p, st, bar_t):
@@ -1288,7 +1288,8 @@ class SymbolAgent(threading.Thread):
             self.notify.send(key, ctitle(self.symbol, event_name or ("CLOSED " + ("WIN" if p["points"] > 0 else "LOSS")), p["direction"]), [reason],
                              fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"],
                                                     points=p["points"], secured=st.get("secured"), peak=st["peak"]),
-                             color=EVENT_COLOURS["closed_win" if p["points"] > 0 else "closed_loss"], footer=cfooter(self.S.display_name, journal_reason or ""))
+                             color=EVENT_COLOURS["closed_win" if p["points"] > 0 else "closed_loss"], footer=cfooter(self.S.display_name, journal_reason or ""),
+                             event="CLOSED" if p["points"] > 0 else "STOP", points=p["points"])
         else:
             telemetry.failure(self.notify, self.journal, title="AUREON GUARDIAN FAILURE", key=self.key("ERROR", f"close-{p['ticket']}-{r.retcode}"),
                               mode=self.S.name, symbol=self.symbol, ticket=p["ticket"], action=f"CLOSE ({reason})", bid=r.bid, ask=r.ask,
@@ -1628,7 +1629,8 @@ class SymbolAgent(threading.Thread):
                                     fields=[field("Ticket", f"#{t}"), field("Entry", f"{st.get('entry', 0):.2f}"), field("Peak", f"+{st.get('peak', 0):.2f}")],
                                     color=EVENT_COLOURS["info"], footer=cfooter(self.S.display_name, "reason"),
                                     meta={"reason_for": "close", "symbol": self.symbol, "ticket": t, "side": (st.get("direction") or "").upper(),
-                                          "bar": self.last_bar, "kind": "close", "mode": self.S.name, "price": st.get("entry")})
+                                          "bar": self.last_bar, "kind": "close", "mode": self.S.name, "price": st.get("entry")},
+                                    event="CLOSED" if last > 0 else "STOP", points=last)
                 self.closed_by_aureon.discard(t)
         self.health["managed"] = len(pos)
         sig = self.latest_signal

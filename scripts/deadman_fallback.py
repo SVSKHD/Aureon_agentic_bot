@@ -31,10 +31,14 @@ def load_env(path: str) -> None:
         pass
 
 
-def telegram_send(token: str, chat: str, text: str, timeout: float = 15.0) -> bool:
+def telegram_send(token: str, chat: str, text: str, timeout: float = 15.0, reply_markup: dict | None = None) -> bool:
+    """sendMessage. v2.11.0: optional inline keyboard (reply_markup) — reused by aureon_mt5/push.py."""
     import urllib.parse
     import urllib.request
-    data = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
+    fields = {"chat_id": chat, "text": text}
+    if reply_markup:
+        fields["reply_markup"] = json.dumps(reply_markup)
+    data = urllib.parse.urlencode(fields).encode()
     try:
         with urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", data=data, timeout=timeout) as r:
             return 200 <= r.status < 300

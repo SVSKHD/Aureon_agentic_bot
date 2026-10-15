@@ -2,6 +2,41 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.11.0 — 2026-10-15  (MINOR: notifications + console contract; no trading change)
+- **Part A — immediate Discord mentions** (`aureon_mt5/notify.py`): `EVENT_CLASS` by event prefix (trade / ops, default
+  info); every `send` / `ask` / `card` resolves an event (`event=` kwarg, else the key's event segment, else an ops title) and a
+  class (`klass=` overrides). Trade events in `AUREON_DISCORD_MENTION_EVENTS` (default `ASK,FILLED,CLOSED,STOP`, registry
+  enum-set, hot) carry `<@AUREON_DISCORD_USER_ID>` in `content` with `allowed_mentions: {"users": [id]}` (webhook and bot-posted
+  asks). `AUREON_DISCORD_ASKS_WEBHOOK`: trade-class copies posted with `?wait=true`; `edit_card` / button decisions PATCH every
+  tracked copy (`Notifier.mirror_edit`). Events tagged at the source: ORDER PLACED → FILLED; guardian closes and broker-side
+  closes → CLOSED / STOP with points; SHOULD WE CLOSE? → POSITION_ASK. With the new variables unset the payloads are
+  byte-identical to v2.10.1 (tested).
+- **Part B — push layer** (`aureon_mt5/push.py`): `Push.send(PushEvent)`; backends `AUREON_PUSH=off|ntfy|pushover|telegram`
+  on a 3-worker pool, 10 s timeout, failures journaled (`push_failed`), never raised; one push per dedupe key, also when the
+  Discord post failed. Mapping: ASK → urgent + TAKE/SKIP/READ · FILLED → high · CLOSED/STOP → normal (STOP worse than
+  `AUREON_PUSH_LOSS_ALERT_PTS` → urgent) · FLIP_HOLD → high + READ · POSITION_ASK → high + CLOSE/READ · MAINTENANCE /
+  COLD START / MT5 NOT UP / REPAIR AUTO-APPLY → high · Claude READ verdict → high. ntfy JSON publish (PUT upload with
+  `AUREON_PUSH_IMAGES=1`, RFC 2047 headers), Pushover (urgent = priority 2, retry 30, expire 600), Telegram (`telegram_send`
+  from `scripts/deadman_fallback.py` gains `reply_markup`; inline keyboard; `getUpdates` long-poll 25 s → console actions,
+  configured chat only).
+- **Scoped action tokens**: push buttons carry `act.<payload>.<sig>` (HMAC-SHA256 keyed by the console token), valid only for
+  that action, symbol and ask key, until the ask expires, once. The console token is never sent to ntfy / Pushover / Telegram.
+- **Console** (`aureon_mt5/console.py`, `docs/CONSOLE.md`, contract v1): FastAPI on its own uvicorn thread, started with the
+  bot; `AUREON_CONSOLE_BIND=127.0.0.1:8787`, non-loopback refused without `AUREON_CONSOLE_ALLOW_PUBLIC=1` (flagged loudly);
+  Bearer `AUREON_CONSOLE_TOKEN` (32+ chars, constant-time compare) or a scoped token; 20 req/min per client; every call
+  journaled `console_call` with `source="push"`. `POST /console/action` (take / skip / close / read), `GET /console/state`
+  (`{"v": 1, …}`), `GET /console/chart/<key>.png` (only `logs/charts/`). Never imports `broker`.
+- **Shared actions** (`aureon_mt5/actions.py`): `/take`, `/skip`, the new **`/close`**, the console and Telegram use one path;
+  console refusals: no open ask, already answered, stale (> `AUREON_ASK_TTL_MIN`), regime gate (with reasons), alert without a
+  side, plus everything `execute_entry` refuses. `halt.close_all_positions` gains `comment=`.
+- Config: `AUREON_DISCORD_USER_ID`, `AUREON_DISCORD_ASKS_WEBHOOK`, `AUREON_DISCORD_MENTION_EVENTS`, `AUREON_PUSH`,
+  `AUREON_PUSH_IMAGES`, `AUREON_PUSH_LOSS_ALERT_PTS`, `AUREON_NTFY_URL/TOPIC/TOKEN`, `AUREON_PUSHOVER_TOKEN/USER`,
+  `AUREON_TELEGRAM_TOKEN/CHAT`, `AUREON_CONSOLE_BIND/TOKEN/ALLOW_PUBLIC/URL`; `validate()` rules for all of them (BOOT CHECK
+  applies the `notify` group's fallbacks). Registry group `notify`: `mention_events`, `push` (loud when switched on),
+  `push_images`. `requirements.txt`: fastapi, uvicorn (imported only when the console is on).
+- Tests: `test_v2110_notify.py`, `test_v2110_push.py`, `test_v2110_console.py`.
+- Strategy rules changed: NO
+
 ## v2.10.1 — 2026-10-15  (operations: unattended operation + server ownership; defaults unchanged for trades)
 Parts E and F of the v2.10.0 brief (v2.10.0 shipped A–D). New tooling and commands, so MINOR-sized; numbered 2.10.1 to keep
 the v2.11.0 number for the notifications release.

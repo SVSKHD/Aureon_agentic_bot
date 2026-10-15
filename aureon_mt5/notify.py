@@ -12,11 +12,20 @@ Card model
       - png    : attached and shown as the embed image
     card(...) : same, non-deduped (startup notes, info)
     Helpers build consistent cards for the guardian: signal_fields(), position_fields().
+
+v2.11.0 — notifications that arrive when the trade does
+    Every card has an EVENT (explicit `event=`, else the key's event segment, else an ops title) and a CLASS
+    (EVENT_CLASS by prefix, default "info"; `klass=` overrides). Trade-class events listed in AUREON_DISCORD_MENTION_EVENTS
+    carry `<@AUREON_DISCORD_USER_ID>` in `content` with allowed_mentions limited to that user; trade-class cards are also
+    posted to AUREON_DISCORD_ASKS_WEBHOOK and edit_card() updates that copy too. The push layer (push.py) gets one push per
+    dedupe key. With none of the v2.11 variables set the webhook payloads are byte-identical to v2.10.1.
 """
 from __future__ import annotations
 
 import json
 import os
+import threading
+import time as _time
 from datetime import datetime, timedelta, timezone
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -36,6 +45,44 @@ EVENT_COLOURS = {
     "closed_win": GREEN, "closed_loss": ORANGE, "flip": YELLOW, "news": YELLOW, "error": RED,
     "market": GREY, "info": BLURPLE,
 }
+
+# v2.11.0 event class by event PREFIX (CLOSED_BY_YOU → trade via CLOSED); anything else is "info"
+EVENT_CLASS = {
+    "ASK": "trade", "ALERT": "trade", "FILLED": "trade", "CLOSED": "trade", "STOP": "trade", "FLIP_HOLD": "trade",
+    "POSITION_ASK": "trade",
+    "MAINTENANCE": "ops", "COLD_START": "ops", "MT5_NOT_UP": "ops", "MT5_RESTARTED": "ops", "REPAIR_AUTO": "ops",
+    "CLOCK_DRIFT": "ops", "NETWORK_BACK": "ops",
+}
+EVENT_ALIASES = {"ORDER": "FILLED"}
+TITLE_EVENTS = (("COLD START", "COLD_START"), ("MT5 NOT UP", "MT5_NOT_UP"), ("MT5 RESTARTED", "MT5_RESTARTED"),
+                ("REPAIR AUTO-APPLY", "REPAIR_AUTO"), ("MAINTENANCE", "MAINTENANCE"), ("NETWORK BACK", "NETWORK_BACK"),
+                ("CLOCK DRIFT", "CLOCK_DRIFT"))
+
+
+def event_class(event: str | None) -> str:
+    ev = str(event or "").upper()
+    for prefix in sorted(EVENT_CLASS, key=len, reverse=True):
+        if ev.startswith(prefix):
+            return EVENT_CLASS[prefix]
+    return "info"
+
+
+def parse_key(key: str | None) -> tuple[str, str]:
+    """dedupe key → (symbol, EVENT). 'mode:SYM:EVENT:ident' and 'alert:SYM:aid:ORDER'. ('', '') when it has no event."""
+    parts = str(key or "").split(":")
+    if parts[0] == "alert" and len(parts) >= 4:
+        sym, ev = parts[1], parts[3]
+    elif len(parts) >= 3:
+        sym, ev = parts[1], parts[2]
+    else:
+        return "", ""
+    ev = ev.upper()
+    return sym, EVENT_ALIASES.get(ev, ev)
+
+
+def title_event(title: str | None) -> str:
+    t = str(title or "").upper()
+    return next((ev for frag, ev in TITLE_EVENTS if frag in t), "")
 
 
 def _colour_for(title: str) -> int:
@@ -114,13 +161,130 @@ class Notifier:
         self.backlog: list[str] = []                    # v2.10.1: titles that failed to post; one summary on reconnect
         self.claude_edit_hook = None                    # v1.10.0: set by bot.py — adds the Claude field to a posted ask card
         self.card_edit_hook = None                      # v2.0.2: set by bot.py — upserts named fields on a posted ask card (alerts)
+        self.cfg = None                                 # v2.11.0: configure() — mentions / asks channel read it live (hot)
+        self.push = None                                # v2.11.0: push.Push — one push per dedupe key
+        self.open_asks: dict[str, dict] = {}                 # v2.11.0: open trade questions by key (bot, webhook, console share them)
+        self.copies: dict[str, list] = {}               # v2.11.0: key → [[webhook, message_id, embed]] webhook copies to edit
+        self._tl = threading.local()
+
+    def configure(self, cfg, push=None) -> "Notifier":
+        """v2.11.0: give the notifier the config (mention user, mention events, asks webhook) and the push layer."""
+        self.cfg = cfg
+        self.push = push
+        return self
+
+    # ------------------------------------------------------------------ v2.11.0 event context
+    def classify(self, key: str | None, title: str, event: str | None = None, klass: str | None = None) -> tuple[str, str, str]:
+        sym, kev = parse_key(key)
+        ev = str(event or "").upper() or (kev if event_class(kev) != "info" else "") or title_event(title) or kev
+        return sym, ev, (klass or event_class(ev))
+
+    def mention_for(self, event: str, klass: str) -> str | None:
+        cfg = self.cfg
+        uid = str(getattr(cfg, "discord_user_id", "") or "")
+        if klass != "trade" or not uid.isdigit():
+            return None
+        return uid if event in tuple(getattr(cfg, "discord_mention_events", ()) or ()) else None
+
+    def asks_webhook(self) -> str:
+        return str(getattr(self.cfg, "discord_asks_webhook", "") or "")
+
+    def _set_ctx(self, ctx):
+        tl = self.__dict__.get("_tl")
+        if tl is None:
+            tl = self.__dict__["_tl"] = threading.local()
+        tl.ctx = ctx
+
+    def _take_ctx(self):
+        tl = self.__dict__.get("_tl")
+        ctx = getattr(tl, "ctx", None) if tl is not None else None
+        if tl is not None:
+            tl.ctx = None
+        return ctx
+
+    @staticmethod
+    def _with_mention(payload: dict, mention: str | None) -> dict:
+        if mention:
+            payload = dict(payload)
+            payload["content"] = f"<@{mention}>" + (" " + payload["content"] if payload.get("content") else "")
+            payload["allowed_mentions"] = {"users": [mention]}
+        return payload
+
+    def _remember_copy(self, key, url, r, embed):
+        try:
+            mid = (r.json() or {}).get("id")
+        except Exception:
+            mid = None
+        if key and mid and embed:
+            self.copies.setdefault(key, []).append([url, str(mid), json.loads(json.dumps(embed))])
+            while len(self.copies) > 200:
+                self.copies.pop(next(iter(self.copies)))
+
+    def _post_asks_copy(self, key, body, png, embed, mention):
+        """Trade-class copy to the asks channel (?wait=true so edit_card can PATCH it). Never raises."""
+        url = self.asks_webhook()
+        if not url:
+            return False
+        try:
+            import requests  # type: ignore
+            payload = self._with_mention({"embeds": [embed]} if embed else {"content": body[:1900]}, mention)
+            if png and os.path.exists(png):
+                with open(png, "rb") as f:
+                    r = requests.post(url + "?wait=true", data={"payload_json": json.dumps(payload)},
+                                      files={"file": (os.path.basename(png), f, "image/png")}, timeout=15)
+            else:
+                r = requests.post(url + "?wait=true", json=payload, timeout=15)
+            ok = 200 <= r.status_code < 300
+            if ok:
+                self._remember_copy(key, url, r, embed)
+            else:
+                print(f"  (asks channel post failed: HTTP {r.status_code})")
+            return ok
+        except Exception as e:
+            print("  (asks channel post failed:", e, ")")
+            return False
+
+    def mirror_edit(self, key: str, updates: dict) -> bool:
+        """v2.11.0: upsert named fields on every tracked webhook copy of `key` (asks channel, and the main webhook card in
+        webhook mode). True when at least one copy was patched. Never raises."""
+        copies = self.copies.get(key) or []
+        done = False
+        for c in copies:
+            url, mid, embed = c
+            fields = list(embed.get("fields") or [])
+            for name, value in updates.items():
+                for f in fields:
+                    if f.get("name") == name:
+                        f["value"] = str(value)[:1024]; break
+                else:
+                    fields.append({"name": str(name)[:256], "value": str(value)[:1024], "inline": False})
+            embed["fields"] = fields[:25]
+            try:
+                import requests  # type: ignore
+                r = requests.patch(f"{url}/messages/{mid}", json={"embeds": [embed]}, timeout=10)
+                done = done or (200 <= r.status_code < 300)
+            except Exception as e:
+                print("  (copy edit failed:", e, ")")
+        return done
+
+    def _push_after(self, key, title, lines, fields, png, sym, ev, klass, points=None, meta=None):
+        """One push per delivered dedupe key (push.Push dedupes too). Never raises."""
+        p = self.push
+        if p is None:
+            return
+        try:
+            p.notify(key=key, title=title, lines=list(lines or []), fields=fields, png=png, symbol=sym, event=ev, klass=klass,
+                     points=points, meta=meta or {})
+        except Exception as e:
+            print("  (push failed:", e, ")")
 
     def edit_card(self, key: str, updates: dict) -> bool:
         """Replace / add fields by name on the card posted under `key` (bot only). False when there is no such card
         (webhook mode, expired) — the caller then posts a follow-up card instead. Never raises."""
         hook = self.card_edit_hook
+        mirrored = self.mirror_edit(key, dict(updates)) if self.copies.get(key) else False    # v2.11.0 asks-channel copy
         if hook is None:
-            return False
+            return bool(mirrored) and any(c[0] == self.webhook for c in self.copies.get(key) or [])
         try:
             return bool(hook(key, dict(updates)))
         except Exception as e:
@@ -156,11 +320,16 @@ class Notifier:
 
     # ------------------------------------------------------------------ deduped card
     def send(self, key: str, title: str, lines: list[str] | None = None, png: str | None = None, *,
-             fields: list[dict] | None = None, color: int | None = None, footer: str | None = None) -> bool:
-        """One deduped card. Returns True when delivered (or printed in console mode). Never raises."""
+             fields: list[dict] | None = None, color: int | None = None, footer: str | None = None,
+             event: str | None = None, klass: str | None = None, points: float | None = None, meta: dict | None = None) -> bool:
+        """One deduped card. Returns True when delivered (or printed in console mode). Never raises.
+        v2.11.0: event / klass (see EVENT_CLASS) drive the mention, the asks channel and the push; points → STOP loss alert."""
         try:
             if key in self.sent:
                 return False
+            sym, ev, k = self.classify(key, title, event, klass)
+            mention = self.mention_for(ev, k)
+            fan = k == "trade" and bool(self.asks_webhook())
             lines = [str(x) for x in (lines or []) if str(x).strip()]
             description = "\n".join(lines)
             body = f"**{title}**" + (f"\n{description}" if description else "")
@@ -171,15 +340,23 @@ class Notifier:
             if self.attempts.get(key, 0) == 0:
                 print(f"\n[{stamp}] " + self._console(title, lines, fields), flush=True)
                 self.recent = (self.recent + [f"{stamp} {title}"])[-50:]
+            self._set_ctx({"mention": mention, "track": fan, "key": key} if (mention or fan) else None)
             try:
                 ok = self.raw(body, png, embed=embed)
             except TypeError:                       # subclasses with the old raw(body, png) signature
                 ok = self.raw(body, png)
+            finally:
+                self._set_ctx(None)
             if ok:
                 self.sent.add(key); self.attempts.pop(key, None)
                 if len(self.sent) > 20000:
                     self.sent = set(list(self.sent)[-5000:])
+                if fan:
+                    self._post_asks_copy(key, body, png, embed, mention)
+                self._push_after(key, title, lines, fields, png, sym, ev, k, points=points, meta=meta)
                 return True
+            if self.attempts.get(key, 0) == 0:          # Discord down: the phone still hears it (push dedupes per key)
+                self._push_after(key, title, lines, fields, png, sym, ev, k, points=points, meta=meta)
             self.attempts[key] = self.attempts.get(key, 0) + 1
             if self.attempts[key] >= MAX_ATTEMPTS:
                 print(f"  (giving up on Discord delivery of {key} after {MAX_ATTEMPTS} attempts)")
@@ -190,48 +367,77 @@ class Notifier:
             return False
 
     # ------------------------------------------------------------------ ask to trade (buttons when the bot is up)
-    def ask(self, key: str, title: str, lines: list[str], *, fields=None, color=None, footer=None, png=None, meta: dict | None = None) -> bool:
+    def ask(self, key: str, title: str, lines: list[str], *, fields=None, color=None, footer=None, png=None, meta: dict | None = None,
+            event: str | None = None, klass: str | None = None, points: float | None = None) -> bool:
         """A trade question. With the bot running: card + [TAKE] [SKIP] buttons in the channel. Otherwise: the same card
-        via webhook, with 'reply /take or /skip' instructions. Deduped like send(). Never places orders."""
+        via webhook, with 'reply /take or /skip' instructions. Deduped like send(). Never places orders.
+        v2.11.0: event defaults to ASK; the open question is kept in self.open_asks for /take, /skip and the console."""
         if key in self.sent:
             return False
+        ev = str(event or "ASK").upper()
+        if ev == "ASK":
+            self.open_asks[key] = item = {"key": key, "title": title, "description": "\n".join(lines), "fields": fields or [],
+                                     "color": color, "footer": footer, "png": png, "meta": meta or {}, "t": _time.time()}
+            while len(self.open_asks) > 50:
+                self.open_asks.pop(next(iter(self.open_asks)))
+        else:
+            item = {"key": key, "title": title, "description": "\n".join(lines), "fields": fields or [], "color": color,
+                    "footer": footer, "png": png, "meta": meta or {}, "t": _time.time()}
         if self.bot_ready:
+            sym, ev, k = self.classify(key, title, ev, klass)
+            mention = self.mention_for(ev, k)
+            if mention:
+                item["mention"] = mention
             self.sent.add(key)
-            self.ask_queue.put({"key": key, "title": title, "description": "\n".join(lines), "fields": fields or [], "color": color,
-                                "footer": footer, "png": png, "meta": meta or {}})
+            self.ask_queue.put(item)
             print(f"\n[ask] {title}", flush=True)
+            if k == "trade" and self.asks_webhook():
+                self._post_asks_copy(key, f"**{title}**\n" + "\n".join(lines), png,
+                                     self.make_embed(title, "\n".join(lines), fields=fields, color=color, footer=footer, png=png), mention)
+            self._push_after(key, title, lines, fields, png, sym, ev, k, points=points, meta=meta)
             return True
         return self.send(key, title, lines + ["answer with `/take` or `/skip` (buttons need the bot token + DISCORD_CHANNEL)"],
-                         png, fields=fields, color=color, footer=footer)
+                         png, fields=fields, color=color, footer=footer, event=ev, klass=klass, points=points, meta=meta)
 
     # ------------------------------------------------------------------ non-deduped card
     def card(self, title: str, description: str = "", *, fields: list[dict] | None = None, color: int | None = None,
-             footer: str | None = None, png: str | None = None) -> bool:
+             footer: str | None = None, png: str | None = None, event: str | None = None, klass: str | None = None) -> bool:
         embed = self.make_embed(title, description, fields=fields, color=color, footer=footer, png=png)
         console = self._console(title, [description] if description else [], fields)
         try:
-            return self.raw(console, png, embed=embed)
+            ok = self.raw(console, png, embed=embed)
         except TypeError:
-            return self.raw(console, png)
+            ok = self.raw(console, png)
         except Exception as e:
             print("  (notify card failed:", e, ")")
             return False
+        if ok and self.push is not None:                                      # v2.11.0: ops cards (COLD START, MT5 NOT UP…)
+            sym, ev, k = self.classify(None, title, event, klass)
+            if ev:
+                self._push_after(f"card:{ev}:{title}:{int(_time.time() // 60)}", title, [description] if description else [],
+                                 fields, png, sym, ev, k)
+        return ok
 
     # ------------------------------------------------------------------ transport
     def raw(self, body: str, png: str | None = None, *, embed: dict | None = None) -> bool:
         """Post an embed (or plain content) to the webhook. True on success. No webhook = console = delivered."""
+        ctx = self._take_ctx() or {}                     # v2.11.0: mention / copy tracking for this one post
         if not self.webhook:
             return True
         try:
             import requests  # type: ignore
             payload: dict = {"embeds": [embed]} if embed else {"content": body[:1900]}
+            payload = self._with_mention(payload, ctx.get("mention"))
+            url = self.webhook + ("?wait=true" if ctx.get("track") else "")
             if png and os.path.exists(png):
                 with open(png, "rb") as f:
-                    r = requests.post(self.webhook, data={"payload_json": json.dumps(payload)},
+                    r = requests.post(url, data={"payload_json": json.dumps(payload)},
                                       files={"file": (os.path.basename(png), f, "image/png")}, timeout=15)
             else:
-                r = requests.post(self.webhook, json=payload, timeout=15)
+                r = requests.post(url, json=payload, timeout=15)
             ok = 200 <= r.status_code < 300
+            if ok and ctx.get("track"):
+                self._remember_copy(ctx.get("key"), self.webhook, r, embed)
             self.posts += int(ok); self.failures += int(not ok)
             if not ok:
                 print(f"  (discord post failed: HTTP {r.status_code} {r.text[:120]})")
