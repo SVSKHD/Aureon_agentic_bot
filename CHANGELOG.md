@@ -2,6 +2,48 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.10.0 — 2026-10-15  (MINOR: operations + context; defaults unchanged)
+Built on v2.8.0 — there is no v2.9.0: the "v2.9.0" pieces this release builds on (structure-gated flip, giveback,
+`_flip_evidence`, `request_flip_read`, the 15-Oct fixture) shipped in v2.8.0.
+- **Feature registry** `aureon_mt5/features.py`: one row per env-gated feature (claude_mode, image_events, open_read, dd_read_at,
+  exit_losing, max_calls, flip_require_structure, flip_use_zl, giveback_pct/arm, setup_stop, setup_max_dd, daily_plan,
+  repair_agent, zl_context, regime_gate + 5 thresholds). Resolution discord (`logs/features.json`) > env > default; `apply()`
+  writes onto `Config` in place (no caller changes). `ClaudeAdvisor.set_mode()` (+ `rebind`) for live claude_mode, journal
+  `claude_mode_changed`; max_calls updates the budget. `/features`, `/feature-set` (admin; non-hot refused with a position open
+  unless force; journal `feature_set`; FEATURE CHANGED card for loud changes), `/feature-reset`, `/feature-help`.
+  Boot card + daily plan card: `Features` field, one line per group, `*` = from Discord.
+- **/commands**: `bot.HELP` (module level) documents all 66 registered commands; `tests/test_v2100_commands.py` fails on any
+  undocumented root command.
+- **Repair agent** `aureon_mt5/repair.py`: `Detector` on the HealthGuard tick (no new thread; `telemetry.RECENT`,
+  `context_chart.FAILURES`), one open incident per fingerprint (`logs/incidents.json`, `INCIDENT #n` card). `Repairer.propose`
+  (Claude worker, `_call_lock`, daily budget, usage kind `repair`): worktree `repair/<n>` from origin/master, REPAIR_BRIEF.md,
+  fixer (`claude -p` with Read/Edit/Write/pytest or `codex exec`), pytest, forbidden-path + guardian-function (AST) + VERSION
+  check, patch file, worktree reset, `REPAIR #n` card. `apply`: `git apply --check --index` → apply → pytest → commit → push →
+  `ops.restart_process(reason "repair #n")`; any failure reverts. Commands `/repairs`, `/repair`, `/repair-apply`,
+  `/repair-discard` (admin). `AUREON_REPAIR_AGENT=off|propose`, `_ENGINE`, `_MODEL`, `_TIMEOUT`.
+- **Pins** `tests/test_strategy_pins.py` on `tests/fixtures/xauusd_2day_m5.json` (synthetic 15-Oct + one synthetic day): P
+  signals, analysis entries/exit reasons, live-guardian stops/close reasons at defaults, the 15-Oct trade. VERSIONING.md: pins
+  rule + repair-agent boundary.
+- **Zero-lag context** `aureon_mt5/common/zl.py` (`AUREON_ZL_CONTEXT=0`): ZLEMA 50/80, HMA 55, TEMA 50, ADX 5/14 ± DI, ATR 14,
+  KAMA 10, session VWAP — no lookahead (tested). Snapshot `zl` block + ZL_RULES paragraph; chart: dotted ZL lines + ADX(5) strip;
+  `AUREON_FLIP_USE_ZL=0` → optional "ZL cross against" flip evidence (adds only).
+- **Backtest** `tools/replay_guardian.py` + `tools/guardian_sim.py`: live `_guard` bar by bar, fills at close, stops intrabar;
+  `--trade`, `--signal` (a P seen live that the analysis misses), `--set`, `--compare`; summary → `logs/replay/<date>.json`.
+- **Regime gate** `aureon_mt5/regime.py` (`AUREON_REGIME_GATE=off`): features crosses_2h, flat_gap_bars, adx14 (+rising),
+  di_spread, failed_p_2h, range_compression, zl_crosses_2h; score = min(whipsaw half, energy half) (weights in
+  `Config.regime_weights`); CLEAN/CHOPPY/DEAD with hysteresis; `no_trade_day`. Computed + journaled (`regime_change`) every bar
+  at any setting; `show` adds a Regime field to P/cross/RE/ENTER cards; `block` cards the signal "CHOP · not tradeable" (no ask,
+  no tracked ask, no Claude entry read), refuses TAKE (`take_refused_regime`), posts NO-TRADE REGIME / NO-TRADE DAY. Open
+  positions untouched (the v2.8.0 flip/giveback tests re-run with block + DEAD). Regime block in the Claude snapshot only when
+  the gate is not `off` (defaults keep Claude's prompt unchanged). Backtest: entries_blocked → would_have_lost / would_have_won,
+  no_trade_days, sign-off rule.
+- Registry notes: `max_calls` is an int; `flip_use_zl` added to the registry; `daily_plan` keeps its existing default **on**
+  (the daily plan card has existed since v2.3.15 — `.env.example` keeps `AUREON_DAILY_PLAN=1`, not 0).
+- Replay (synthetic bars, see v2.8.0): `--trade 10-15T01:30,long,4103.5 --signal 10-15T02:05,short --compare
+  --set giveback_pct=50 --set flip_require_structure=1` → defaults total +8.30 (01:30 long −1.2 p_flip) vs +19.50 (held, +10.0);
+  `--set regime_gate=block` on the same window → entries_blocked 0 (every entry CLEAN: the synthetic days trend).
+- Strategy rules changed: NO — pins test added
+
 ## v2.8.0 — 2026-10-15  (MINOR: Claude chart/reads + guardian rules behind env; defaults unchanged)
 Why: 2026-10-15 02:05 server — five XAUUSD longs from 4103.5 were closed at 4102.3 (−1.2) by rule 1 in `_guard` ("opposite P →
 close (flip)") on a short P that never closed through EMA 80, with EMA 50 still rising and M15 bull. Price then ran to 4150. The exit

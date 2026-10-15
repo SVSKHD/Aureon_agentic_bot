@@ -188,6 +188,162 @@ def parallel_card(agents, cfg, journal=None) -> dict:
     return _embed("AUREON · MT5 · PARALLEL STATUS", f"v{VERSION} · {len(agents)} symbol(s)", color=GREEN if all_ok else YELLOW, fields=fields)
 
 
+# v2.2.0 command directory (v2.10.0: module level; tests/test_v2100_commands.py requires an entry for EVERY root command)
+HELP = {
+    "Monitoring": {
+        "status": "Primary symbol snapshot — automatic, read-only",
+        "agents": "Running agent phases and health — automatic, read-only",
+        "parallel-status": "All symbols — automatic, read-only",
+        "market": "Market state — automatic, read-only",
+        "chart": "Current chart — automatic, read-only",
+        "symbols": "Configured symbols — automatic, read-only",
+        "symbol-present": "Symbol presence — user supplies symbol",
+    },
+    "Trading": {
+        "override": "Override a missed setup — places the order at the current price (execution on)",
+        "ignore-miss": "Ignore a missed setup — no action",
+        "halt": "Kill switch: close all positions and block entries — admin",
+        "unhalt": "Resume after a halt — exact confirmation phrase",
+        "take": "Accept pending ask — user places order unless AUREON_EXECUTION=1",
+        "skip": "Reject pending ask — user action",
+        "alert": "Arm price watch — user chooses price; bot monitors",
+        "alerts": "Show armed watches — automatic",
+        "alert-cancel": "Cancel one alert — user action",
+        "alert-clear": "Clear alerts — user action",
+    },
+    "Agent control": {
+        "agent-on": "Switch a symbol to AGENT mode for N minutes — operator",
+        "manual": "Switch a symbol back to MANUAL — operator",
+        "agent-schedule": "Scheduled AGENT windows — operator",
+        "governor": "Risk governor rules and current values — read-only",
+        "plan": "Today's daily plan — read-only",
+        "watchdog": "Open watchdog incidents — read-only",
+    },
+    "Features": {
+        "features": "Every feature toggle with its value and source (discord/env/default) — read-only",
+        "feature-set": "Change a feature live — admin; non-hot ones refused with a position open unless force",
+        "feature-reset": "Drop a Discord override (back to .env / default) — admin",
+        "feature-help": "What a feature does, its range and current value — read-only",
+    },
+    "Repair": {
+        "repairs": "Open incidents and proposed patches — read-only",
+        "repair": "Draft a tested patch for an incident on a branch — admin; nothing is applied",
+        "repair-apply": "Apply a proposed patch, test, commit, restart — admin",
+        "repair-discard": "Close an incident and drop its patch — admin",
+    },
+    "Review & tuning": {
+        "review": "Latest nightly review (pattern flags) — read-only",
+        "eod": "End-of-day review now or for a date — read-only",
+        "tuning": "Active tuning overrides and pending proposals — read-only",
+        "approve-tuning": "Approve a tuning proposal — operator",
+        "reject-tuning": "Reject a tuning proposal — operator",
+        "revert-tuning": "Revert a tuning override — operator",
+    },
+    "Claude": {
+        "claude-attach": "Re-bind Claude to a symbol's agent — operator",
+        "claude-detach": "Detach Claude from a symbol's agent — operator",
+        "claude": "Health, attachment and login — read-only",
+        "claude-status": "Usage and spend — automatic ledger",
+        "claude-test": "One CLI test — consumes usage",
+        "claude-review": "Review day — consumes usage",
+        "claude-rules": "Pending rule proposals — read-only",
+        "claude-rules-approve": "Approve rule proposal — manual operator",
+        "claude-report": "Alias of /advisor-report — historical, read-only",
+        "claude-read": "Read chart + position now (HOLD/EXIT or ENTER/SKIP) — consumes usage; shown only",
+    },
+    "Codex": {
+        "codex": "Health, login and attachment — read-only; verdicts shown, never applied",
+        "codex-status": "Usage and spend — automatic ledger",
+        "codex-test": "One CLI test — consumes usage",
+        "codex-review": "Review day — consumes usage",
+        "codex-alert": "Frozen-snapshot verdict on demand — consumes usage",
+        "codex-attach": "Re-bind to a symbol — operator",
+        "codex-detach": "Detach from a symbol — operator",
+        "codex-rules": "Pending Codex rule proposals — read-only",
+        "codex-rules-approve": "Approve Codex rule proposal — manual operator",
+    },
+    "Reports": {
+        "report": "Weekly trade summary — automatic",
+        "compare": "Detector, Claude, Codex, trader outcomes — automatic",
+        "advisor-report": "Claude and Codex performance, head-to-head — historical, read-only",
+        "compare-breakdown": "Compare by signal/session — automatic",
+        "git-history": "Commit history — automatic",
+        "pull-history": "MT5 history — automatic",
+    },
+    "Control": {
+        "restart": "Restart bot — admin only",
+        "mode": "Change process mode and restart — admin only",
+        "discord-bot": "Bot administration — admin",
+        "commands": "This directory — read-only",
+    },
+}
+
+
+# ----------------------------------------------------------------------------- v2.10.0 feature toggles (pure; the commands wrap these)
+def features_text(cfg, group: str = "") -> str:
+    from . import features
+    ov = features.load_overrides(cfg.log_dir)
+    lines = features.summary(cfg, ov, group=(group.strip().lower() or None))
+    return ("\n".join(lines) or f"no feature group {group!r}")[:1900]
+
+
+def feature_set_action(cfg, agents, journal, notify, claude, user, name: str, value: str, force: bool = False,
+                       admin_role: str | None = None, reset: bool = False) -> str:
+    """/feature-set and /feature-reset. Admin only; non-hot features refused with a position open unless force.
+    Applies live (cfg in place, Claude mode/budget), journals feature_set, posts FEATURE CHANGED for loud changes."""
+    from . import features, ops
+    role = os.environ.get("AUREON_ADMIN_ROLE_ID", "") if admin_role is None else admin_role
+    if not ops.admin_allowed(user, role):
+        return "Denied: configured administrator role required"
+    try:
+        f = features.get(name.strip().lower())
+        new_preview = None if reset else features.parse(f, value)
+    except ValueError as e:
+        return f"⚠️ {e}"
+    if not f.hot and ops.positions_block_mode_change(agents) and not force:
+        return (f"⛔ {f.name} is not hot — a position is open (or the snapshot cannot prove flat). "
+                f"Retry with force:true to change it anyway.")
+    if f.name == "claude_mode" and claude is None and (new_preview or "off") != "off":
+        return "⚠️ the Claude add-on was off at boot (no advisor exists) — set AUREON_CLAUDE in .env and /restart"
+    advisors = [claude] if claude is not None else []
+    if reset:
+        old, new = features.clear_override(cfg.log_dir, cfg, f.name, str(user), advisors)
+    else:
+        old, new = features.set_override(cfg.log_dir, cfg, f.name, value, str(user), advisors)
+    if claude is not None and f.name == "claude_mode":
+        claude.rebind(agents)
+    src = "env/default" if reset else "discord"
+    journal.log("feature_set", name=f.name, old=features.fmt(f, old), new=features.fmt(f, new), source=src, who=str(user),
+                force=bool(force), reset=bool(reset))
+    if features.is_loud(f, new) and old != new:
+        try:
+            notify.card(f"FEATURE CHANGED · {f.name}", f"{features.fmt(f, old)} → **{features.fmt(f, new)}** by {user}\n"
+                        f"{features.consequence(f, cfg)}", footer="Aureon MT5 · features")
+        except Exception:
+            pass
+    ov = features.load_overrides(cfg.log_dir)
+    return f"{features.line(f, cfg, ov)}" + (" · forced with a position open" if force and not f.hot else "")
+
+
+def repair_action(kind: str, cfg, agents, claude, repairer, user, n: int, force: bool = False, admin_role: str | None = None) -> Reply:
+    """v2.10.0 /repair, /repair-apply, /repair-discard — admin only. propose runs on the Claude worker when Claude is on."""
+    from . import ops, repair as repair_mod
+    role = os.environ.get("AUREON_ADMIN_ROLE_ID", "") if admin_role is None else admin_role
+    if not ops.admin_allowed(user, role):
+        return Reply(content="Denied: configured administrator role required")
+    if repair_mod.get(cfg.log_dir, n) is None:
+        return Reply(content=f"incident #{n} not found")
+    if kind == "apply":
+        return Reply(content=repairer.apply(n, agents=agents, user=user, force=force))
+    if kind == "discard":
+        return Reply(content=repairer.discard(n, user))
+    if claude is not None:
+        claude._enqueue({"type": "repair", "event": "repair", "symbol": "ALL", "n": n, "repairer": repairer})
+        return Reply(content=f"REPAIR #{n} queued on the Claude worker — the REPAIR card follows (tests + diff). Nothing is applied.")
+    res = repairer.propose(n)
+    return Reply(content=f"REPAIR #{n} · {res.get('status')}", file=res.get("patch"))
+
+
 def command_directory(tree, descriptions):
     """Return grouped, rendered entries for *every* registered root command."""
     actual = {c.name: c for c in tree.get_commands()}
@@ -727,6 +883,13 @@ def ask_decision(cfg, agents, journal, item: dict, decision: str, user, notify=N
                      symbol=m.get("symbol"), mode=m.get("mode"), side=m.get("side"), signal_kind=m.get("kind"),
                      price=m.get("price"), bar=m.get("bar"), decision=decision, by=str(user),
                      lots_chosen=lots, lots_suggested=lots_suggested)
+    if decision == "TAKE":                                       # v2.10.0 regime gate (block): never into whipsaw
+        ag = agents.get(m.get("symbol"))
+        if ag is not None and getattr(ag, "regime_tracker", None) is not None and ag.regime_tracker.blocks():
+            tr = ag.regime_tracker
+            journal.log("take_refused_regime", symbol=m.get("symbol"), state=tr.state, reasons=tr.reasons, by=str(user))
+            return {"line": "REFUSED", "text": f"regime {tr.state} — {', '.join(tr.reasons) or 'score ' + format(tr.score, '.2f')}",
+                    "ok": False, "ticket": None, "placed": False, "lots": None}
     item["decided"] = decision
     if decision == "SKIP":
         return {"line": "SKIPPED", "text": "⏭ skipped", "ok": True, "ticket": None, "placed": False, "lots": None}
@@ -860,7 +1023,8 @@ def alert_preview(ag, a: dict, current: float | None) -> dict | None:
         return None
 
 
-def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_notify=None, claude=None, alerts=None, codex=None):
+def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_notify=None, claude=None, alerts=None, codex=None,
+            repair: dict | None = None):
     try:
         import discord  # type: ignore
         from discord import app_commands  # type: ignore
@@ -1715,64 +1879,11 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
                              "takes effect on the next advisor call")
 
     # ------------------------------------------------------------------ v2.2.0 command directory, taken from actual tree registrations
-    _help = {
-        "Monitoring": {
-            "status": "Primary symbol snapshot — automatic, read-only",
-            "agents": "Running agent phases and health — automatic, read-only",
-            "parallel-status": "All symbols — automatic, read-only",
-            "market": "Market state — automatic, read-only",
-            "chart": "Current chart — automatic, read-only",
-            "symbols": "Configured symbols — automatic, read-only",
-            "symbol-present": "Symbol presence — user supplies symbol",
-        },
-        "Trading": {
-            "take": "Accept pending ask — user places order unless AUREON_EXECUTION=1",
-            "skip": "Reject pending ask — user action",
-            "alert": "Arm price watch — user chooses price; bot monitors",
-            "alerts": "Show armed watches — automatic",
-            "alert-cancel": "Cancel one alert — user action",
-            "alert-clear": "Clear alerts — user action",
-        },
-        "Claude": {
-            "claude": "Health, attachment and login — read-only",
-            "claude-status": "Usage and spend — automatic ledger",
-            "claude-test": "One CLI test — consumes usage",
-            "claude-review": "Review day — consumes usage",
-            "claude-rules": "Pending rule proposals — read-only",
-            "claude-rules-approve": "Approve rule proposal — manual operator",
-            "claude-report": "Alias of /advisor-report — historical, read-only",
-            "claude-read": "Read chart + position now (HOLD/EXIT or ENTER/SKIP) — consumes usage; shown only",
-        },
-        "Codex": {
-            "codex": "Health, login and attachment — read-only; verdicts shown, never applied",
-            "codex-status": "Usage and spend — automatic ledger",
-            "codex-test": "One CLI test — consumes usage",
-            "codex-review": "Review day — consumes usage",
-            "codex-alert": "Frozen-snapshot verdict on demand — consumes usage",
-            "codex-attach": "Re-bind to a symbol — operator",
-            "codex-detach": "Detach from a symbol — operator",
-            "codex-rules": "Pending Codex rule proposals — read-only",
-            "codex-rules-approve": "Approve Codex rule proposal — manual operator",
-        },
-        "Reports": {
-            "report": "Weekly trade summary — automatic",
-            "compare": "Detector, Claude, Codex, trader outcomes — automatic",
-            "advisor-report": "Claude and Codex performance, head-to-head — historical, read-only",
-            "compare-breakdown": "Compare by signal/session — automatic",
-            "git-history": "Commit history — automatic",
-            "pull-history": "MT5 history — automatic",
-        },
-        "Control": {
-            "restart": "Restart bot — admin only",
-            "mode": "Change process mode and restart — admin only",
-            "discord-bot": "Bot administration — admin",
-        },
-    }
 
     @tree.command(name="commands", description="Grouped Aureon command directory: automatic versus user actions")
     async def commands_cmd(inter: discord.Interaction):
         def work():
-            groups = command_directory(tree, _help)
+            groups = command_directory(tree, HELP)
             fields = [_field(group, "\n".join(lines)[:1024], False)
                       for group, lines in groups.items()]
             return Reply(card=_embed("AUREON · COMMANDS", "Only registered commands appear.", fields=fields))
@@ -1809,6 +1920,71 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
         # after the followup is sent: restart_process stops agents and exits 75; the supervisor restarts the process
         threading.Timer(2.0, ops.restart_process, args=(agents, journal, notify) + args,
                         kwargs={"log_dir": cfg.log_dir, "exit_hook": lambda code: ops.hard_exit(code, agents)}).start()
+
+    # ------------------------------------------------------------------ v2.10.0 feature toggles
+    @tree.command(name="features", description="Every feature toggle with value and source (discord/env/default)")
+    @app_commands.describe(group="claude | guardian | plan | repair | context | regime (default: all)")
+    async def features_cmd(inter: discord.Interaction, group: str = ""):
+        await run(inter, "features", lambda: Reply(content=features_text(cfg, group)))
+
+    @tree.command(name="feature-set", description="Admin: change a feature live (non-hot ones need force with a position open)")
+    @app_commands.describe(name="feature name (see /features)", value="new value (on/off, number, or choice)",
+                           force="allow a non-hot change with a position open")
+    async def feature_set_cmd(inter: discord.Interaction, name: str, value: str, force: bool = False):
+        user = inter.user
+        await run(inter, "feature-set", lambda: Reply(content=feature_set_action(cfg, agents, journal, notify, claude, user, name,
+                                                                                  value, force)))
+
+    @tree.command(name="feature-reset", description="Admin: drop a feature's Discord override (back to .env / default)")
+    @app_commands.describe(name="feature name", force="allow a non-hot change with a position open")
+    async def feature_reset_cmd(inter: discord.Interaction, name: str, force: bool = False):
+        user = inter.user
+        await run(inter, "feature-reset", lambda: Reply(content=feature_set_action(cfg, agents, journal, notify, claude, user, name,
+                                                                                    "", force, reset=True)))
+
+    @tree.command(name="feature-help", description="What a feature does, its range and its current value")
+    @app_commands.describe(name="feature name")
+    async def feature_help_cmd(inter: discord.Interaction, name: str):
+        def work():
+            from . import features
+            try:
+                return Reply(content=features.help_text(name.strip().lower(), cfg, features.load_overrides(cfg.log_dir)))
+            except ValueError as e:
+                return Reply(content=f"⚠️ {e}")
+        await run(inter, "feature-help", work)
+
+    # ------------------------------------------------------------------ v2.10.0 repair agent (detect → propose → a human applies)
+    repair_box = repair if repair is not None else {}
+
+    def _repairer():
+        from . import repair as repair_mod
+        if repair_box.get("repairer") is None:
+            repair_box["repairer"] = repair_mod.Repairer(cfg, journal, health_notify or notify)
+        return repair_box["repairer"]
+
+    @tree.command(name="repairs", description="Open incidents and proposed repair patches")
+    async def repairs_cmd(inter: discord.Interaction):
+        from . import repair as repair_mod
+        await run(inter, "repairs", lambda: Reply(content=repair_mod.listing(cfg.log_dir)))
+
+    @tree.command(name="repair", description="Admin: draft a tested patch for an incident on a branch (nothing is applied)")
+    @app_commands.describe(n="incident number (see /repairs)")
+    async def repair_cmd(inter: discord.Interaction, n: int):
+        user = inter.user
+        await run(inter, "repair", lambda: repair_action("propose", cfg, agents, claude, _repairer(), user, n),
+                  timeout=float(cfg.repair_timeout) + 600)
+
+    @tree.command(name="repair-apply", description="Admin: apply a proposed repair patch, test, commit, push, restart")
+    @app_commands.describe(n="incident number", force="apply and restart even with a position open")
+    async def repair_apply_cmd(inter: discord.Interaction, n: int, force: bool = False):
+        user = inter.user
+        await run(inter, "repair-apply", lambda: repair_action("apply", cfg, agents, claude, _repairer(), user, n, force), timeout=1900)
+
+    @tree.command(name="repair-discard", description="Admin: close an incident and drop its proposed patch")
+    @app_commands.describe(n="incident number")
+    async def repair_discard_cmd(inter: discord.Interaction, n: int):
+        user = inter.user
+        await run(inter, "repair-discard", lambda: repair_action("discard", cfg, agents, claude, _repairer(), user, n))
 
     @tree.command(name="restart", description="Admin: stop agents cleanly and restart process; requires role")
     @app_commands.describe(reason="Reason shown on the BACK ONLINE card")

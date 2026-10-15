@@ -87,6 +87,7 @@ class HealthGuard:
         self.restarting = False
         self.last_failures: list[str] = []
         self._thread: threading.Thread | None = None
+        self.detector = None                        # v2.10.0: repair.Detector, ticked here (no extra thread)
 
     # -------------------------------------------------------------- health conditions
     def _gateway_up(self) -> bool:
@@ -145,6 +146,11 @@ class HealthGuard:
         if self.last_heartbeat is None or now - self.last_heartbeat >= HEARTBEAT_EVERY_S:
             self.last_heartbeat = now
             self.write_heartbeat(lag, fails)
+        if self.detector is not None:
+            try:
+                self.detector.tick()
+            except Exception as e:
+                telemetry.info(f"repair detector failed: {e!r}")
         if self.deadman_url and not fails and (self.last_ping is None or now - self.last_ping >= DEADMAN_EVERY_S):
             self.last_ping = now
             if self.ping(self.deadman_url):

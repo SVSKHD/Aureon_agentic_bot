@@ -131,6 +131,9 @@ class SymbolAgent(threading.Thread):
         self._resolved_profile = cfg.resolved_guardian_profile(_demo)
         self.off = cfg.server_utc_offset
         self.state: dict[int, dict] = journal.load_state(symbol)
+        from .regime import RegimeTracker                                # v2.10.0 regime: computed every closed bar
+        self.regime_tracker = RegimeTracker(cfg, journal, symbol)
+        self.regime: dict | None = None
         self.latest_signal: dict | None = None
         self.last_confirmed_cross: dict | None = None   # v2.0.0 ema2050: {"bar_time", "direction"} — the guardian's exit signal
         self.last_bar: int | None = None
@@ -201,7 +204,12 @@ class SymbolAgent(threading.Thread):
                     _time.sleep(self.cfg.poll_seconds); continue
                 bar_t = int(closed["time"].iloc[-1]); new_bar = bar_t != self.last_bar
                 df = self.S.add_emas(closed)
+                if self.cfg.zl_context:                                        # v2.10.0: zero-lag context columns (no rule reads them)
+                    from .common.zl import add_zl
+                    df = add_zl(df, self.off)
                 self.last_df = df
+                if new_bar:
+                    self._update_regime(df, bar_t)
                 cf, cs = self.S.ema_cols
                 ef = float(df[cf].iloc[-1]); es = float(df[cs].iloc[-1]); close = float(df["close"].iloc[-1])
                 sgn = 1 if ef > es else -1
@@ -371,6 +379,48 @@ class SymbolAgent(threading.Thread):
         txt = " · ".join(parts); self._htf_cache = (key, txt)
         return txt
 
+    # ------------------------------------------------------------------ v2.10.0 regime gate
+    def _update_regime(self, df, bar_t):
+        """Every closed bar (any gate setting): state + journal on change. block: DEAD / NO-TRADE DAY cards. Never touches positions."""
+        try:
+            cf, cs = self.S.ema_cols
+            prev = self.regime_tracker.state
+            self.regime = self.regime_tracker.update(df, bar_t, cf, cs)
+            self.health["regime"] = self.regime_tracker.line()
+            if self.cfg.regime_gate != "block":
+                return
+            tr = self.regime_tracker
+            if tr.state == "DEAD" and prev != "DEAD":
+                self.notify.send(self.key("NO_TRADE_REGIME", bar_key(bar_t, self.off)), ctitle(self.symbol, "NO-TRADE REGIME"),
+                                 [f"regime DEAD ({tr.score:.2f}): " + (", ".join(tr.reasons) or "no movement"),
+                                  "entries closed until the regime turns CHOPPY → CLEAN · open trades unaffected"],
+                                 color=EVENT_COLOURS["market"], footer=cfooter(self.S.display_name, "regime"))
+            if tr.no_trade_day:
+                self.notify.send(self.key("NO_TRADE_DAY", datetime.now(IST).strftime("%Y-%m-%d")), ctitle(self.symbol, "NO-TRADE DAY"),
+                                 [f"CHOPPY/DEAD covered ≥ {self.cfg.no_trade_day_frac:.0%} of today's session — not a lock: "
+                                  f"a CLEAN streak reopens entries as usual"], color=EVENT_COLOURS["market"],
+                                 footer=cfooter(self.S.display_name, "regime"))
+        except Exception as e:
+            telemetry.info(f"regime update failed {self.symbol}: {e!r}")
+
+    def regime_blocks(self) -> bool:
+        return self.regime_tracker.blocks()
+
+    def _entry_ask(self, key, title, lines, **kw) -> bool:
+        """notify.ask for P / cross / RE / ENTER cards. show: + REGIME line. block in CHOPPY/DEAD: the signal is carded
+        'CHOP · not tradeable' with no buttons, no tracked ask, no Claude entry read — returns False."""
+        tr = self.regime_tracker; gate = self.cfg.regime_gate
+        if gate in ("show", "block") and tr.state:
+            kw["fields"] = list(kw.get("fields") or []) + [field("Regime", tr.line(), inline=False)]
+        if tr.blocks():
+            self.journal.log("entry_blocked_regime", symbol=self.symbol, key=key, state=tr.state, score=tr.score, reasons=tr.reasons)
+            self.notify.send(key, f"{title} · CHOP · not tradeable", [lines[0] if lines else "",
+                             f"regime {tr.state}: {', '.join(tr.reasons) or 'score ' + format(tr.score, '.2f')} — no ask, no Claude entry read"],
+                             kw.get("png"), fields=kw.get("fields"), color=EVENT_COLOURS["market"], footer=kw.get("footer"))
+            return False
+        self.notify.ask(key, title, lines, **kw)
+        return True
+
     def _m15_state(self) -> str | None:
         """v2.8.0: raw M15 50/80 state on closed bars ("BULLISH · PULLBACK", …), cached per M5 bar. Any failure → None
         (None never counts as evidence or as a failed setup check)."""
@@ -412,6 +462,10 @@ class SymbolAgent(threading.Thread):
         avg = float(rng[-21:-1].mean()) if len(rng) > 21 else float(rng.mean()) if len(rng) else 0.0
         if len(gap) and avg > 0 and abs(float(gap[-1])) >= self.cfg.flip_gap_x_range * avg:
             ev.append(f"gap wide: {abs(float(gap[-1])):.1f} vs avg range {avg:.1f}")
+        if getattr(self.cfg, "flip_use_zl", False):                    # v2.10.0: optional; only ever ADDS evidence
+            from .common.zl import zl_cross_against
+            if zl_cross_against(df, p["direction"]):
+                ev.append("ZL cross against")
         return ev
 
     def _warnings(self, df) -> list[str]:
@@ -829,12 +883,14 @@ class SymbolAgent(threading.Thread):
                                 marker={"index": r.index, "side": r.side, "label": "RE", "stop": stop,
                                         "secure": (r.price + s_ * g.secure_at) if g else None})
             re_key = self.key(f"RE_{r.side}", bar_key(bar_t, self.off))
-            self.notify.ask(re_key, ctitle(self.symbol, "RE-ENTRY", r.side),
+            asked = self._entry_ask(re_key, ctitle(self.symbol, "RE-ENTRY", r.side),
                             [f"pullback to EMA {self.S.fast} rejected — trend continues", f"**Trade {r.side} now?**"], png=png,
                             fields=re_fields + self._lot_field(r.price - stop) + self._evidence_field("reentry", r.side, bar_t) + self._context_fields(df),
                             color=EVENT_COLOURS["signal_long" if r.side == "LONG" else "signal_short"], footer=cfooter(self.S.display_name, "re-entry"),
                             meta={"symbol": self.symbol, "side": r.side, "kind": "reentry", "price": r.price, "bar": bar_t, "mode": self.S.name,
                                   "sl": stop, "chop": _chop, "chop_crosses": _chop_n, **self._suggested(r.price - stop)})
+            if not asked:
+                return                                                   # v2.10.0 regime gate (block): carded, not tradeable
             self.track_ask(re_key, r.side, "reentry", r.price, bar_t, self._suggested(r.price - stop).get("lots"), stop)
             for adv in self.advisors():
                 adv.request_entry(self, "reentry", r.side, bar_t, df, card_key=re_key, png=png)
@@ -982,6 +1038,8 @@ class SymbolAgent(threading.Thread):
             elif "pb" in ev.label: kind = "pullback"
             else: kind = "cross"
             self.latest_signal = {"bar_time": bar_t, "symbol": self.symbol, "strategy": self.S.name, "kind": kind, "direction": side, "consumed": False}
+            if kind == "P":
+                self.regime_tracker.note_p(bar_t, side)                  # v2.10.0: failed-P count for the regime
             if self.leg and self.leg["side"] != side:
                 self._end_leg(df, bar_t, f"opposite {kind} {side}")
             if not self.leg or self.leg["side"] != side:
@@ -1004,12 +1062,14 @@ class SymbolAgent(threading.Thread):
                                         "stop": (close - s * g.pre_stop) if g else None, "secure": (close + s * g.secure_at) if g else None})
             fields = fields + (self._lot_field(g.pre_stop) if g else []) + self._evidence_field(kind, side, bar_t) + self._context_fields(df)
             ask_key = self.key(f"{kind.upper()}_{side}", bar_key(bar_t, self.off))
-            self.notify.ask(ask_key, ctitle(self.symbol, {"P": "P PRE-CROSS", "cross": "CONFIRMED CROSS", "late": "LATE ENTRY", "pullback": "PULLBACK ENTRY"}.get(kind, kind), side), [note, f"**Trade {side} now?**"], png=png,
+            asked = self._entry_ask(ask_key, ctitle(self.symbol, {"P": "P PRE-CROSS", "cross": "CONFIRMED CROSS", "late": "LATE ENTRY", "pullback": "PULLBACK ENTRY"}.get(kind, kind), side), [note, f"**Trade {side} now?**"], png=png,
                              meta={"symbol": self.symbol, "side": side, "kind": kind, "price": close, "bar": bar_t, "mode": self.S.name,
                                    "sl": (close - s * g.pre_stop) if g else None, "chop": _chop, "chop_crosses": _chop_n,
                                    **(self._suggested(g.pre_stop) if g else {})},
                              fields=fields, color=EVENT_COLOURS["signal_long" if side == "LONG" else "signal_short"],
                              footer=cfooter(self.S.display_name, f"bar {ist(bar_t, self.off)}"))
+            if not asked:
+                return                                                   # v2.10.0 regime gate (block): carded, not tradeable
             self.track_ask(ask_key, side, kind, close, bar_t, self._suggested(g.pre_stop).get("lots") if g else None,
                           (close - s * g.pre_stop) if g else None)
             if kind in ("P", "cross"):                                       # v1.10.0: enqueue only — never blocks the poll
@@ -1160,10 +1220,12 @@ class SymbolAgent(threading.Thread):
                                             "secure": (close + s * g.secure_at) if g else None})
                 fields = fields + (self._lot_field(g.pre_stop) if g else []) + self._context_fields(df)
                 ask_key = self.key(f"ENTER_{side}", bk)
-                self.notify.ask(ask_key, ctitle(self.symbol, f"ENTER {side} ({kind})"), [note, f"**Trade {side} now?**"], png=png,
+                asked = self._entry_ask(ask_key, ctitle(self.symbol, f"ENTER {side} ({kind})"), [note, f"**Trade {side} now?**"], png=png,
                                 meta={"symbol": self.symbol, "side": side, "kind": kind, "price": close, "bar": bar_t, "mode": self.S.name,
                                       "sl": stop, "chop": _chop, "chop_crosses": _chop_n, **(self._suggested(g.pre_stop) if g else {})},
                                 fields=fields, color=colour, footer=cfooter(self.S.display_name, f"bar {ist(bar_t, off)}"))
+                if not asked:
+                    return                                               # v2.10.0 regime gate (block): carded, not tradeable
                 self.track_ask(ask_key, side, kind, close, bar_t, self._suggested(g.pre_stop).get("lots") if g else None, stop)
                 for adv in self.advisors():                                    # the ENTER bar only — never raw CROSS / MULTI
                     adv.request_entry(self, "enter", side, bar_t, df, card_key=ask_key, png=png)

@@ -24,6 +24,11 @@ UP, DOWN, EMA_F, EMA_S = "#2fbf9a", "#e0635a", "#ff3b3b", "#ffffff"
 SESS = {"asia": "#f2c14e", "london": "#5aa9ff", "ny": "#ff5a5a"}
 
 
+import time as _time
+from collections import deque as _deque
+FAILURES: "_deque[float]" = _deque(maxlen=200)
+
+
 def context_chart(df, symbol: str, mode_display: str, fast: int, slow: int, ema_cols: tuple, off_h: float, out_dir: str,
                   marker: dict | None = None, bars: int = 120, title_extra: str = "", regions: list | None = None,
                   day_start_ts: int | None = None, reentries: list | None = None) -> str | None:
@@ -35,7 +40,13 @@ def context_chart(df, symbol: str, mode_display: str, fast: int, slow: int, ema_
         shift = len(df) - len(d)
         n = len(d); x = np.arange(n)
         o, h, l, c = (d[k].to_numpy() for k in ("open", "high", "low", "close"))
-        fig, ax = plt.subplots(figsize=(12, 7), dpi=100, facecolor=BG)
+        zl = "zl50" in d and "adx5" in d                 # v2.10.0 AUREON_ZL_CONTEXT: zero-lag lines + ADX(5) strip
+        if zl:
+            fig, (ax, axa) = plt.subplots(2, 1, figsize=(12, 8), dpi=100, facecolor=BG, sharex=True,
+                                          gridspec_kw={"height_ratios": [5, 1], "hspace": 0.05})
+            axa.set_facecolor(PANEL)
+        else:
+            fig, ax = plt.subplots(figsize=(12, 7), dpi=100, facecolor=BG)
         ax.set_facecolor(PANEL)
         for sp in ax.spines.values(): sp.set_visible(False)
         ax.grid(True, color=GRID, lw=0.6); ax.tick_params(colors=MUTED, labelsize=11, length=0)
@@ -97,6 +108,13 @@ def context_chart(df, symbol: str, mode_display: str, fast: int, slow: int, ema_
             ax.add_patch(Rectangle((xi - 0.32, min(oi, ci)), 0.64, max(abs(ci - oi), 1e-6), color=cc, lw=0))
         # EMAs + labels
         ax.plot(x, d[cf], color=EMA_F, lw=2.2); ax.plot(x, d[cs], color=EMA_S, lw=2.2)
+        if zl:
+            ax.plot(x, d["zl50"], color=EMA_F, lw=1.0, ls=":"); ax.plot(x, d["zl80"], color=EMA_S, lw=1.0, ls=":")
+            axa.plot(x, d["adx5"], color=MUTED, lw=1.2)
+            axa.axhline(25, color=GRID, lw=0.8, ls="--")
+            for sp in axa.spines.values(): sp.set_visible(False)
+            axa.tick_params(colors=MUTED, labelsize=9, length=0)
+            axa.text(0.002, 0.85, "ADX 5", transform=axa.transAxes, color=MUTED, fontsize=9, va="top")
         for col_name, colour, per in ((cf, EMA_F, fast), (cs, EMA_S, slow)):
             yv = float(d[col_name].iloc[-1])
             ax.annotate(f"EMA {per}  {yv:.2f}", (n - 1, yv), xytext=(8, 0), textcoords="offset points", color=colour,
@@ -132,7 +150,10 @@ def context_chart(df, symbol: str, mode_display: str, fast: int, slow: int, ema_
                      fontsize=14, weight="bold", loc="left", pad=12)
         ax.text(0.995, 1.01, f"{last:.2f} · {datetime.fromtimestamp(int(d['time'].iloc[-1]) - off_h * 3600, tz=IST):%d %b %H:%M} IST",
                 transform=ax.transAxes, color=MUTED, fontsize=11, ha="right", va="bottom")
-        fig.tight_layout()
+        if zl:
+            fig.subplots_adjust(left=0.04, right=0.985, top=0.95, bottom=0.05)
+        else:
+            fig.tight_layout()
         slug = "".join(ch for ch in title_extra.lower() if ch.isalnum())[:16] or "ctx"
         path = os.path.join(out_dir, f"{symbol}_{slug}_{int(d['time'].iloc[-1])}.png")
         fig.savefig(path, facecolor=BG); plt.close(fig)
@@ -144,4 +165,5 @@ def context_chart(df, symbol: str, mode_display: str, fast: int, slow: int, ema_
         return path
     except Exception as e:
         print("  (context chart failed:", e, ")")
+        FAILURES.append(_time.time())                  # v2.10.0: the repair Detector counts these per day
         return None
