@@ -1,4 +1,4 @@
-# Aureon MT5 v2.11.0
+# Aureon MT5 v2.11.2
 
 You place the trade. Aureon detects (per selected EMA mode), fires a Discord gunshot, then manages what you placed:
 protect → secure +10 → ride in +5 steps → close on the fast-EMA turn → news safeguard. Reports and slash commands.
@@ -23,6 +23,20 @@ protected (SL never loosened) but receive no strategy rules; a `⚠️ MODE MISM
 Production: run it under the supervisor (auto-restart, hang kill, boot start) — **[docs/SERVICE.md](docs/SERVICE.md)**:
 
     powershell -ExecutionPolicy Bypass -File .\scripts\aureon_service.ps1 -Action install
+
+## v2.11.2 — a network loss never ends the process
+
+**Run it as the service, from `C:\Aureon`.** Install the repo at `C:\Aureon` (never under OneDrive, Dropbox or Google Drive:
+they lock and sync `guardian_state.json`, `features.json`, `restart_marker.json` and the journal while the bot writes them;
+the BOOT CHECK warns), and run it as the NSSM service from `docs/SERVICE.md §1`. Never use `python main.py` by hand for live
+trading: when that process ends for any reason, nothing brings it back.
+
+When the box loses its network (DNS, Wi-Fi, ISP), Aureon now keeps polling MT5 and managing open trades on their existing
+stops. It opens no new entries: an ask that fires is journaled `ask_suppressed_network` and listed on the console
+(`AUREON_NETWORK_DEGRADED_ENTRIES=1` allows entries anyway). Trade cards queue in `logs/card_queue.jsonl`. The Discord
+client reconnects forever, with backoff up to 60 s. When the network returns, one `BACK ONLINE · network · down N min ·
+K cards queued` card is posted, followed by the queued cards in order. Every process exit is recorded (`process_exit` in the
+journal, `logs/exit_marker.json`), and the next boot card says `last exit: …`. The 4-hourly heartbeat shows a DNS self-check.
 
 ## v2.11.0 — notifications that arrive when the trade does
 

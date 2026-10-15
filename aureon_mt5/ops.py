@@ -66,9 +66,32 @@ def pop_restart_marker(log_dir, max_age=3600):
     return data
 
 
-def hard_exit(code=EXIT_RESTART, agents=None, join_timeout=5.0, _exit=os._exit):
+STOP = threading.Event()   # v2.11.2: a planned stop (/restart, /mode, maintenance, repair-apply, Ctrl-C) — the only thing
+                           # that ends the Discord supervisor; everything network-related reconnects forever
+
+
+def stop_requested() -> bool:
+    return STOP.is_set()
+
+
+def hard_exit(code=EXIT_RESTART, agents=None, join_timeout=5.0, _exit=None, reason: str | None = None):
     """Stop agents (best effort, bounded), flush logs and leave with `code`. os._exit because this runs on a Timer /
-    health thread where sys.exit would only end that thread. The supervisor restarts the process."""
+    health thread where sys.exit would only end that thread. The supervisor restarts the process.
+    v2.11.2: sets STOP and records process_exit (reason from the restart marker) before leaving."""
+    STOP.set()
+    try:
+        from . import netguard
+        if reason is None:
+            import json
+            try:
+                with open(restart_marker_path(netguard.EXIT_CTX.get("log_dir") or "logs"), encoding="utf-8") as f:
+                    m = json.load(f)
+                reason = f"restart · {m.get('kind')} · {m.get('reason', '')}".strip(" ·")
+            except (OSError, ValueError):
+                reason = f"exit {code}"
+        netguard.record_exit(reason, planned=True, code=code, where="ops.hard_exit")
+    except Exception:
+        pass
     for ag in list((agents or {}).values()):
         try:
             ag.stop()
@@ -90,7 +113,7 @@ def hard_exit(code=EXIT_RESTART, agents=None, join_timeout=5.0, _exit=os._exit):
         sys.stdout.flush(); sys.stderr.flush()
     except Exception:
         pass
-    _exit(code)
+    (_exit or os._exit)(code)
 
 
 def cli_pins_mode(argv, symbols=None):

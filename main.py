@@ -282,6 +282,8 @@ def main():
     if a.token: cfg.bot_token = a.token
 
     notify = Notifier(cfg.webhook); journal = Journal(cfg.log_dir); telemetry.setup(cfg.log_dir)
+    from aureon_mt5 import netguard                                    # v2.11.2: network state + exit_reason go here
+    netguard.configure(journal=journal, log_dir=cfg.log_dir)
     feature_overrides = _features.load_overrides(cfg.log_dir)
     if feature_overrides:
         _features.apply(cfg, feature_overrides)
@@ -300,6 +302,9 @@ def main():
     # v2.11.0: mentions / asks channel / push from the first card on (after the BOOT CHECK fallbacks)
     from aureon_mt5.push import Push
     push = Push(cfg, journal)
+    push.on_pause = lambda b, err: health_notify.card(f"AUREON · MT5 · PUSH PAUSED · {b}",
+                                                      f"{b} failed 5× in a row ({err or 'HTTP error'}) — paused 10 min; Discord unaffected",
+                                                      footer="Aureon MT5 · netguard")
     notify.configure(cfg, push=push)
     if health_notify is not notify:
         health_notify.configure(cfg, push=push)
@@ -342,6 +347,8 @@ def main():
     news_line, unverified = news_status(cfg.news_file)
 
     agents: dict[str, SymbolAgent] = {}; started = _time.time()
+    netguard.configure(positions=lambda: sum(len((getattr(ag, "snapshot", None) or {}).get("positions") or [])
+                                             for ag in list(agents.values())))
     alerts = AlertStore(cfg.log_dir)                                                   # v2.0.0 /alert store, shared by agents + bot
     claude = ClaudeAdvisor.create(cfg, notify, journal, health_notify=health_notify)     # None when AUREON_CLAUDE=off
     if claude is not None:
@@ -380,10 +387,11 @@ def main():
         marker = _ops.pop_restart_marker(cfg.log_dir) or {}          # v2.7.2: written before exit(75)
         from aureon_mt5 import server as _srv
         down = _srv.down_text(marker)                                    # v2.10.1: every BACK ONLINE says how long we were away
+        last_exit = netguard.pop_exit_marker(cfg.log_dir)                 # v2.11.2: why the previous process ended
         if not marker and not os.environ.get("AUREON_RESTART_REASON") and not os.environ.get("AUREON_AUTO_RESTARTED"):
             why = "cold start"
             _srv.cold_start(cfg, journal, health_notify,
-                            {s_: (broker.positions(s_) if not cfg.dry else []) for s_ in cfg.symbols})
+                            {s_: (broker.positions(s_) if not cfg.dry else []) for s_ in cfg.symbols}, last_exit=last_exit)
         if marker.get("kind") in ("maintenance", "repair-auto", "repair-rollback"):
             why = f"restarted · {marker['kind']}"
             text = {"maintenance": f"maintenance reboot · {marker.get('reason', '')}",
@@ -484,7 +492,19 @@ def main():
     from aureon_mt5.tuning_auto import TuningAuto
     maint = srv.Maintenance(cfg, journal, health_notify, agents, exit_hook=restart_exit)
     mt5_mgr = srv.Mt5Manager(cfg, journal, health_notify, broker)
-    net = srv.NetworkWatch(journal)
+    netguard.MONITOR = monitor
+
+    def on_net_flip(degraded_now):
+        def work():
+            res = netguard.dns_check(netguard.dns_hosts(cfg))
+            journal.log("dns_check", result={k: v["ok"] for k, v in res.items()})
+            if degraded_now:
+                health_notify.card("AUREON · MT5 · NETWORK DEGRADED", "; ".join(netguard.STATE["reasons"]) +
+                                   f"\n{netguard.dns_line(res)}\npolling and the guardian continue on the existing stops · no new "
+                                   "entries · trade cards queue (logs/card_queue.jsonl)", footer="Aureon MT5 · netguard")
+            else:
+                health_notify.card("AUREON · MT5 · NETWORK RESTORED", netguard.dns_line(res), footer="Aureon MT5 · netguard")
+        threading.Thread(target=work, daemon=True, name="aureon-netflip").start()
     tuner = TuningAuto(cfg, journal, health_notify, advisors=[claude] if claude is not None else [])
     srv.check_clock(journal, health_notify); last_clock = _time.time()
     was_in_session = srv.in_session(cfg, _time.time())
@@ -499,8 +519,14 @@ def main():
             mt5_mgr.tick(now)
             if now - last_clock >= 6 * 3600:
                 last_clock = now; srv.check_clock(journal, health_notify)
-            net.tick(bool(getattr(notify, "last_ok", True)), guard.last_ping_ok if cfg.deadman_url else None,
-                     cfg.dry or broker.connected())
+            # v2.11.2: network state (gateway > 60 s / 2 webhook failures / DNS) and the card queue, every 30 s, independent
+            # of the gateway. Degraded = no new entries; the guardian and the poll loop never notice.
+            netguard.update(now, journal=journal, on_flip=on_net_flip)
+            if netguard.degraded() and now - (netguard.STATE.get("dns_t") or 0) >= 300:
+                threading.Thread(target=netguard.dns_check, args=(netguard.dns_hosts(cfg),), daemon=True, name="aureon-dns").start()
+            notify.flush()
+            if health_notify is not notify:
+                health_notify.flush()
             try:
                 import shutil as _sh
                 srv.STATE["disk_free_gb"] = _sh.disk_usage(cfg.log_dir).free / 1e9
@@ -549,12 +575,62 @@ def main():
                 except Exception:
                     pass
         except KeyboardInterrupt:
-            notify.card("AUREON · MT5 · PROCESS EXITING", "KeyboardInterrupt")
-            broker.close_connection(); print("bye"); return
+            from aureon_mt5 import ops as _o
+            _o.STOP.set()
+            try:
+                notify.card("AUREON · MT5 · PROCESS EXITING", "KeyboardInterrupt")
+                broker.close_connection()
+            except Exception:
+                pass
+            print("bye"); raise
         except Exception as e:
             telemetry.failure(notify, journal, title="AUREON SUPERVISOR ERROR", key="supervisor", mode=cfg.mode, action="supervisor", exc=e)
         _time.sleep(30)
 
 
+class _Signal(BaseException):
+    def __init__(self, signum):
+        super().__init__(signum); self.signum = signum
+
+
+def run() -> int:
+    """v2.11.2: every way out of the process records process_exit {reason, exc_type, where, uptime_s, positions_open}
+    (journal + restart_marker.json or exit_marker.json). Planned exits → 0 (or the restart code 75); anything else → 1, so
+    the service restarts us. (os._exit paths — /restart, self-heal — record in ops.hard_exit.)"""
+    import signal
+    from aureon_mt5 import netguard, ops
+
+    def _sig(signum, frame):
+        raise _Signal(signum)
+    for name in ("SIGTERM", "SIGBREAK"):
+        if hasattr(signal, name):
+            try:
+                signal.signal(getattr(signal, name), _sig)
+            except (ValueError, OSError):
+                pass
+    try:
+        main()
+        netguard.record_exit("normal stop", planned=True, code=0, where="main returned")
+        return 0
+    except KeyboardInterrupt as e:
+        ops.STOP.set()
+        netguard.record_exit("SIGINT (Ctrl-C)", exc=e, planned=True, code=0)
+        return 0
+    except _Signal as e:
+        ops.STOP.set()
+        name = {getattr(signal, n, None): n for n in ("SIGTERM", "SIGBREAK")}.get(e.signum, str(e.signum))
+        netguard.record_exit(f"{name} (service stop)", exc=e, planned=True, code=0)
+        return 0
+    except SystemExit as e:
+        code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+        netguard.record_exit(f"SystemExit({code})", exc=e, planned=code in (0, ops.EXIT_RESTART), code=code)
+        return code
+    except BaseException as e:                                # unplanned: non-zero so the service restarts us
+        import traceback
+        traceback.print_exc()
+        netguard.record_exit(f"unhandled {type(e).__name__}: {str(e)[:200]}", exc=e, planned=False, code=1)
+        return 1
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(run())

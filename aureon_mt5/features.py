@@ -106,6 +106,10 @@ def registry() -> list[Feature]:
                 min=1.0, max=720.0, unit="h"),
         Feature("log_keep_days", "AUREON_LOG_KEEP_DAYS", "float", 30.0, "log_keep_days", "server",
                 "rotated logs / stall dumps / replays older than this are deleted in the maintenance window", min=1.0, max=365.0),
+        Feature("network_degraded_entries", "AUREON_NETWORK_DEGRADED_ENTRIES", "bool", False, "network_degraded_entries", "server",
+                "allow new entry asks while the network is degraded (Discord / DNS down); off = asks are journaled, not shown",
+                loud=True, loud_values=(True,),
+                consequence="entry asks now fire while Discord is unreachable — you may not see them until it is back"),
         # ---- notify (v2.11.0) — presentation only, never a trade
         Feature("mention_events", "AUREON_DISCORD_MENTION_EVENTS", "enum-set", ("ASK", "FILLED", "CLOSED", "STOP"),
                 "discord_mention_events", "notify",

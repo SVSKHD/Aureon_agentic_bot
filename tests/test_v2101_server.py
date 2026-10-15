@@ -188,8 +188,11 @@ def test_notifier_backlog_summary(monkeypatch):
     monkeypatch.setattr(requests, "post", lambda url, json=None, **k: (posted.append(json), R(next(codes)))[1])
     n.card("A"); n.card("B")
     assert n.backlog == ["A", "B"] and not n.last_ok
-    n.card("C")
-    assert n.backlog == [] and posted[-1]["embeds"][0]["title"] == "AUREON · MT5 · NETWORK BACK" and "• A" in posted[-1]["embeds"][0]["description"]
+    n.card("C")                                     # v2.11.2: webhook down (2 failures) → no blocking POST, C is missed too
+    assert len(posted) == 2 and n.backlog == ["A", "B", "C"]
+    n.flush()                                       # main loop, every 30 s: one summary on reconnect
+    t = posted[-1]["embeds"][0]
+    assert n.backlog == [] and t["title"].startswith("AUREON · MT5 · BACK ONLINE · network · down") and "• A" in t["description"]
 
 
 # ------------------------------------------------------------------ /server

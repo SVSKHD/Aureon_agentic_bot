@@ -2181,14 +2181,39 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
         await run(inter, "compare-breakdown", lambda: _compare_reply(days, True), timeout=30)
 
     def _runner():
-        asyncio.set_event_loop(asyncio.new_event_loop())
-        try:
-            client.run(cfg.bot_token, log_handler=None)
-            telemetry.info("discord client.run returned — bot offline")
-        except BaseException as e:                       # login failure, fatal gateway error, …
-            telemetry.info(f"discord client.run died: {e!r}")
-        # v2.7.2: the bot thread is gone — mark the gateway down so the health guard self-restarts after 5 min
-        monitor.gateway_down("bot thread exited")
+        """v2.11.2: the outer loop is the guarantee — any exit of client.start() (DNS failure at login, ConnectionClosed,
+        discord.py's own reconnect giving up, a clean return) backs off 2 s → 60 s and starts again. Only ops.STOP
+        (/restart, /mode, maintenance, repair-apply, Ctrl-C) ends it. discord.py's reconnect=True stays on."""
+        from . import netguard, ops as _ops
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        netguard.MONITOR = monitor
+
+        async def start():
+            if client.is_closed():
+                client.clear()                                # a closed client can be started again after clear() …
+                conn = getattr(client.http, "connector", None)
+                if conn is not None and getattr(conn, "closed", False):
+                    from discord.utils import MISSING
+                    client.http.connector = MISSING           # … but its aiohttp connector closed with the session
+            await client.start(cfg.bot_token, reconnect=True)
+
+        async def close():
+            if not client.is_closed():
+                await client.close()
+
+        def on_exit(why):
+            monitor.gateway_down(f"client exited: {why}")
+            netguard.update()
+
+        while not _ops.STOP.is_set():
+            try:
+                loop.run_until_complete(netguard.supervise_client(start, stop_requested=_ops.STOP.is_set, close=close,
+                                                                  on_exit=on_exit))
+            except BaseException as e:                         # never let the bot thread die
+                netguard.rlog("bot-thread", f"discord supervisor error: {e!r} — restarting it")
+                _time.sleep(2)
+        monitor.gateway_down("stopped")
 
     bot_thread[0] = threading.Thread(target=_runner, daemon=True, name="discord-bot")
     bot_thread[0].start()

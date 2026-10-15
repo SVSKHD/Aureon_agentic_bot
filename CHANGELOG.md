@@ -2,6 +2,39 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.11.2 — 2026-10-15  (PATCH: process survival on network loss)
+Root cause: with DNS gone the Discord login raised, `bot._runner` let the `discord-bot` thread end, and once the gateway had
+been down for 300 s `HealthGuard._maybe_restart` treated that as a hang and called `ops.hard_exit(75)` → `os._exit(75)`
+(after posting "⚠️ Aureon frozen — restarting", which itself failed with "discord post failed"); with no service installed
+nothing restarted the process.
+- **`aureon_mt5/netguard.py`**: network failures become state, never an exit. `degraded()` = gateway down > 60 s OR 2 webhook
+  failures in a row OR discord.com does not resolve; mirrored into the v2.10.1 entry gate. Failure logs at most once a
+  minute (`rlog`).
+- **Gateway supervisor** (`netguard.supervise_client`, `bot._runner`): any exit of `client.start()` — DNS failure at login,
+  ConnectionClosed, discord.py's reconnect giving up, a clean return — backs off 2 s → 60 s and starts again (closed client
+  `clear()`ed, its aiohttp connector reset); only `ops.STOP` (/restart, /mode, maintenance, repair-apply, Ctrl-C) ends it.
+  `reconnect=True` stays on.
+- **HealthGuard**: a disconnected gateway is no longer a restart condition (loop lag > 30 s still is). The v2.7.2 test
+  `test_self_restart_on_gateway_down_over_5_min` is replaced by `test_gateway_down_never_restarts_the_process`.
+- **Degraded**: the poll loop and guardian unchanged; entry asks journaled `ask_suppressed_network` and listed on the console
+  (`/console/state` → `network.suppressed_asks`), never auto-taken; registry flag `network_degraded_entries` (bool, default
+  off, loud when on) allows them. Trade cards go to `logs/card_queue.jsonl` (append-only, cap 500) and no blocking POST is
+  attempted while the webhook is down; the main loop retries every 30 s (independent of the gateway) and flushes with one
+  `BACK ONLINE · network · down N min · K cards queued` card followed by the queued cards in order (replaces NETWORK BACK).
+- **Push / console best-effort**: a push backend failing 5× in a row is paused 10 min with one PUSH PAUSED card; the uvicorn
+  thread restarts itself (5 s → 60 s); Telegram poll and dead-man ping failures are rate-limited logs.
+- **exit_reason**: `main.run()` wraps `main()`; every path out (normal stop, exception, SIGINT, SIGTERM/SIGBREAK, SystemExit,
+  and `ops.hard_exit`) journals `process_exit {reason, exc_type, where, uptime_s, positions_open}` and writes it into
+  `restart_marker.json` (restart requested) or `logs/exit_marker.json`. COLD START / BACK ONLINE cards show `last exit: …`.
+  `python main.py` exits 1 on any unplanned exit (0 planned, 75 restart). `ops.hard_exit` resolves `os._exit` at call time.
+- **Service-safe paths**: `config.validate` warns (BOOT CHECK, /env-check) when the repo or `log_dir` resolves under a
+  OneDrive / Dropbox / Google Drive / iCloud folder.
+- **DNS self-check** (`netguard.dns_check`, 5 s bound per host): discord.com, the ntfy host (api.ntfy.sh by default), the MT5
+  host (optional `AUREON_MT5_HOST`) — on the 4-hourly heartbeat card and on every degraded flip (NETWORK DEGRADED / RESTORED).
+- Tests: `tests/test_v2112_netguard.py` (the reproduction fails on v2.11.0 with `ops.hard_exit(75)`; unpatched it killed
+  pytest with exit 75). `.env.example`: no new required variables.
+- Strategy rules changed: NO
+
 ## v2.11.0 — 2026-10-15  (MINOR: notifications + console contract; no trading change)
 - **Part A — immediate Discord mentions** (`aureon_mt5/notify.py`): `EVENT_CLASS` by event prefix (trade / ops, default
   info); every `send` / `ask` / `card` resolves an event (`event=` kwarg, else the key's event segment, else an ops title) and a

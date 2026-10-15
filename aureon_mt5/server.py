@@ -108,7 +108,8 @@ def last_heartbeat(log_dir: str) -> tuple[str | None, float | None]:
         return None, None
 
 
-def cold_start(cfg, journal, notify, positions_by_symbol: dict, *, run=run_ps, now: float | None = None) -> dict:
+def cold_start(cfg, journal, notify, positions_by_symbol: dict, *, run=run_ps, now: float | None = None,
+               last_exit: dict | None = None) -> dict:
     """Card + journal on a boot with NO restart marker. positions_by_symbol: {sym: [live positions]} (after MT5 connect)."""
     now = _time.time() if now is None else now
     info = boot_info(run)
@@ -128,6 +129,9 @@ def cold_start(cfg, journal, notify, positions_by_symbol: dict, *, run=run_ps, n
                             "secured": st.get("secured"), "state": "re-adopted" if st else "new (no saved state)"})
     head = (f"rebooted {ist_hhmm(info['boot_time'])} · down {down_s // 60 if down_s is not None else '?'} min · reason: {reason}")
     lines = [head, f"last heartbeat: {hb_line or 'none'}"]
+    if last_exit:                                            # v2.11.2: logs/exit_marker.json from the previous process
+        from .netguard import last_exit_text
+        lines.append(last_exit_text(last_exit))
     if adopted:
         lines.append("positions across the gap: " + "; ".join(
             f"#{a['ticket']} {a['side']} SL {a['sl'] or '—'} secured {a['secured'] if a['secured'] is not None else '—'} ({a['state']})"
@@ -135,7 +139,8 @@ def cold_start(cfg, journal, notify, positions_by_symbol: dict, *, run=run_ps, n
     else:
         lines.append("no open positions across the gap")
     rec = {"boot_time": info["boot_time"].isoformat() if info["boot_time"] else None, "down_s": down_s,
-           "reason": reason, "last_heartbeat": hb_line, "positions": adopted}
+           "reason": reason, "last_heartbeat": hb_line, "positions": adopted,
+           "last_exit": (last_exit or {}).get("reason")}
     try:
         journal.log("cold_start", **rec)
     except Exception:
@@ -153,7 +158,11 @@ def down_text(marker: dict | None, now: float | None = None) -> str:
     now = _time.time() if now is None else now
     if not marker or not marker.get("t"):
         return "down ? s"
-    return f"down {int(max(0, now - float(marker['t'])))} s"
+    out = f"down {int(max(0, now - float(marker['t'])))} s"
+    if marker.get("exit"):                                   # v2.11.2: why the previous process ended
+        from .netguard import last_exit_text
+        out += " · " + last_exit_text(marker["exit"])
+    return out
 
 
 # ============================================================================= E2 MT5 before the bot

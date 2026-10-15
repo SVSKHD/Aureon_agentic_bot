@@ -108,14 +108,14 @@ def test_self_restart_on_loop_lag_over_30s_calls_exit_hook_once(tmp_path):
     assert ops.pop_restart_marker(str(tmp_path))["kind"] == "self-heal"
 
 
-def test_self_restart_on_gateway_down_over_5_min(tmp_path):
+def test_gateway_down_never_restarts_the_process(tmp_path):
+    """v2.11.2 (replaces the v2.7.2 'self-restart after 5 min gateway down'): on 2026-10-15 a DNS loss turned that rule
+    into exit 75 with no service to bring the bot back. A gateway that stays down is network state, never an exit."""
     g, mon, agents, ping, exit_hook, mono, wall = _setup(tmp_path)
     mon.gateway_down()
-    _advance(mon, mono, wall, 299); g.tick()
-    assert not exit_hook.called
-    _advance(mon, mono, wall, 2); g.tick(); g.tick()
-    exit_hook.assert_called_once_with(75)
-    assert "gateway" in g.journal.log.call_args.kwargs["reason"]
+    for _ in range(12):
+        _advance(mon, mono, wall, 300); g.tick()
+    assert not exit_hook.called and "gateway disconnected" in g.last_failures
 
 
 def test_gateway_flap_does_not_restart(tmp_path):
