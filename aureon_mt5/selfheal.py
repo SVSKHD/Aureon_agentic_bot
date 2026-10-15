@@ -82,6 +82,7 @@ class HealthGuard:
         self.last_ping: float | None = None
         self.last_heartbeat: float | None = None
         self.pings = 0
+        self.last_ping_ok: bool | None = None       # v2.10.1: network watch (None = no dead-man URL configured)
         self.in_stall = False
         self.stall_dumps: list[str] = []
         self.restarting = False
@@ -153,7 +154,9 @@ class HealthGuard:
                 telemetry.info(f"repair detector failed: {e!r}")
         if self.deadman_url and not fails and (self.last_ping is None or now - self.last_ping >= DEADMAN_EVERY_S):
             self.last_ping = now
-            if self.ping(self.deadman_url):
+            ok = bool(self.ping(self.deadman_url))
+            self.last_ping_ok = ok
+            if ok:
                 self.pings += 1
 
     def write_heartbeat(self, lag: float, fails: list[str]):

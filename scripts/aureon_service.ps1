@@ -59,6 +59,36 @@ function Rotate-Log {
     }
 }
 
+function Get-Mt5Path {
+    # v2.10.1: AUREON_MT5_PATH (environment or .env), else the path the bot cached from terminal_info() last run
+    $p = $env:AUREON_MT5_PATH
+    if (-not $p) {
+        $envFile = Join-Path $Root ".env"
+        if (Test-Path $envFile) {
+            $line = Get-Content $envFile | Where-Object { $_ -match '^\s*AUREON_MT5_PATH\s*=' } | Select-Object -First 1
+            if ($line) { $p = ($line -split '=', 2)[1].Trim().Trim('"') }
+        }
+    }
+    if (-not $p) {
+        $cache = Join-Path $Logs "mt5_path.txt"
+        if (Test-Path $cache) { $p = (Get-Content $cache -Raw).Trim() }
+    }
+    return $p
+}
+
+function Ensure-Mt5 {
+    # MT5 before the bot: start terminal64.exe when none is running for that path. The bot itself waits for
+    # MetaTrader5.initialize() (AUREON_MT5_BOOT_WAIT, 5 s → 30 s backoff) and exits 75 if it never comes up.
+    $path = Get-Mt5Path
+    if (-not $path -or -not (Test-Path $path)) { Write-SvcLog "MT5 path unknown (set AUREON_MT5_PATH) — not starting the terminal"; return }
+    $running = Get-Process terminal64 -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $path }
+    if (-not $running) {
+        Write-SvcLog "starting MT5: $path"
+        Start-Process -FilePath $path -WorkingDirectory (Split-Path $path) | Out-Null
+        Start-Sleep -Seconds 10
+    }
+}
+
 function Run-Loop {
     $attempt = 0
     $env:PYTHONUNBUFFERED = "1"
@@ -66,6 +96,7 @@ function Run-Loop {
     $env:AUREON_SUPERVISED = "1"
     while ($true) {
         Rotate-Log
+        Ensure-Mt5
         Write-SvcLog "starting: $Python main.py (cwd $Root)"
         $started = Get-Date
         # cmd.exe does the appending redirection; the hang check kills the whole tree

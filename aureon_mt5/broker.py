@@ -54,6 +54,14 @@ def connect() -> bool:
         return bool(_m)
 
 
+def reset():
+    """v2.10.1: forget a failed initialize() so connect() can retry (MT5 may still be starting after a reboot)."""
+    global _m
+    with _lock:
+        if not _m:
+            _m = None
+
+
 def mt5():
     return _m if connect() else None
 

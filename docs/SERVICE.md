@@ -72,3 +72,43 @@ then "🟢 Aureon back" when it is fresh again.
 - `logs/aureon.log` — `SELF-RESTART`, `discord gateway DOWN/UP … after N s`, `loop stall … stacks dumped`.
 - `logs/stall-*.txt` — stacks at the moment the loop lagged.
 - `.\scripts\aureon_service.ps1 -Action status` — service/task state + heartbeat age.
+
+## v2.10.1 — unattended operation: the box belongs to Aureon
+
+**Service account.** The service (NSSM *Log on* tab) or Scheduled Task must run as the **Windows user that owns the MT5
+terminal** — `MetaTrader5.initialize()` attaches to the terminal in that user's session. The Scheduled-Task variant only starts
+at logon, so **Windows auto-logon is required** for it to come back after a reboot (`aureon_server.ps1 -Action harden` sets it).
+
+**MT5 before the bot.** `aureon_service.ps1 -Action run` starts `terminal64.exe` before `python main.py` when none is running
+for `AUREON_MT5_PATH` (or the path the bot cached in `logs/mt5_path.txt` from `terminal_info()`). The bot then retries
+`MetaTrader5.initialize()` with 5 s → 30 s backoff for `AUREON_MT5_BOOT_WAIT` (300 s), posts **MT5 NOT UP** after 5 min and
+exits 75 if it never comes up (the launcher restarts it). While running, a terminal that is alive but disconnected for 60 s is
+restarted and login + symbols re-verified (**MT5 RESTARTED** card).
+
+**Harden once** (elevated PowerShell): `.\scripts\aureon_server.ps1 -Action plan` shows, `-Action harden` applies: Windows Update
+active hours over `AUREON_SERVER_ACTIVE_HOURS`, no auto-reboot with a logged-on user, auto-logon, sleep/hibernate/display-off off,
+High performance plan, `w32tm` resync at boot, Defender exclusions for MT5 and the repo. It prints what it changed and what it
+could not.
+
+**Maintenance window** (hourly check): only when **flat and outside the session** (05:30–23:00 IST, `AUREON_SESSION_IST`) — or a
+reboot pending ≥ `AUREON_SERVER_MAINT_FORCE_AFTER_H` (48 h), still flat:
+- pending Windows reboot → **MAINTENANCE · rebooting for Windows Update in 60 s**, marker `maintenance`, `shutdown /r /t 60`;
+  a position opening during the countdown aborts it (`shutdown /a`) and reschedules. Back up: **BACK ONLINE · maintenance reboot**.
+- code: `git` → origin/master, then the full suite; green → restart, red → stay on the old commit and skip that sha
+  (the old every-5-minutes auto-update now runs here).
+- housekeeping once a day: stall dumps / rotated service logs / replays older than `AUREON_LOG_KEEP_DAYS`, charts > 7 days
+  (never the journal, state, incidents or features); `pip install -r requirements.txt` when it changed.
+
+**Cold start.** A boot with no restart marker posts **COLD START**: boot time, last shutdown reason from the System log
+(1074 planned / Windows Update, 6006 clean, 6008 unexpected), minutes down since the last heartbeat, and the positions re-adopted
+across the gap. Every BACK ONLINE card now says `down X s`.
+
+**Clock and network.** Clock drift is checked at boot and every 6 h against time.windows.com; > 2 s → resync + **CLOCK DRIFT**.
+If Discord **and** the dead-man ping fail while MT5 still ticks, Aureon keeps polling and managing on the existing stops but opens
+no new trades; missed cards are summarised in one **NETWORK BACK** card. It never flattens on a network loss.
+
+**Remote access.** Use **Tailscale** for phone/device access to the box (and to the v2.11 console). Nothing listens on a public
+interface.
+
+**`/server`** shows uptime, last boot reason, pending updates + window, MT5 (pid, login, tick age), clock drift, disk, RAM, CPU,
+repo commit vs origin/master, the last three restarts and open incidents. **`/env-check`** shows what the guardian actually runs on.

@@ -29,3 +29,16 @@
   guardian functions in `aureon_mt5/agent.py` (`_guard*`, `_close`, `_move_sl`), `aureon_mt5/broker.py`, any `journeys.py`,
   `aureon_mt5/leg_guardian.py`, `aureon_mt5/setup.py`, `.env*`, `VERSIONING.md`, and the `VERSION` line. Strategy and
   guardian changes go through `tuning.propose` or a human.
+- `AUREON_REPAIR_AGENT=auto` (v2.10.1) may apply a *plumbing* patch by itself only when every guard holds: no forbidden path,
+  suite green in the worktree and on the live checkout, flat (no open or unverifiable position), outside the session (unless the
+  bot is already unhealthy: heartbeat / gateway / journal integrity), at most `AUREON_REPAIR_AUTO_PER_DAY`. It is verified after
+  `AUREON_REPAIR_VERIFY_S` of healthy running; otherwise it is reverted once, the incident goes to `needs_human` and that
+  fingerprint is never auto-applied again. Forbidden paths are never applied automatically under any setting.
+
+**Strategy-autonomy rule** (v2.10.1)
+- A strategy or guardian knob changes by itself only with evidence: `AUREON_TUNING_AUTO=shadow|apply` replays the proposal over
+  `AUREON_TUNING_REPLAY_DAYS` (more points AND fewer losing trades AND the regime sign-off where relevant AND the pins green), then
+  shadows it for `AUREON_TUNING_SHADOW_SESSIONS` sessions (every session must agree), then — `apply` only — sets it through the
+  feature registry with a STRATEGY CHANGE APPLIED card and `/veto`. At most `AUREON_TUNING_AUTO_PER_WEEK` per week.
+- Never automatic under any setting: lot size, loosening `pre_stop` / `SETUP_MAX_DD`, `claude_mode → manage`, `exit_losing`,
+  symbols, mode. Only feature-registry knobs can apply automatically; Guardian-dataclass values need a human.

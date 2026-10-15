@@ -206,6 +206,7 @@ HELP = {
         "unhalt": "Resume after a halt — exact confirmation phrase",
         "take": "Accept pending ask — user places order unless AUREON_EXECUTION=1",
         "skip": "Reject pending ask — user action",
+        "close": "Close the open position on a symbol now — same path as the phone's CLOSE (execution on)",
         "alert": "Arm price watch — user chooses price; bot monitors",
         "alerts": "Show armed watches — automatic",
         "alert-cancel": "Cancel one alert — user action",
@@ -224,6 +225,9 @@ HELP = {
         "feature-set": "Change a feature live — admin; non-hot ones refused with a position open unless force",
         "feature-reset": "Drop a Discord override (back to .env / default) — admin",
         "feature-help": "What a feature does, its range and current value — read-only",
+        "env-check": "What the guardian is actually running on + every config problem — read-only",
+        "server": "Uptime, boot reason, updates, MT5, clock, disk/RAM/CPU, repo, restarts, incidents — read-only",
+        "veto": "Revert an auto-applied strategy change instantly — admin",
     },
     "Repair": {
         "repairs": "Open incidents and proposed patches — read-only",
@@ -834,7 +838,7 @@ def execute_entry(cfg, agents, journal, item: dict, side: str, user, notify=None
                             _field("Time", f"{datetime.now(IST):%H:%M:%S} IST")]
             if n is not None:
                 n.send(f"alert:{sym}:{aid}:ORDER", f"{sym} · MT5 · ORDER PLACED · {side}", [f"alert {aid} · {lots_chosen:g} lots at market — the guardian takes it from here"],
-                       fields=order_fields, color=GREEN, footer=f"{ag.S.display_name if ag else cfg.mode} · alert {aid}")
+                       fields=order_fields, color=GREEN, footer=f"{ag.S.display_name if ag else cfg.mode} · alert {aid}", event="FILLED")
             line = f"TAKEN {side} {lots_chosen:g} lots{sugg_txt} · ticket {r.ticket or '—'} · filled {fill:.2f}" if fill is not None else f"TAKEN {side} {lots_chosen:g} lots{sugg_txt} · ticket {r.ticket or '—'}"
             if capped:
                 line += f" (capped at max {cfg.max_lots:g})"
@@ -1024,7 +1028,7 @@ def alert_preview(ag, a: dict, current: float | None) -> dict | None:
 
 
 def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_notify=None, claude=None, alerts=None, codex=None,
-            repair: dict | None = None):
+            repair: dict | None = None, actions=None):
     try:
         import discord  # type: ignore
         from discord import app_commands  # type: ignore
@@ -1042,6 +1046,9 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
         return respond(inter, name, work, notify=health_notify or notify, journal=journal, **kw)
 
     pending: dict[str, dict] = {}          # last asks by key, for /take /skip without buttons
+    from .actions import Actions, record_decision
+    if actions is None:                    # v2.11.0: the same take / skip / close / read path as the console and the phone
+        actions = Actions(cfg, agents, journal, notify, claude=claude, alerts=alerts)
 
     def _ask_embed(item):
         em = discord.Embed(title=item["title"][:256], description=item["description"][:4096], color=item.get("color") or BLUE,
@@ -1088,10 +1095,7 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
     notify.card_edit_hook = _card_edit
 
     def _decide(item, decision, user):
-        m = item.get("meta", {})
-        journal.log("decision", symbol=m.get("symbol"), mode=m.get("mode"), side=m.get("side"), signal_kind=m.get("kind"),
-                    price=m.get("price"), bar=m.get("bar"), decision=decision, by=str(user))
-        item["decided"] = decision
+        record_decision(journal, item, decision, user)
 
     class AskView(discord.ui.View):
         def __init__(self, item):
@@ -1150,6 +1154,8 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             self.item["fields"] = [f for f in (self.item.get("fields") or []) if f.get("name") != "Decision"] + \
                 [{"name": "Decision", "value": dec_value[:1024], "inline": False}]
             em = _ask_embed(self.item); em.color = dec_color
+            if notify.copies.get(self.item.get("key")):        # v2.11.0: the asks-channel copy gets the decision too
+                await in_pool(notify.mirror_edit, self.item.get("key"), {"Decision": dec_value[:1024]})
             try:
                 await self.item["message"].edit(embed=em, view=self)
             except Exception:
@@ -1185,7 +1191,12 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
                 view = AlertView(item) if (item.get("meta") or {}).get("kind") == "alert" else AskView(item)
                 if item.get("png") and os.path.exists(item["png"]):
                     fname = os.path.basename(item["png"]); em.set_image(url=f"attachment://{fname}"); files = [discord.File(item["png"], filename=fname)]
-                msg = await ch.send(embed=em, view=view, files=files)
+                extra = {}
+                if item.get("mention"):                       # v2.11.0: <@user> in content → a real phone notification
+                    extra = {"content": f"<@{item['mention']}>",
+                             "allowed_mentions": discord.AllowedMentions(everyone=False, roles=False,
+                                                                         users=[discord.Object(id=int(item["mention"]))])}
+                msg = await ch.send(embed=em, view=view, files=files, **extra)
                 item["message"] = msg; pending[item["key"]] = item
                 if (item.get("meta") or {}).get("kind") == "alert" and alerts is not None:      # v2.0.2: message id on the alert
                     try:                                          # v2.7.2: store lock + file write — off the loop
@@ -1263,6 +1274,8 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
                 [{"name": "Decision", "value": dec_value, "inline": False}]
             em = _ask_embed(self.item)
             em.color = GREEN if (side != "SKIP" and r.get("ok")) else RED if (side != "SKIP" and not r.get("ok")) else GREY
+            if notify.copies.get(self.item.get("key")):        # v2.11.0: asks-channel copy
+                await in_pool(notify.mirror_edit, self.item.get("key"), {"Decision": dec_value})
             try:
                 await self.item["message"].edit(embed=em, view=self)
             except Exception:
@@ -1282,32 +1295,33 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
                 except Exception:
                     pass
 
-    def _latest_open():
-        return next((i for i in reversed(list(pending.values())) if not i.get("decided")), None)
-
     @tree.command(name="take", description="Accept pending ask; places order when AUREON_EXECUTION=1, else arms guardian")
     @app_commands.describe(lots="Lot size (from AUREON_LOT_BUTTONS); omit to use the card's suggested size")
     async def take_cmd(inter: discord.Interaction, lots: float | None = None):
         user = inter.user
         def work():
-            item = _latest_open()
-            if not item:
-                return Reply(content="no open trade question")
-            r = ask_decision(cfg, agents, journal, item, "TAKE", user, notify, lots=lots)
-            notify.edit_card(item.get("key"), {"Decision": f"✅ **{r['line']}** · {user.display_name if hasattr(user, 'display_name') else user} · {datetime.now(IST):%H:%M} IST — {r['text']}"[:1024]})
-            return Reply(content=f"✅ {r['line']} — {r['text']}")
+            r = actions.take(lots=lots, user=user.display_name if hasattr(user, "display_name") else user)
+            return Reply(content=("✅ " if r["ok"] else "⛔ ") + r["text"])
         await run(inter, "take", work)
 
     @tree.command(name="skip", description="Skip pending ask; records operator decision")
     async def skip_cmd(inter: discord.Interaction):
         user = inter.user
         def work():
-            item = _latest_open()
-            if not item:
-                return Reply(content="no open trade question")
-            _decide(item, "SKIP", user)
-            return Reply(content=f"⏭ skipped {item['meta'].get('side')} {item['meta'].get('symbol')}")
+            r = actions.skip(user=user)
+            return Reply(content=r["text"] if r["ok"] else "⛔ " + r["text"])
         await run(inter, "skip", work)
+
+    @tree.command(name="close", description="Close the open position on a symbol now (execution on) — same path as the phone")
+    @app_commands.describe(symbol="XAUUSD or XAGUSD (default: primary)")
+    async def close_cmd(inter: discord.Interaction, symbol: str = ""):
+        user = inter.user
+        def work():
+            r = actions.close(symbol or None, user=user)
+            if r["ok"]:
+                notify.card("✋ CLOSED BY COMMAND", r["text"], footer=f"by {user} · {datetime.now(IST):%H:%M} IST")
+            return Reply(content=("✅ " if r["ok"] else "⛔ ") + r["text"])
+        await run(inter, "close", work)
 
     @tree.command(name="override", description="Override a missed setup — places the order at the current price")
     @app_commands.describe(symbol="Symbol (default: first)", lots="Lot size")
@@ -1941,6 +1955,35 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
         user = inter.user
         await run(inter, "feature-reset", lambda: Reply(content=feature_set_action(cfg, agents, journal, notify, claude, user, name,
                                                                                     "", force, reset=True)))
+
+    @tree.command(name="server", description="The box: uptime, boot reason, updates, MT5, clock, resources, repo, restarts")
+    async def server_cmd(inter: discord.Interaction):
+        def work():
+            from . import server as srv
+            c = srv.server_card(cfg, agents, journal, started=started_at, broker=broker)
+            return Reply(card=_embed(c["title"], f"v{VERSION}", fields=c["fields"]))
+        await run(inter, "server", work, timeout=40)
+
+    @tree.command(name="veto", description="Admin: revert an auto-applied strategy change (STRATEGY CHANGE APPLIED card id)")
+    @app_commands.describe(id="the id on the STRATEGY CHANGE APPLIED card")
+    async def veto_cmd(inter: discord.Interaction, id: int):
+        user = inter.user
+        def work():
+            from . import ops
+            from .tuning_auto import TuningAuto
+            if not ops.admin_allowed(user, os.environ.get("AUREON_ADMIN_ROLE_ID", "")):
+                return Reply(content="Denied: configured administrator role required")
+            return Reply(content=TuningAuto(cfg, journal, notify, replay=lambda *a: None, pins=lambda: True,
+                                            advisors=[claude] if claude is not None else []).veto(id, str(user)))
+        await run(inter, "veto", work)
+
+    @tree.command(name="env-check", description="What the guardian is running on (env + Discord overrides) and every config problem")
+    async def env_check_cmd(inter: discord.Interaction):
+        def work():
+            from . import features
+            from .config import env_check_table
+            return Reply(content=env_check_table(cfg, features.load_overrides(cfg.log_dir))[:1900])
+        await run(inter, "env-check", work)
 
     @tree.command(name="feature-help", description="What a feature does, its range and its current value")
     @app_commands.describe(name="feature name")

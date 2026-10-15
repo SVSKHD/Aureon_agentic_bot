@@ -1,4 +1,4 @@
-# Aureon MT5 v2.10.0
+# Aureon MT5 v2.11.0
 
 You place the trade. Aureon detects (per selected EMA mode), fires a Discord gunshot, then manages what you placed:
 protect → secure +10 → ride in +5 steps → close on the fast-EMA turn → news safeguard. Reports and slash commands.
@@ -23,6 +23,56 @@ protected (SL never loosened) but receive no strategy rules; a `⚠️ MODE MISM
 Production: run it under the supervisor (auto-restart, hang kill, boot start) — **[docs/SERVICE.md](docs/SERVICE.md)**:
 
     powershell -ExecutionPolicy Bypass -File .\scripts\aureon_service.ps1 -Action install
+
+## v2.11.0 — notifications that arrive when the trade does
+
+Nothing about trading changes. A card that matters now reaches the phone as a notification, and the phone can answer it.
+
+**1 · Discord, set up so it actually pings** (no extra service):
+- `AUREON_DISCORD_USER_ID` = your user id (Settings → Advanced → Developer Mode, then right-click yourself → *Copy User ID*).
+  Trade cards (`AUREON_DISCORD_MENTION_EVENTS`, default `ASK,FILLED,CLOSED,STOP`) carry `<@you>`, so the phone notifies
+  even when the channel is muted for everything else. Only you can be pinged (`allowed_mentions`).
+- Optional `AUREON_DISCORD_ASKS_WEBHOOK`: make a `#aureon-asks` channel, give it a webhook, and set the channel to
+  **All messages** on the phone (long-press the channel → Notification settings). It gets only trade cards; TAKE / SKIP and
+  Claude's verdict are mirrored into that copy too.
+- Phone **Focus / Do Not Disturb**: add Discord (or the push app below) to the allowed apps. Otherwise iOS/Android hold it.
+
+**2 · Phone push with buttons** (`AUREON_PUSH=ntfy|pushover|telegram`, comma list):
+- **ntfy** (free, recommended): install the ntfy app, subscribe to a long random topic, put it in `AUREON_NTFY_TOPIC`.
+  An ask arrives as an *urgent* notification with **TAKE · SKIP · READ** buttons; a fill as *high*; a close or stop as
+  *normal* (a stop losing more than `AUREON_PUSH_LOSS_ALERT_PTS` is *urgent*). `AUREON_PUSH_IMAGES=1` attaches the chart.
+- **Pushover**: `AUREON_PUSHOVER_TOKEN` / `USER`; asks are emergency priority (repeats every 30 s for 10 min until seen).
+- **Telegram**: `AUREON_TELEGRAM_TOKEN` / `CHAT`; buttons under the message, answered by a long-poll thread.
+
+**3 · The buttons need the console** (`docs/CONSOLE.md`): set `AUREON_CONSOLE_TOKEN` (32+ chars). It listens on
+`127.0.0.1:8787` only. Install **Tailscale** on the box and the phone, run `tailscale serve --bg 8787` on the box, and put
+the `https://<box>.<tailnet>.ts.net` address in `AUREON_CONSOLE_URL`. Each button carries a one-time token for that one
+action on that one ask, so the push service never sees the console token. A TAKE from the phone is refused exactly when
+`/take` would be, and also when the ask is stale or the regime gate blocks it. The reason comes back on the phone.
+
+**New command:** `/close [symbol]`, the same close path the phone's CLOSE uses. `/features` lists `push`, `push_images` and
+`mention_events` (all hot; switching push on posts a FEATURE CHANGED card). `/env-check` flags a non-numeric user id, a
+short token, a public bind and a backend with missing credentials.
+
+## v2.10.1 — unattended operation; the box belongs to Aureon
+The operator is often not at the server. Details and setup: [docs/SERVICE.md](docs/SERVICE.md#v2101--unattended-operation-the-box-belongs-to-aureon).
+- **Cold start**: a boot without a restart marker posts **COLD START** (boot time, last shutdown reason from the System log,
+  minutes down, positions re-adopted). Every BACK ONLINE card says `down X s`.
+- **MT5 before the bot**: the launcher starts `terminal64.exe` first; the bot waits for it (5 s → 30 s backoff,
+  `AUREON_MT5_BOOT_WAIT`), posts **MT5 NOT UP** after 5 min, exits 75 if it never comes up; a hung terminal is restarted.
+- **Env check**: `config.validate()` — unparsable numbers, values outside the feature registry's ranges, Discord plumbing,
+  contradictions (`EXIT_LOSING` without manage, `SETUP_MAX_DD` < `pre_stop`, regime thresholds out of order). Guardian
+  problems fall back to the safe default and post **BOOT CHECK**; `/env-check` shows what the guardian runs on.
+- **Repair agent `auto`**: plumbing fixes apply themselves only when flat, outside the session, suite green twice, ≤ 2/day;
+  **REPAIR AUTO-APPLY** → **REPAIR VERIFIED** after 10 min healthy, or **REPAIR ROLLED BACK** (once) and `needs_human`.
+- **Maintenance window** (flat + outside the session): Windows reboots (60 s countdown, aborted if a position opens), code updates
+  with the suite (the old 5-minute auto-update moved here), log rotation, pip. `aureon_server.ps1 -Action harden` sets the OS up.
+- **Clock / network**: drift > 2 s → resync + card; Discord and dead-man down while MT5 ticks → no new entries, guardian
+  untouched, one NETWORK BACK summary on reconnect. **`/server`** shows the box.
+- **Evidence-gated strategy autonomy** (`AUREON_TUNING_AUTO=off|shadow|apply`, default off): a proposal must win the replay
+  (more points AND fewer losing trades AND pins green), then shadow 3 sessions, then — apply only — it is set through the registry
+  with **STRATEGY CHANGE APPLIED** and `/veto <id>`. Never automatic: lot size, loosening stops, claude manage, exit_losing,
+  symbols, mode.
 
 ## v2.10.0 — live toggles, full /commands, gated self-repair, zero-lag context, regime gate
 Nothing here changes a trade by default; `tests/test_strategy_pins.py` pins the strategy and the guardian at defaults.

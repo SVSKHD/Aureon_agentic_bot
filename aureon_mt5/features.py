@@ -12,6 +12,8 @@ import time as _time
 from dataclasses import dataclass, field
 
 IMAGE_EVENT_CHOICES = ("P", "CROSS", "RE", "ENTER", "ALERT", "READ")
+MENTION_EVENT_CHOICES = ("ASK", "FILLED", "CLOSED", "STOP", "FLIP_HOLD", "POSITION_ASK", "CLOSED_BY_YOU")
+PUSH_CHOICES = ("NTFY", "PUSHOVER", "TELEGRAM")
 TRUE_WORDS = ("1", "true", "on", "yes", "y")
 FALSE_WORDS = ("0", "false", "off", "no", "n")
 
@@ -72,9 +74,10 @@ def registry() -> list[Feature]:
         Feature("daily_plan", "AUREON_DAILY_PLAN", "bool", True, "daily_plan", "plan", "post the daily plan card"),
         # ---- repair
         Feature("repair_agent", "AUREON_REPAIR_AGENT", "enum", "off", "repair_agent", "repair",
-                "incidents: off = detect + card only · propose = draft a tested patch on a branch (a human applies it)",
-                choices=("off", "propose"), loud=True, loud_values=("propose",),
-                consequence="new incidents now start a repair proposal (patch + card; nothing is applied without /repair-apply)"),
+                "incidents: off = card only · propose = tested patch on a branch · auto = propose, then apply plumbing fixes "
+                "when every guard holds (flat, outside session, suite green, daily cap)",
+                choices=("off", "propose", "auto"), loud=True, loud_values=("propose", "auto"),
+                consequence="incidents now get a repair proposal; with auto, plumbing fixes apply themselves when every guard holds"),
         # ---- context
         Feature("zl_context", "AUREON_ZL_CONTEXT", "bool", False, "zl_context", "context",
                 "zero-lag EMAs, HMA, ADX, KAMA, VWAP in the Claude snapshot and the chart (no rule change)"),
@@ -93,6 +96,26 @@ def registry() -> list[Feature]:
                 "consecutive clean bars needed to leave CHOPPY", min=1, max=30),
         Feature("no_trade_day_frac", "AUREON_NO_TRADE_DAY_FRAC", "float", 0.6, "no_trade_day_frac", "regime",
                 "NO-TRADE DAY card once CHOPPY/DEAD covered this share of the session (after NY open)", min=0.1, max=1.0),
+        # ---- server (v2.10.1)
+        Feature("tuning_auto", "AUREON_TUNING_AUTO", "enum", "off", "tuning_auto", "server",
+                "strategy proposals: off · shadow (replay + graded shadow sessions, nothing applied) · apply (after a clean "
+                "shadow, applied with /veto)", choices=("off", "shadow", "apply"), loud=True, loud_values=("apply",),
+                consequence="evidence-gated strategy changes may now apply themselves (replay + shadow; /veto reverts)"),
+        Feature("maint_force_after_h", "AUREON_SERVER_MAINT_FORCE_AFTER_H", "float", 48.0, "maint_force_after_h", "server",
+                "a pending Windows reboot may happen inside the session after this many hours (still only when flat)",
+                min=1.0, max=720.0, unit="h"),
+        Feature("log_keep_days", "AUREON_LOG_KEEP_DAYS", "float", 30.0, "log_keep_days", "server",
+                "rotated logs / stall dumps / replays older than this are deleted in the maintenance window", min=1.0, max=365.0),
+        # ---- notify (v2.11.0) — presentation only, never a trade
+        Feature("mention_events", "AUREON_DISCORD_MENTION_EVENTS", "enum-set", ("ASK", "FILLED", "CLOSED", "STOP"),
+                "discord_mention_events", "notify",
+                "trade-class events that @mention AUREON_DISCORD_USER_ID (and go to the asks channel)", choices=MENTION_EVENT_CHOICES),
+        Feature("push", "AUREON_PUSH", "enum-set", (), "push", "notify",
+                "phone push backends (none = off): ntfy · pushover · telegram — asks get TAKE / SKIP / READ actions",
+                choices=PUSH_CHOICES, loud=True, extra={"loud_when_on": True},
+                consequence="trade asks now reach the phone with TAKE / SKIP / READ actions ({push})"),
+        Feature("push_images", "AUREON_PUSH_IMAGES", "bool", False, "push_images", "notify",
+                "attach the chart PNG to pushes (ntfy upload / pushover attachment)"),
     ]
 
 
@@ -137,7 +160,7 @@ def parse(f: Feature, raw):
         out = []
         for x in items:
             x = str(x).strip().upper()
-            if not x or x in ("NONE", "-"):
+            if not x or x in ("NONE", "-", "OFF"):
                 continue
             if x not in f.choices:
                 raise ValueError(f"{f.name}: {x} not in {','.join(f.choices)}")
@@ -276,6 +299,8 @@ def clear_override(log_dir: str, cfg, name: str, who: str = "", advisors=(), env
 
 
 def is_loud(f: Feature, new) -> bool:
+    if f.extra.get("loud_when_on"):
+        return f.loud and bool(new)
     return f.loud and (not f.loud_values or new in f.loud_values)
 
 

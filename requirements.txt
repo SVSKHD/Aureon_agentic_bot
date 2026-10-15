@@ -6,3 +6,5 @@ pyfiglet
 discord.py
 python_dotenv
 MetaTrader5 ; platform_system == "Windows"
+fastapi
+uvicorn

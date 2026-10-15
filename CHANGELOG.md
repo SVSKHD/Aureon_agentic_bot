@@ -2,6 +2,71 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.11.0 — 2026-10-15  (MINOR: notifications + console contract; no trading change)
+- **Part A — immediate Discord mentions** (`aureon_mt5/notify.py`): `EVENT_CLASS` by event prefix (trade / ops, default
+  info); every `send` / `ask` / `card` resolves an event (`event=` kwarg, else the key's event segment, else an ops title) and a
+  class (`klass=` overrides). Trade events in `AUREON_DISCORD_MENTION_EVENTS` (default `ASK,FILLED,CLOSED,STOP`, registry
+  enum-set, hot) carry `<@AUREON_DISCORD_USER_ID>` in `content` with `allowed_mentions: {"users": [id]}` (webhook and bot-posted
+  asks). `AUREON_DISCORD_ASKS_WEBHOOK`: trade-class copies posted with `?wait=true`; `edit_card` / button decisions PATCH every
+  tracked copy (`Notifier.mirror_edit`). Events tagged at the source: ORDER PLACED → FILLED; guardian closes and broker-side
+  closes → CLOSED / STOP with points; SHOULD WE CLOSE? → POSITION_ASK. With the new variables unset the payloads are
+  byte-identical to v2.10.1 (tested).
+- **Part B — push layer** (`aureon_mt5/push.py`): `Push.send(PushEvent)`; backends `AUREON_PUSH=off|ntfy|pushover|telegram`
+  on a 3-worker pool, 10 s timeout, failures journaled (`push_failed`), never raised; one push per dedupe key, also when the
+  Discord post failed. Mapping: ASK → urgent + TAKE/SKIP/READ · FILLED → high · CLOSED/STOP → normal (STOP worse than
+  `AUREON_PUSH_LOSS_ALERT_PTS` → urgent) · FLIP_HOLD → high + READ · POSITION_ASK → high + CLOSE/READ · MAINTENANCE /
+  COLD START / MT5 NOT UP / REPAIR AUTO-APPLY → high · Claude READ verdict → high. ntfy JSON publish (PUT upload with
+  `AUREON_PUSH_IMAGES=1`, RFC 2047 headers), Pushover (urgent = priority 2, retry 30, expire 600), Telegram (`telegram_send`
+  from `scripts/deadman_fallback.py` gains `reply_markup`; inline keyboard; `getUpdates` long-poll 25 s → console actions,
+  configured chat only).
+- **Scoped action tokens**: push buttons carry `act.<payload>.<sig>` (HMAC-SHA256 keyed by the console token), valid only for
+  that action, symbol and ask key, until the ask expires, once. The console token is never sent to ntfy / Pushover / Telegram.
+- **Console** (`aureon_mt5/console.py`, `docs/CONSOLE.md`, contract v1): FastAPI on its own uvicorn thread, started with the
+  bot; `AUREON_CONSOLE_BIND=127.0.0.1:8787`, non-loopback refused without `AUREON_CONSOLE_ALLOW_PUBLIC=1` (flagged loudly);
+  Bearer `AUREON_CONSOLE_TOKEN` (32+ chars, constant-time compare) or a scoped token; 20 req/min per client; every call
+  journaled `console_call` with `source="push"`. `POST /console/action` (take / skip / close / read), `GET /console/state`
+  (`{"v": 1, …}`), `GET /console/chart/<key>.png` (only `logs/charts/`). Never imports `broker`.
+- **Shared actions** (`aureon_mt5/actions.py`): `/take`, `/skip`, the new **`/close`**, the console and Telegram use one path;
+  console refusals: no open ask, already answered, stale (> `AUREON_ASK_TTL_MIN`), regime gate (with reasons), alert without a
+  side, plus everything `execute_entry` refuses. `halt.close_all_positions` gains `comment=`.
+- Config: `AUREON_DISCORD_USER_ID`, `AUREON_DISCORD_ASKS_WEBHOOK`, `AUREON_DISCORD_MENTION_EVENTS`, `AUREON_PUSH`,
+  `AUREON_PUSH_IMAGES`, `AUREON_PUSH_LOSS_ALERT_PTS`, `AUREON_NTFY_URL/TOPIC/TOKEN`, `AUREON_PUSHOVER_TOKEN/USER`,
+  `AUREON_TELEGRAM_TOKEN/CHAT`, `AUREON_CONSOLE_BIND/TOKEN/ALLOW_PUBLIC/URL`; `validate()` rules for all of them (BOOT CHECK
+  applies the `notify` group's fallbacks). Registry group `notify`: `mention_events`, `push` (loud when switched on),
+  `push_images`. `requirements.txt`: fastapi, uvicorn (imported only when the console is on).
+- Tests: `test_v2110_notify.py`, `test_v2110_push.py`, `test_v2110_console.py`.
+- Strategy rules changed: NO
+
+## v2.10.1 — 2026-10-15  (operations: unattended operation + server ownership; defaults unchanged for trades)
+Parts E and F of the v2.10.0 brief (v2.10.0 shipped A–D). New tooling and commands, so MINOR-sized; numbered 2.10.1 to keep
+the v2.11.0 number for the notifications release.
+- **E1 cold start** (`aureon_mt5/server.py`): boot without a marker → **COLD START** card + journal `cold_start` (Windows boot
+  time, last 1074/6006/6008 event and its reason, minutes down since the last heartbeat, positions re-adopted from
+  guardian_state). BACK ONLINE cards: `down X s` (marker time); new marker kinds `maintenance`, `repair-auto`, `repair-rollback`.
+- **E2 MT5 before the bot**: `aureon_service.ps1` starts `terminal64.exe` (`AUREON_MT5_PATH` / `logs/mt5_path.txt`);
+  `server.connect_mt5` retries 5 s → 30 s for `AUREON_MT5_BOOT_WAIT`, **MT5 NOT UP** after 5 min, exit 75; `broker.reset()`.
+- **E3 env check**: every numeric `Config` field parses through `_num` (an unparsable value no longer crashes the import: default
+  + recorded); `config.validate()` / `apply_fallbacks()` / `env_check_table()`; **BOOT CHECK** card; `/env-check`.
+- **E4 repair `auto`**: `repair.maybe_auto_apply` (guards: clean patch, flat, outside session unless the bot is unhealthy,
+  daily cap `AUREON_REPAIR_AUTO_PER_DAY`, fingerprint not rolled back before) → **REPAIR AUTO-APPLY** → `repair.Verifier` on the
+  new process → **REPAIR VERIFIED** after `AUREON_REPAIR_VERIFY_S`, or `git revert` + restart once → **REPAIR ROLLED BACK**,
+  `needs_human`, fingerprint blocked from auto.
+- **F1 maintenance** (`server.Maintenance`, `scripts/aureon_server.ps1 -Action plan|harden`): hourly pending-reboot check;
+  reboot / code update (+ suite; red → stay on the old commit) / housekeeping only flat and outside the session (or pending ≥
+  `AUREON_SERVER_MAINT_FORCE_AFTER_H`, flat); 60 s countdown aborted by a new position; `rotate_logs` never touches the journal or
+  state; pip on a changed requirements.txt. **The 5-minute auto-update moved into this window.**
+- **F2** `server.Mt5Manager`: disconnected 60 s → restart terminal, verify login + symbols. **F3** `check_clock` (boot + 6 h,
+  > 2 s → resync + card); `NetworkWatch` → `network_degraded` blocks new entries (guardian unchanged, tested); Notifier backlog →
+  one **NETWORK BACK** card. **F4** `/server`; heartbeat card line `disk · drift · updates pending · MT5 age`.
+- **F5** `aureon_mt5/tuning_auto.py` (`AUREON_TUNING_AUTO=off|shadow|apply`): replay gate (points ↑, losing trades ↓, regime
+  sign-off, pins) → shadow sessions (each must agree) → apply through the registry (weekly cap) with **STRATEGY CHANGE
+  APPLIED** + `/veto`; never-list. `tuning.propose` accepts guardian/regime registry features (registry range).
+- Registry: `repair_agent` gains `auto`; group `server`: `tuning_auto`, `maint_force_after_h`, `log_keep_days`.
+- Known gap (unchanged, pre-existing): `logs/overrides.json` written by `/approve` is shown by `/tuning` but not read by the
+  guardian, so only registry knobs can change automatically.
+- Tests: `test_v2101_unattended.py`, `test_v2101_server.py` (all OS calls through a faked `run_ps`).
+- Strategy rules changed: NO — pins test unchanged and green
+
 ## v2.10.0 — 2026-10-15  (MINOR: operations + context; defaults unchanged)
 Built on v2.8.0 — there is no v2.9.0: the "v2.9.0" pieces this release builds on (structure-gated flip, giveback,
 `_flip_evidence`, `request_flip_read`, the 15-Oct fixture) shipped in v2.8.0.

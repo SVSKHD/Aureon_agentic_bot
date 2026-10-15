@@ -101,7 +101,7 @@ def cli_pins_mode(argv, symbols=None):
 
 
 def restart_process(agents, journal, notify, user, reason="", mode=None, symbols=None, argv=None, exit_hook=None,
-                    log_dir="logs", update=None):
+                    log_dir="logs", update=None, marker_kind="manual"):
     """Only after permission/position gates passed by the invoking command.
     Brings the checkout to origin/master first (same rules as auto-update); a failed update aborts the restart
     before any agent is stopped, so the current build keeps running.
@@ -132,6 +132,6 @@ def restart_process(agents, journal, notify, user, reason="", mode=None, symbols
         ag.stop()
     for ag in list(agents.values()):
         ag.join(timeout=5)
-    write_restart_marker(log_dir, "manual", reason)
+    write_restart_marker(log_dir, marker_kind, reason)
     (exit_hook or hard_exit)(EXIT_RESTART)
     return True
