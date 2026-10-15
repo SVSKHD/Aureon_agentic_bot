@@ -21,3 +21,15 @@ def _patched_init_280(self, *a, **kw):
     self.claude_open_read = False
 
 _cfg.Config.__init__ = _patched_init_280
+
+
+# v2.11.2: network state (netguard) and the planned-stop flag are process-wide — every test starts healthy and running.
+import pytest as _pytest
+
+
+@_pytest.fixture(autouse=True)
+def _netguard_reset():
+    from aureon_mt5 import netguard, ops
+    netguard.reset(); ops.STOP.clear()
+    yield
+    netguard.reset(); ops.STOP.clear()

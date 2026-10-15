@@ -166,11 +166,14 @@ class Notifier:
         self.open_asks: dict[str, dict] = {}                 # v2.11.0: open trade questions by key (bot, webhook, console share them)
         self.copies: dict[str, list] = {}               # v2.11.0: key → [[webhook, message_id, embed]] webhook copies to edit
         self._tl = threading.local()
+        self.queue = None                               # v2.11.2: netguard.CardQueue once configure() ran
 
     def configure(self, cfg, push=None) -> "Notifier":
         """v2.11.0: give the notifier the config (mention user, mention events, asks webhook) and the push layer."""
         self.cfg = cfg
         self.push = push
+        from .netguard import CardQueue                 # v2.11.2: trade cards survive a network loss (logs/card_queue.jsonl)
+        self.queue = CardQueue(os.path.join(getattr(cfg, "log_dir", "logs") or "logs", "card_queue.jsonl"))
         return self
 
     # ------------------------------------------------------------------ v2.11.0 event context
@@ -340,13 +343,17 @@ class Notifier:
             if self.attempts.get(key, 0) == 0:
                 print(f"\n[{stamp}] " + self._console(title, lines, fields), flush=True)
                 self.recent = (self.recent + [f"{stamp} {title}"])[-50:]
-            self._set_ctx({"mention": mention, "track": fan, "key": key} if (mention or fan) else None)
-            try:
-                ok = self.raw(body, png, embed=embed)
-            except TypeError:                       # subclasses with the old raw(body, png) signature
-                ok = self.raw(body, png)
-            finally:
-                self._set_ctx(None)
+            from . import netguard
+            skip = bool(self.webhook) and netguard.webhook_down()     # v2.11.2: no blocking POST while the network is down
+            ok = False
+            if not skip:
+                self._set_ctx({"mention": mention, "track": fan, "key": key} if (mention or fan) else None)
+                try:
+                    ok = self.raw(body, png, embed=embed)
+                except TypeError:                       # subclasses with the old raw(body, png) signature
+                    ok = self.raw(body, png)
+                finally:
+                    self._set_ctx(None)
             if ok:
                 self.sent.add(key); self.attempts.pop(key, None)
                 if len(self.sent) > 20000:
@@ -357,6 +364,12 @@ class Notifier:
                 return True
             if self.attempts.get(key, 0) == 0:          # Discord down: the phone still hears it (push dedupes per key)
                 self._push_after(key, title, lines, fields, png, sym, ev, k, points=points, meta=meta)
+            if k == "trade" and self.queue is not None and self.webhook:    # v2.11.2: queued, flushed in order on reconnect
+                self.queue.append({"t": _time.time(), "key": key, "title": title, "body": body, "embed": embed, "png": png})
+                self.sent.add(key); self.attempts.pop(key, None)
+                return False
+            if skip:
+                self._note_missed(embed, body)
             self.attempts[key] = self.attempts.get(key, 0) + 1
             if self.attempts[key] >= MAX_ATTEMPTS:
                 print(f"  (giving up on Discord delivery of {key} after {MAX_ATTEMPTS} attempts)")
@@ -404,6 +417,11 @@ class Notifier:
              footer: str | None = None, png: str | None = None, event: str | None = None, klass: str | None = None) -> bool:
         embed = self.make_embed(title, description, fields=fields, color=color, footer=footer, png=png)
         console = self._console(title, [description] if description else [], fields)
+        from . import netguard
+        if self.webhook and netguard.webhook_down():          # v2.11.2: no blocking POST while the network is down
+            print("\n" + console, flush=True)
+            self._note_missed(embed, console)
+            return False
         try:
             ok = self.raw(console, png, embed=embed)
         except TypeError:
@@ -440,29 +458,78 @@ class Notifier:
                 self._remember_copy(ctx.get("key"), self.webhook, r, embed)
             self.posts += int(ok); self.failures += int(not ok)
             if not ok:
-                print(f"  (discord post failed: HTTP {r.status_code} {r.text[:120]})")
+                _rlog("discord-post", f"discord post failed: HTTP {r.status_code} {r.text[:120]}")
             self._track(ok, embed, body)
             return ok
-        except Exception as e:
+        except Exception as e:                       # DNS, timeout, proxy, TLS — never escapes (v2.11.2)
             self.failures += 1
-            print("  (discord post failed:", e, ")")
+            _rlog("discord-post", f"discord post failed: {type(e).__name__}: {str(e)[:200]} — cards queue until it is back")
             self._track(False, embed, body)
             return False
 
+    def _note_missed(self, embed, body):
+        lines = (body or "").splitlines()
+        t = (embed or {}).get("title") or (lines[0] if lines else "?")
+        self.backlog = (self.backlog + [str(t)[:120]])[-200:]
+
     def _track(self, ok: bool, embed, body):
-        """v2.10.1: remember what failed; on the first success after failures post ONE summary card of the backlog."""
+        """v2.10.1: remember what failed. v2.11.2: the webhook streak feeds netguard; the first success after failures
+        flushes (summary card first, then the queued trade cards in order)."""
+        from . import netguard
         self.last_ok = ok
+        netguard.webhook_result(ok)
         if not ok:
-            self.backlog = (self.backlog + [((embed or {}).get("title") or (body or "").splitlines()[0])[:120]])[-200:]
+            self._note_missed(embed, body)
             return
-        if self.backlog and not getattr(self, "_flushing", False):
-            missed, self.backlog = self.backlog, []
+        if not getattr(self, "_flushing", False) and (self.backlog or (self.queue is not None and len(self.queue))):
+            self.flush()
+
+    def flush(self) -> dict:
+        """v2.11.2 (main loop, every 30 s, independent of the gateway; and on the first success): while the webhook is down
+        or anything is pending, post ONE summary card `BACK ONLINE · network · down N min · K cards queued`, then the
+        queued trade cards in order. Stops at the first failure and keeps the rest. Never raises."""
+        from . import netguard
+        if getattr(self, "_flushing", False) or not self.webhook:
+            return {}
+        try:
+            q = self.queue.items() if self.queue is not None else []
+            if not (q or self.backlog or netguard.webhook_down()):
+                return {}
+            since = netguard.STATE.get("webhook_down_since") or (q[0].get("t") if q else None)
+            mins = max(0, round((_time.time() - since) / 60)) if since else 0
+            missed = [t for t in self.backlog if t]
+            desc = (f"{len(missed)} other card(s) could not be posted:\n" + "\n".join(f"• {t}" for t in missed[-25:])) if missed else \
+                "nothing else was missed"
+            title = f"AUREON · MT5 · BACK ONLINE · network · down {mins} min · {len(q)} cards queued"
             self._flushing = True
             try:
-                self.raw("", embed=self.make_embed("AUREON · MT5 · NETWORK BACK",
-                                                   f"{len(missed)} card(s) could not be posted while offline:\n" + "\n".join(f"• {t}" for t in missed[-25:])))
+                if not self.raw("", embed=self.make_embed(title, desc, color=GREY)):
+                    return {"ok": False, "queued": len(q)}
+                self.backlog = []
+                for i, it in enumerate(q):
+                    try:
+                        ok = self.raw(it.get("body", ""), it.get("png"), embed=it.get("embed"))
+                    except TypeError:
+                        ok = self.raw(it.get("body", ""), it.get("png"))
+                    if not ok:
+                        self.queue.replace(q[i:])
+                        return {"ok": False, "sent": i, "queued": len(q) - i}
+                if self.queue is not None:
+                    self.queue.replace([])
+                return {"ok": True, "sent": len(q), "title": title}
             finally:
                 self._flushing = False
+        except Exception as e:
+            _rlog("flush", f"card queue flush failed: {e!r}")
+            return {"ok": False}
+
+
+def _rlog(key, msg):
+    try:
+        from .netguard import rlog
+        rlog(key, msg)
+    except Exception:
+        print(f"  ({msg})")
 
 
 # --------------------------------------------------------------------------- v1.11.0 COMPARE card

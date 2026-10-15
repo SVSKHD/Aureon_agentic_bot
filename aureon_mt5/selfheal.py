@@ -7,7 +7,8 @@ One plain background thread (`HealthGuard`, never the Discord event loop) that e
     loop lag < 5 s, Discord gateway connected, every agent thread alive, last processed bar fresh while the market is open.
     Process dead or frozen → pings stop → the external service alerts (email / phone);
   * dumps every thread's stack to logs/stall-<time>.txt when the loop lags > 3 s (once per stall episode);
-  * self-restarts on a hang: loop lag > 30 s, or gateway disconnected > 5 min while the process is otherwise alive →
+  * self-restarts on a hang: loop lag > 30 s while the process is otherwise alive (v2.11.2: a gateway that stays down is
+    network state, never an exit) →
     journal + logs/aureon.log + one webhook card (webhooks don't need the gateway) → exit(75); the supervisor
     (scripts/aureon_service.ps1) brings the process back. Guardian state is restart-safe (guardian_state.json + journal).
 
@@ -32,7 +33,7 @@ DEADMAN_EVERY_S = 60.0
 HEARTBEAT_EVERY_S = 30.0
 STALL_DUMP_LAG_S = 3.0
 RESTART_LAG_S = 30.0
-RESTART_GATEWAY_S = 300.0
+RESTART_GATEWAY_S = 300.0         # v2.11.2: no longer an exit condition (kept for the heartbeat text)
 SNAPSHOT_STALE_S = 300.0          # an agent that has not refreshed its snapshot for 5 min is frozen (stuck MT5 call)
 
 
@@ -43,7 +44,8 @@ def http_ping(url: str, timeout: float = 10.0) -> bool:
         r = requests.get(url, timeout=timeout)
         return 200 <= r.status_code < 300
     except Exception as e:
-        telemetry.info(f"deadman ping failed: {e!r}")
+        from . import netguard
+        netguard.rlog("deadman", f"deadman ping failed: {e!r}")          # v2.11.2: at most once a minute
         return False
 
 
@@ -193,10 +195,8 @@ class HealthGuard:
         why = None
         if self.monitor.last_beat is not None and lag > RESTART_LAG_S:
             why = f"event loop lag {lag:.0f} s (> {RESTART_LAG_S:.0f} s)"
-        else:
-            down = self.monitor.gateway_down_for(now) if hasattr(self.monitor, "gateway_down_for") else 0.0
-            if down > RESTART_GATEWAY_S:
-                why = f"Discord gateway disconnected {down:.0f} s (> {RESTART_GATEWAY_S:.0f} s)"
+        # v2.11.2: a disconnected gateway is NEVER a reason to exit (2026-10-15: DNS loss → exit 75 with no service to
+        # restart us). It is network state (netguard.degraded); the Discord supervisor reconnects forever.
         if why is None:
             return False
         self.restarting = True

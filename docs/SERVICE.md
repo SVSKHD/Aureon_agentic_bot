@@ -112,3 +112,20 @@ interface.
 
 **`/server`** shows uptime, last boot reason, pending updates + window, MT5 (pid, login, tick age), clock drift, disk, RAM, CPU,
 repo commit vs origin/master, the last three restarts and open incidents. **`/env-check`** shows what the guardian actually runs on.
+
+## v2.11.2 — network loss and where to install
+
+**Install at `C:\Aureon`**, not under OneDrive / Dropbox / Google Drive / iCloud (Desktop and Documents are often redirected
+into OneDrive). Sync clients lock and rewrite `guardian_state.json`, `features.json`, `restart_marker.json` and
+`journal.jsonl` while the bot writes them. `config.validate` flags such a path on the BOOT CHECK card and in `/env-check`.
+**Run the NSSM service from §1.** `python main.py` in a console is for tests only: on 2026-10-15 such a console process
+ended during a DNS outage and nothing restarted it.
+
+What a network loss does now (`aureon_mt5/netguard.py`):
+- **Nothing network-related ends the process.** A gateway that stays down is no longer a self-restart reason (only a frozen
+  event loop is). The Discord client is restarted forever (2 s → 60 s backoff) until a planned stop.
+- **Degraded** (gateway down > 60 s, or 2 webhook failures in a row, or discord.com does not resolve): polling and the guardian
+  are unchanged and there are no new entries. Cards are written to `logs/card_queue.jsonl` and flushed on reconnect behind a
+  single BACK ONLINE summary. NETWORK DEGRADED / RESTORED cards carry a DNS self-check.
+- **Every exit is recorded:** `process_exit` in the journal and in `restart_marker.json` / `logs/exit_marker.json`.
+  Unplanned exits return 1, so NSSM restarts the process; planned exits return 0, restarts return 75.

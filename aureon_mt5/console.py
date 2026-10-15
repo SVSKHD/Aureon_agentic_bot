@@ -87,6 +87,7 @@ def console_state(cfg, agents: dict, actions, notify=None, *, started: float | N
         "positions": positions,
         "pending_ask": pending,
         "last_reads": list(getattr(actions, "last_reads", []) or [])[-5:],
+        "network": _network_state(),
         "health": {"uptime_s": round(now - started) if started else None,
                    "discord_ok": bool(getattr(notify, "last_ok", True)),
                    "network_degraded": bool(server.network_degraded()),
@@ -94,6 +95,14 @@ def console_state(cfg, agents: dict, actions, notify=None, *, started: float | N
                    "agents": {s: {"status": (getattr(a, "health", {}) or {}).get("status"),
                                   "last_bar": (getattr(a, "health", {}) or {}).get("last_bar")} for s, a in (agents or {}).items()}},
     }
+
+
+def _network_state() -> dict:
+    """v2.11.2: degraded flag, why, since when, and the entry asks suppressed meanwhile (never auto-taken)."""
+    from . import netguard
+    st = netguard.STATE
+    return {"degraded": bool(st["degraded"]), "reasons": list(st["reasons"]), "since": st["since"],
+            "suppressed_asks": list(st["suppressed"])[-10:], "dns": netguard.dns_line()}
 
 
 # ----------------------------------------------------------------------------- the app
@@ -202,19 +211,49 @@ class ConsoleServer:
             return f"console off: {host} is not loopback and AUREON_CONSOLE_ALLOW_PUBLIC is not 1"
         return host, port
 
-    def start(self) -> str:
+    def start(self, backoff=(5.0, 60.0)) -> str:
+        """v2.11.2: the uvicorn thread restarts itself (backoff 5 s → 60 s) when uvicorn dies or exits on its own — a bind
+        failure, a network error, anything. Only stop() ends it. Never raises into the bot."""
         b = self.bind()
         if isinstance(b, str):
             return b
         import uvicorn  # type: ignore
         host, port = b
-        self.server = uvicorn.Server(uvicorn.Config(self.app, host=host, port=port, log_level="warning", access_log=False,
-                                                    lifespan="off"))
-        self.thread = threading.Thread(target=self.server.run, name="aureon-console", daemon=True)
+        self._stopping = False
+        self.restarts = 0
+
+        def make():
+            return uvicorn.Server(uvicorn.Config(self.app, host=host, port=port, log_level="warning", access_log=False,
+                                                 lifespan="off"))
+
+        def loop():
+            from . import netguard
+            delay = backoff[0]
+            while not self._stopping:
+                self.server = make()
+                t0 = _time.monotonic()
+                try:
+                    self.server.run()
+                    why = "uvicorn returned"
+                except BaseException as e:                    # SystemExit from a failed bind included
+                    why = f"{type(e).__name__}: {e}"
+                if self._stopping:
+                    break
+                self.restarts += 1
+                if _time.monotonic() - t0 > 120:
+                    delay = backoff[0]
+                netguard.rlog("console", f"console stopped ({why}) — restarting in {delay:.0f} s")
+                end = _time.monotonic() + delay
+                while not self._stopping and _time.monotonic() < end:
+                    _time.sleep(min(0.2, delay))
+                delay = min(backoff[1], delay * 2)
+
+        self.thread = threading.Thread(target=loop, name="aureon-console", daemon=True)
         self.thread.start()
         return ""
 
     def stop(self, timeout: float = 5.0):
+        self._stopping = True
         if self.server is not None:
             self.server.should_exit = True
         if self.thread is not None:

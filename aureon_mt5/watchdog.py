@@ -187,6 +187,11 @@ class Watchdog:
         try:                                                          # v2.10.1: disk · drift · updates pending · MT5 age
             from .server import heartbeat_line
             lines.append(heartbeat_line())
+            try:                                             # v2.11.2: DNS self-check on the 4-hourly heartbeat
+                from . import netguard
+                lines.append(netguard.dns_line(netguard.dns_check(netguard.dns_hosts(self.cfg))))
+            except Exception:
+                pass
         except Exception:
             pass
         for sym, ag in self.agents.items():

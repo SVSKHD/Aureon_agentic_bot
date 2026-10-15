@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from dotenv import load_dotenv
 load_dotenv()   # load .env if present
 
-VERSION = "2.11.0"
+VERSION = "2.11.2"
 
 
 def _parse_lot_buttons(raw: str) -> list[float]:
@@ -199,6 +199,9 @@ class Config:
     console_token: str = os.environ.get("AUREON_CONSOLE_TOKEN", "").strip()
     console_allow_public: bool = os.environ.get("AUREON_CONSOLE_ALLOW_PUBLIC", "0") == "1"
     console_url: str = os.environ.get("AUREON_CONSOLE_URL", "").strip().rstrip("/")     # how the phone reaches it (Tailscale)
+    # v2.11.2 network loss: entries stay off while degraded unless the operator allows them; optional MT5 host for the DNS check
+    network_degraded_entries: bool = os.environ.get("AUREON_NETWORK_DEGRADED_ENTRIES", "0") == "1"
+    mt5_host: str = os.environ.get("AUREON_MT5_HOST", "").strip()
     # regime score weights (sum need not be 1; the score is clipped to [0, 1])
     regime_weights: dict = field(default_factory=lambda: {"crosses": 0.30, "flat_gap": 0.20, "adx": 0.20, "di": 0.10,
                                                           "failed_p": 0.10, "compression": 0.10})
@@ -277,6 +280,30 @@ def validate(cfg, environ=None, pre_stop: float = 6.0) -> list[dict]:
                     "value": f"{cfg.regime_dead:g}/{cfg.regime_choppy:g}/{cfg.regime_clean:g}",
                     "issue": "need DEAD < CHOPPY <= CLEAN", "fallback": "0.25/0.45/0.55", "group": "regime"})
     out += _notify_problems(cfg, env)
+    out += sync_folder_problems(cfg)
+    return out
+
+
+SYNC_MARKERS = ("onedrive", "dropbox", "google drive", "googledrive", "my drive", "icloud drive", "iclouddrive")
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def sync_folder_problems(cfg, root: str | None = None) -> list[dict]:
+    """v2.11.2: a repo or log_dir inside OneDrive / Dropbox / Google Drive / iCloud — the sync client locks and rewrites
+    guardian_state.json, features.json, restart_marker.json and the journal while the bot writes them."""
+    out = []
+    for what, path in (("repo", root or REPO_ROOT), ("log_dir", getattr(cfg, "log_dir", "logs") or "logs")):
+        try:
+            real = os.path.realpath(path if os.path.isabs(path) else os.path.join(root or REPO_ROOT, path))
+        except Exception:
+            continue
+        low = real.replace("\\", "/").lower()
+        hit = next((m for m in SYNC_MARKERS if m in low), None)
+        if hit:
+            out.append({"name": "sync_folder", "env": f"{what} path", "value": real,
+                        "issue": f"⚠️ inside a {hit} sync folder — it locks and syncs the journal / state files while the bot "
+                                 "writes them; install at C:\\Aureon and run the NSSM service (docs/SERVICE.md §1)",
+                        "fallback": "runs, but move it", "group": "server"})
     return out
 
 

@@ -29,6 +29,8 @@ BACKENDS = ("ntfy", "pushover", "telegram")
 NTFY_PRIORITY = {"urgent": 5, "high": 4, "normal": 3}
 PUSHOVER_PRIORITY = {"urgent": 2, "high": 1, "normal": 0}
 TIMEOUT_S = 10.0
+PAUSE_AFTER = 5                    # v2.11.2: a backend failing 5× in a row is paused …
+PAUSE_S = 600.0                    # … for 10 min, with one ops card
 OPS_EVENTS = ("MAINTENANCE", "COLD_START", "MT5_NOT_UP", "REPAIR_AUTO")
 TAGS = {"ASK": ["rotating_light"], "FILLED": ["white_check_mark"], "CLOSED": ["moneybag"], "STOP": ["octagonal_sign"],
         "FLIP_HOLD": ["warning"], "POSITION_ASK": ["question"], "READ_VERDICT": ["brain"]}
@@ -233,6 +235,9 @@ class Push:
         self._poller = None
         self._stop = threading.Event()
         self.last: list[dict] = []                  # last results (for /server and tests)
+        self.fail_streak: dict[str, int] = {}
+        self.paused_until: dict[str, float] = {}
+        self.on_pause = None                        # main: one ops card per pause (health_notify.card)
 
     @property
     def http(self):
@@ -242,7 +247,9 @@ class Push:
         return self._http
 
     def backends(self) -> list[str]:
-        return [b.lower() for b in (getattr(self.cfg, "push", ()) or ()) if b.lower() in BACKENDS]
+        now = self.clock()
+        return [b.lower() for b in (getattr(self.cfg, "push", ()) or ())
+                if b.lower() in BACKENDS and self.paused_until.get(b.lower(), 0) <= now]
 
     def ttl_s(self) -> float:
         return float(getattr(self.cfg, "ask_ttl_min", 20)) * 60
@@ -277,8 +284,22 @@ class Push:
             err = repr(e)[:200]
         rec = {"t": self.clock(), "backend": backend, "key": pe.key, "event": pe.event, "ok": ok, "error": err}
         self.last = (self.last + [rec])[-20:]
-        if not ok:
-            print(f"  (push {backend} failed: {err or 'HTTP error'})")
+        if ok:
+            self.fail_streak[backend] = 0
+        else:
+            from . import netguard
+            netguard.rlog(f"push-{backend}", f"push {backend} failed: {err or 'HTTP error'}")
+            self.fail_streak[backend] = self.fail_streak.get(backend, 0) + 1
+            if self.fail_streak[backend] >= PAUSE_AFTER:
+                self.fail_streak[backend] = 0
+                self.paused_until[backend] = self.clock() + PAUSE_S
+                try:
+                    if self.journal is not None:
+                        self.journal.log("push_paused", backend=backend, minutes=PAUSE_S / 60, error=err or None)
+                    if self.on_pause is not None:
+                        self.on_pause(backend, err)
+                except Exception:
+                    pass
         try:
             if self.journal is not None:
                 self.journal.log("push_sent" if ok else "push_failed", backend=backend, key=pe.key, event=pe.event,
@@ -372,7 +393,8 @@ class Push:
                 try:
                     off = self.poll_once(off)
                 except Exception as e:
-                    print("  (telegram poll failed:", e, ")"); self._stop.wait(10)
+                    from . import netguard
+                    netguard.rlog("telegram-poll", f"telegram poll failed: {e!r}"); self._stop.wait(10)
         self._poller = threading.Thread(target=loop, name="aureon-telegram-poll", daemon=True)
         self._poller.start()
 
