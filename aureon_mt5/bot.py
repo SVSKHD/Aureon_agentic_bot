@@ -224,6 +224,9 @@ HELP = {
         "feature-set": "Change a feature live — admin; non-hot ones refused with a position open unless force",
         "feature-reset": "Drop a Discord override (back to .env / default) — admin",
         "feature-help": "What a feature does, its range and current value — read-only",
+        "env-check": "What the guardian is actually running on + every config problem — read-only",
+        "server": "Uptime, boot reason, updates, MT5, clock, disk/RAM/CPU, repo, restarts, incidents — read-only",
+        "veto": "Revert an auto-applied strategy change instantly — admin",
     },
     "Repair": {
         "repairs": "Open incidents and proposed patches — read-only",
@@ -1941,6 +1944,35 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
         user = inter.user
         await run(inter, "feature-reset", lambda: Reply(content=feature_set_action(cfg, agents, journal, notify, claude, user, name,
                                                                                     "", force, reset=True)))
+
+    @tree.command(name="server", description="The box: uptime, boot reason, updates, MT5, clock, resources, repo, restarts")
+    async def server_cmd(inter: discord.Interaction):
+        def work():
+            from . import server as srv
+            c = srv.server_card(cfg, agents, journal, started=started_at, broker=broker)
+            return Reply(card=_embed(c["title"], f"v{VERSION}", fields=c["fields"]))
+        await run(inter, "server", work, timeout=40)
+
+    @tree.command(name="veto", description="Admin: revert an auto-applied strategy change (STRATEGY CHANGE APPLIED card id)")
+    @app_commands.describe(id="the id on the STRATEGY CHANGE APPLIED card")
+    async def veto_cmd(inter: discord.Interaction, id: int):
+        user = inter.user
+        def work():
+            from . import ops
+            from .tuning_auto import TuningAuto
+            if not ops.admin_allowed(user, os.environ.get("AUREON_ADMIN_ROLE_ID", "")):
+                return Reply(content="Denied: configured administrator role required")
+            return Reply(content=TuningAuto(cfg, journal, notify, replay=lambda *a: None, pins=lambda: True,
+                                            advisors=[claude] if claude is not None else []).veto(id, str(user)))
+        await run(inter, "veto", work)
+
+    @tree.command(name="env-check", description="What the guardian is running on (env + Discord overrides) and every config problem")
+    async def env_check_cmd(inter: discord.Interaction):
+        def work():
+            from . import features
+            from .config import env_check_table
+            return Reply(content=env_check_table(cfg, features.load_overrides(cfg.log_dir))[:1900])
+        await run(inter, "env-check", work)
 
     @tree.command(name="feature-help", description="What a feature does, its range and its current value")
     @app_commands.describe(name="feature name")

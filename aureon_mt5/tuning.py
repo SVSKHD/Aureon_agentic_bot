@@ -85,8 +85,16 @@ def propose(log_dir: str, param: str, old_value, new_value, evidence: str, journ
     if param in NOT_TUNABLE:
         return f"{param} is not tunable (entry rule)"
     bounds = BOUNDS.get(param)
-    if bounds is None:
-        return f"{param} has no tuning bounds"
+    if bounds is None:                                   # v2.10.1: registry features (guardian / regime) with their own range
+        try:
+            from . import features as _F
+            f = _F.get(param)
+        except ValueError:
+            f = None
+        if f is None or f.group not in ("guardian", "regime") or f.type not in ("float", "int", "bool"):
+            return f"{param} has no tuning bounds"
+        bounds = {"min": f.min if f.min is not None else 0, "max": f.max if f.max is not None else 1,
+                  "step": float("inf"), "type": f.type}
     # Check bounds
     if new_value < bounds["min"] or new_value > bounds["max"]:
         return f"{param} {new_value} outside bounds [{bounds['min']}, {bounds['max']}]"

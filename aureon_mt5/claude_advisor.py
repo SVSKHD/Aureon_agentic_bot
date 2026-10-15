@@ -678,7 +678,10 @@ class ClaudeAdvisor:
         if job["type"] == "read":
             self._process_read(job); return
         if job["type"] == "repair":                             # v2.10.0: serialised with every other CLI call; daily budget
-            job["repairer"].propose(job["n"], lock=self._call_lock, budget=self.budget); return
+            res = job["repairer"].propose(job["n"], lock=self._call_lock, budget=self.budget)
+            if res.get("ok") and job.get("after"):                  # v2.10.1: AUREON_REPAIR_AGENT=auto guards + apply
+                job["after"](res)
+            return
         res = self._call(self.prompt_for(job["snapshot"]), job["model"], job["event"], image=job.get("png"))
         if res is None:
             self._journal(job, None, latency=0.0, acted=False, stale=False, error="budget used")

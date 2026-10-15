@@ -287,6 +287,16 @@ def main():
         _features.apply(cfg, feature_overrides)
         print("feature overrides (Discord): " + ", ".join(f"{k}={v}" for k, v in feature_overrides.items()))
     health_notify = Notifier(cfg.health_webhook) if cfg.health_webhook else notify
+    # v2.10.1 BOOT CHECK: unparsable / out-of-range / contradictory settings fall back to the safe default, loudly
+    from aureon_mt5.config import apply_fallbacks, validate as validate_cfg
+    boot_problems = validate_cfg(cfg)
+    if boot_problems:
+        fixed = apply_fallbacks(cfg, [p for p in boot_problems if p.get("group") in ("guardian", "regime", "claude", "server", "repair",
+                                                                                  "context", "plan")])
+        journal.log("boot_check", problems=boot_problems, fallbacks=fixed)
+        health_notify.card("AUREON · MT5 · BOOT CHECK", "\n".join(f"⚠️ `{p['env']}`={p['value'] or '∅'} — {p['issue']} → {p['fallback']}"
+                                                                for p in boot_problems)[:3900],
+                           footer="Aureon MT5 · /env-check shows this any time")
     def process_excepthook(typ, value, tb):
         import traceback
         trace = "\n".join("".join(traceback.format_exception(typ, value, tb)).splitlines()[-15:])
@@ -311,8 +321,15 @@ def main():
     threading.excepthook = agent_thread_hook
 
     if not cfg.dry:
-        if not broker.connect():
-            print("MT5 not available — is the terminal open and logged in? (use --dry for a pipe test)"); sys.exit(1)
+        from aureon_mt5 import server as _server                      # v2.10.1: MT5 may still be starting after a reboot
+        if not _server.connect_mt5(broker.connect, boot_wait=cfg.mt5_boot_wait, notify=health_notify, reset=broker.reset):
+            print("MT5 not available — is the terminal open and logged in? (use --dry for a pipe test)")
+            from aureon_mt5 import ops as _o
+            sys.exit(_o.EXIT_RESTART)                                 # the launcher restarts us (and MT5 first)
+        try:
+            _server.remember_mt5_path(cfg.log_dir, broker.mt5().terminal_info())
+        except Exception:
+            pass
         cfg.server_utc_offset = broker.server_offset_hours(cfg.symbols[0], cfg.server_utc_offset)
     seed_news_file(cfg.news_file)
     news = load_news(cfg.news_file if cfg.news_file and os.path.exists(cfg.news_file) else None, date.today().year)
@@ -355,18 +372,30 @@ def main():
         last_hash = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, timeout=10).stdout.strip()
         from aureon_mt5 import ops as _ops
         marker = _ops.pop_restart_marker(cfg.log_dir) or {}          # v2.7.2: written before exit(75)
+        from aureon_mt5 import server as _srv
+        down = _srv.down_text(marker)                                    # v2.10.1: every BACK ONLINE says how long we were away
+        if not marker and not os.environ.get("AUREON_RESTART_REASON") and not os.environ.get("AUREON_AUTO_RESTARTED"):
+            why = "cold start"
+            _srv.cold_start(cfg, journal, health_notify,
+                            {s_: (broker.positions(s_) if not cfg.dry else []) for s_ in cfg.symbols})
+        if marker.get("kind") in ("maintenance", "repair-auto", "repair-rollback"):
+            why = f"restarted · {marker['kind']}"
+            text = {"maintenance": f"maintenance reboot · {marker.get('reason', '')}",
+                    "repair-auto": f"auto-applied repair · {marker.get('reason', '')} — verifying",
+                    "repair-rollback": f"repair rolled back · {marker.get('reason', '')}"}[marker["kind"]]
+            health_notify.card("AUREON · MT5 · BACK ONLINE", f"{text}\n{down} · running `{last_hash}`", footer="Aureon MT5 · unattended")
         manual_reason = os.environ.pop("AUREON_RESTART_REASON", "") or (
             f"manual:{marker.get('reason', '')}" if marker.get("kind") == "manual" else "")
         if marker.get("kind") == "self-heal":
             why = f"restarted · self-heal · {marker.get('reason', '')}"
             health_notify.card("AUREON · MT5 · BACK ONLINE", f"Recovered from a hang by self-restart.\n{marker.get('reason', '')}\n"
-                               f"Running `{last_hash}` · {S.display_name}", footer="Aureon MT5 · self-heal")
+                               f"{down} · running `{last_hash}` · {S.display_name}", footer="Aureon MT5 · self-heal")
         if manual_reason:
             why = f"restarted · {manual_reason}"
-            notify.card("AUREON · MT5 · BACK ONLINE", f"{manual_reason}\nRunning `{last_hash}` · {S.display_name}")
+            notify.card("AUREON · MT5 · BACK ONLINE", f"{manual_reason}\n{down} · running `{last_hash}` · {S.display_name}")
         if os.environ.get("AUREON_AUTO_RESTARTED") or marker.get("kind") == "auto-update":
             why = f"restarted · auto-update · {last_hash}"
-            notify.card("AUREON · MT5 · BACK ONLINE", f"Auto-update restart complete.\nRunning `{last_hash}` · {last_msg}",
+            notify.card("AUREON · MT5 · BACK ONLINE", f"Auto-update restart complete · {down}.\nRunning `{last_hash}` · {last_msg}",
                         fields=[{"name": "Version", "value": f"v{VERSION}", "inline": True},
                                 {"name": "Commit", "value": f"`{last_hash}`", "inline": True},
                                 {"name": "Message", "value": last_msg[:200], "inline": False}],
@@ -412,8 +441,12 @@ def main():
     repairer = _repair.Repairer(cfg, journal, health_notify)
     def _auto_propose(inc):
         if claude is not None:
-            claude._enqueue({"type": "repair", "event": "repair", "symbol": "ALL", "n": inc["id"], "repairer": repairer})
+            claude._enqueue({"type": "repair", "event": "repair", "symbol": "ALL", "n": inc["id"], "repairer": repairer,
+                             "after": lambda res, n=inc["id"]: _repair.maybe_auto_apply(repairer, n, agents,
+                                                                                       restart=lambda *a, **k: ops.restart_process(*a, **k, exit_hook=restart_exit))})
     guard.detector = _repair.Detector(cfg, journal, health_notify, agents, on_new=_auto_propose)
+    guard.detector.verifier = _repair.Verifier(cfg, journal, health_notify, health_ok=lambda: not guard.last_failures, agents=agents,
+                                               restart=lambda *a, **k: ops.restart_process(*a, **k, exit_hook=restart_exit))
     if bot_repair is not None:
         bot_repair["repairer"] = repairer
 
@@ -421,14 +454,39 @@ def main():
     wd = Watchdog(health_notify or notify, journal, cfg, agents)
     wd.monitor = monitor
 
+    # v2.10.1 the box belongs to Aureon: maintenance window (reboots, code updates, housekeeping), MT5 manager, clock, network,
+    # evidence-gated tuning. All OS calls go through server.run_ps; every action is journaled and carded.
+    from aureon_mt5 import server as srv
+    from aureon_mt5.tuning_auto import TuningAuto
+    maint = srv.Maintenance(cfg, journal, health_notify, agents, exit_hook=restart_exit)
+    mt5_mgr = srv.Mt5Manager(cfg, journal, health_notify, broker)
+    net = srv.NetworkWatch(journal)
+    tuner = TuningAuto(cfg, journal, health_notify, advisors=[claude] if claude is not None else [])
+    srv.check_clock(journal, health_notify); last_clock = _time.time()
+    was_in_session = srv.in_session(cfg, _time.time())
+
     was_open = broker.market_open(cfg.symbols[0], cfg.server_utc_offset, cfg.dry); report_day = None; last_update_check = 0
     review_day = None; codex_review_day = None
     while True:
         try:
             now = _time.time()
-            if now - last_update_check >= AUTO_UPDATE_INTERVAL:
-                last_update_check = now
-                check_for_updates(notify, log_dir=cfg.log_dir, exit_hook=restart_exit)
+            # v2.10.1: code updates moved into the maintenance window (flat, outside the session, suite green)
+            maint.tick(now)
+            mt5_mgr.tick(now)
+            if now - last_clock >= 6 * 3600:
+                last_clock = now; srv.check_clock(journal, health_notify)
+            net.tick(bool(getattr(notify, "last_ok", True)), guard.last_ping_ok if cfg.deadman_url else None,
+                     cfg.dry or broker.connected())
+            try:
+                import shutil as _sh
+                srv.STATE["disk_free_gb"] = _sh.disk_usage(cfg.log_dir).free / 1e9
+                ages = [ag.snapshot.get("tick_age") for ag in agents.values() if getattr(ag, "snapshot", None)]
+                srv.STATE["mt5_age"] = max([a for a in ages if a is not None], default=None)
+            except Exception:
+                pass
+            in_sess = srv.in_session(cfg, now)
+            tuner.tick(session_ended=was_in_session and not in_sess)
+            was_in_session = in_sess
             is_open = broker.market_open(cfg.symbols[0], cfg.server_utc_offset, cfg.dry)
             if was_open and not is_open:
                 notify.send(f"{cfg.mode}:ALL:MARKET:closed-{date.today()}", "AUREON · MT5 · MARKET CLOSED", ["agents sleeping"], footer=f"{S.display_name} · {datetime.now(IST):%H:%M} IST")

@@ -108,6 +108,7 @@ class Detector:
         self._journal_offset = 0
         self._bad_lines = 0
         self._last_parse_check = 0.0                      # the Claude-parse check reads today's journal: every 10 min only
+        self.verifier = None                              # v2.10.1: Verifier after an auto-applied repair (set by main)
 
     def tick(self, now: float | None = None) -> list[dict]:
         now = self.clock() if now is None else now
@@ -115,6 +116,11 @@ class Detector:
             return []
         self._last_tick = now
         new = []
+        if self.verifier is not None:
+            try:
+                self.verifier.tick(now)
+            except Exception as e:
+                telemetry.info(f"repair verifier failed: {e!r}")
         for check in (self._failures, self._claude_parse, self._journal_integrity, self._charts, self._stale_frames):
             try:
                 new += [i for i in check(now) if i]
@@ -223,7 +229,7 @@ class Detector:
                              f"nothing is applied without `/repair-apply {n}`.", footer=f"Aureon MT5 · repair agent {mode}")
         except Exception:
             pass
-        if mode == "propose" and self.on_new is not None:
+        if mode in ("propose", "auto") and self.on_new is not None:
             try:
                 self.on_new(inc)
             except Exception as e:
@@ -413,7 +419,7 @@ class Repairer:
         return res
 
     # -- apply (admin; the live checkout)
-    def apply(self, n: int, *, agents, user, force: bool = False, restart=None, positions_block=None) -> str:
+    def apply(self, n: int, *, agents, user, force: bool = False, restart=None, positions_block=None, auto: bool = False) -> str:
         from . import ops
         inc = get(self.cfg.log_dir, n)
         if inc is None:
@@ -444,11 +450,17 @@ class Repairer:
             if code != 0:
                 self._git(self.root, "reset", "--hard", "HEAD~1")
                 return self._apply_failed(n, f"git push failed — commit reverted (auto-update would discard it): {err[:300]}")
-        update(self.cfg.log_dir, n, status="applied", applied_by=str(user), applied_t=int(_time.time()))
-        self.journal.log("repair_applied", id=n, by=str(user), force=bool(force), tests=summary)
+        update(self.cfg.log_dir, n, status="applied", applied_by=str(user), applied_t=int(_time.time()), auto=bool(auto))
+        self.journal.log("repair_auto_applied" if auto else "repair_applied", id=n, by=str(user), force=bool(force), tests=summary,
+                         fingerprint=inc["fingerprint"])
+        if auto:                                                     # the next process verifies (or rolls back) this commit
+            _, sha, _ = self._git(self.root, "rev-parse", "HEAD")
+            write_verify(self.cfg.log_dir, {"n": n, "fingerprint": inc["fingerprint"], "sha": sha.strip(), "pushed": bool(remotes.strip()),
+                                            "t": int(_time.time())})
         update_fn = None if remotes.strip() else (lambda: {"status": "current", "discarded": []})
         (restart or ops.restart_process)(agents, self.journal, self.notify, user, f"repair #{n}", log_dir=self.cfg.log_dir,
-                                         **({"update": update_fn} if update_fn else {}))
+                                         **({"update": update_fn} if update_fn else {}),
+                                         **({"marker_kind": "repair-auto"} if auto else {}))
         return f"✅ repair #{n} applied · {summary} · restarting"
 
     def _apply_failed(self, n, why: str) -> str:
@@ -482,3 +494,163 @@ def listing(log_dir: str) -> str:
     return "\n".join(f"#{i['id']} · {i['status']} · {i['fingerprint']} · seen {i.get('count', 1)}× · "
                      f"{datetime.fromtimestamp(i['t'], tz=IST):%d %b %H:%M} IST"
                      + (f" · patch ready" if (i.get('proposal') or {}).get('ok') else "") for i in rows)[:1900]
+
+
+# ============================================================================= v2.10.1 auto tier (AUREON_REPAIR_AGENT=auto)
+AUTO_UNHEALTHY_KINDS = ("journal",)                 # the bot is already unhealthy: may auto-apply inside the session
+AUTO_UNHEALTHY_WORDS = ("heartbeat", "gateway", "journal")
+
+
+def _verify_path(log_dir: str) -> str:
+    return os.path.join(log_dir, "repair_verify.json")
+
+
+def write_verify(log_dir: str, data: dict):
+    os.makedirs(log_dir, exist_ok=True)
+    with open(_verify_path(log_dir), "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+
+def read_verify(log_dir: str) -> dict | None:
+    try:
+        with open(_verify_path(log_dir), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def clear_verify(log_dir: str):
+    try:
+        os.remove(_verify_path(log_dir))
+    except OSError:
+        pass
+
+
+def in_session(cfg, now: datetime | None = None) -> bool:
+    """The governor's entry window (AUREON_SESSION_IST, default 05:30–23:00 IST)."""
+    now = now or datetime.now(IST)
+    try:
+        a, b = cfg.session_ist.split("-")
+        ah, am = (int(x) for x in a.split(":")); bh, bm = (int(x) for x in b.split(":"))
+    except Exception:
+        ah, am, bh, bm = 5, 30, 23, 0
+    m = now.hour * 60 + now.minute
+    return ah * 60 + am <= m < bh * 60 + bm
+
+
+def auto_blocked(log_dir: str) -> set[str]:
+    return set(load(log_dir).get("auto_blocked") or [])
+
+
+def auto_guards(repairer, n: int, agents, *, now: datetime | None = None, positions_block=None) -> list[str]:
+    """Every guard that FAILS for auto-applying incident n (empty = apply). Forbidden paths are refused before a patch is
+    ever proposed, so a proposal that exists is plumbing-only by construction."""
+    from . import ops
+    cfg = repairer.cfg
+    inc = get(cfg.log_dir, n) or {}
+    prop = inc.get("proposal") or {}
+    fails = []
+    if not prop.get("ok") or prop.get("forbidden"):
+        fails.append("no clean patch (forbidden paths or failing tests)")
+    if inc.get("fingerprint") in auto_blocked(cfg.log_dir):
+        fails.append("fingerprint rolled back before — needs a human")
+    if (positions_block or ops.positions_block_mode_change)(agents):
+        fails.append("a position is open (or flat cannot be proven)")
+    unhealthy = inc.get("kind") in AUTO_UNHEALTHY_KINDS or any(w in (inc.get("fingerprint") or "").lower() for w in AUTO_UNHEALTHY_WORDS)
+    if in_session(cfg, now) and not unhealthy:
+        fails.append(f"inside the trading session ({cfg.session_ist} IST)")
+    start = (now or datetime.now(IST)).replace(hour=0, minute=0, second=0, microsecond=0)
+    done = [r for r in repairer.journal.read(int(start.timestamp())) if r.get("event") == "repair_auto_applied"]
+    if len(done) >= int(cfg.repair_auto_per_day):
+        fails.append(f"daily cap reached ({len(done)}/{cfg.repair_auto_per_day})")
+    return fails
+
+
+def maybe_auto_apply(repairer, n: int, agents, *, now=None, positions_block=None, restart=None) -> str:
+    """AUREON_REPAIR_AGENT=auto: after a proposal, apply it only when every guard holds; otherwise it stays a proposal and the
+    card names the guard. The live suite runs again after git apply (apply reverts on failure)."""
+    if getattr(repairer.cfg, "repair_agent", "off") != "auto":
+        return "not auto"
+    fails = auto_guards(repairer, n, agents, now=now, positions_block=positions_block)
+    if fails:
+        update(repairer.cfg.log_dir, n, auto_held=fails)
+        repairer.journal.log("repair_auto_held", id=n, guards=fails)
+        try:
+            repairer.notify.card(f"REPAIR #{n} · AUTO-APPLY HELD", "stays a proposal — " + "; ".join(fails)
+                                 + f"\n`/repair-apply {n}` to apply by hand", footer="Aureon MT5 · repair agent auto")
+        except Exception:
+            pass
+        return "held: " + "; ".join(fails)
+    inc = get(repairer.cfg.log_dir, n) or {}
+    try:
+        repairer.notify.card(f"REPAIR AUTO-APPLY #{n}", f"{inc.get('fingerprint')} — patch applies, live suite runs, then restart. "
+                             f"Verified after {int(repairer.cfg.repair_verify_s)} s of healthy running, else rolled back.",
+                             footer="Aureon MT5 · repair agent auto")
+    except Exception:
+        pass
+    return repairer.apply(n, agents=agents, user="repair-agent", restart=restart, positions_block=positions_block, auto=True)
+
+
+class Verifier:
+    """On the process that started after an auto-apply: REPAIR VERIFIED after verify_s of healthy running with no new
+    incident of the same fingerprint; otherwise git revert + push + restart on the previous code (exactly once),
+    REPAIR ROLLED BACK, incident needs_human, fingerprint never auto-applied again."""
+
+    def __init__(self, cfg, journal, notify, *, health_ok=lambda: True, run=subprocess.run, root: str = ROOT, clock=_time.time,
+                 restart=None, agents=None):
+        self.cfg, self.journal, self.notify, self.health_ok, self.clock = cfg, journal, notify, health_ok, clock
+        self.repairer = Repairer(cfg, journal, notify, run=run, root=root)
+        self.restart, self.agents = restart, agents or {}
+        self.boot = clock()
+        self.done = False
+
+    def tick(self, now: float | None = None) -> str | None:
+        if self.done:
+            return None
+        v = read_verify(self.cfg.log_dir)
+        if not v:
+            self.done = True
+            return None
+        now = self.clock() if now is None else now
+        same = [i for i in load(self.cfg.log_dir)["incidents"]
+                if i["fingerprint"] == v["fingerprint"] and i["id"] != v["n"] and i["t"] >= self.boot]
+        if same:
+            return self.rollback(v, f"incident {v['fingerprint']} came back (#{same[-1]['id']})")
+        if now - self.boot < float(self.cfg.repair_verify_s):
+            return None
+        if not self.health_ok():
+            return self.rollback(v, "unhealthy after the verify window (heartbeat / gateway / agents)")
+        clear_verify(self.cfg.log_dir); self.done = True
+        update(self.cfg.log_dir, v["n"], status="verified", verified_t=int(now))
+        self.journal.log("repair_verified", id=v["n"], fingerprint=v["fingerprint"], sha=v.get("sha"))
+        try:
+            self.notify.card(f"REPAIR VERIFIED #{v['n']}", f"{v['fingerprint']} · {int(now - self.boot)} s healthy, no recurrence.",
+                             footer="Aureon MT5 · repair agent auto")
+        except Exception:
+            pass
+        return "verified"
+
+    def rollback(self, v: dict, why: str) -> str:
+        from . import ops
+        clear_verify(self.cfg.log_dir); self.done = True              # exactly once, whatever happens next
+        rp = self.repairer
+        code, _, err = rp._git(rp.root, "revert", "--no-edit", v.get("sha") or "HEAD")
+        if code == 0 and v.get("pushed"):
+            rp._git(rp.root, "push", "origin", "HEAD:master", timeout=120)
+        data = load(self.cfg.log_dir)
+        data["auto_blocked"] = sorted(set(data.get("auto_blocked") or []) | {v["fingerprint"]})
+        for i in data["incidents"]:
+            if i["id"] == v["n"]:
+                i["status"] = "needs_human"
+        save(self.cfg.log_dir, data)
+        self.journal.log("repair_rolled_back", id=v["n"], fingerprint=v["fingerprint"], why=why, revert_ok=code == 0)
+        try:
+            self.notify.card(f"REPAIR ROLLED BACK #{v['n']}", f"{why}\n" + ("reverted the repair commit — restarting on the previous code"
+                             if code == 0 else f"git revert failed: {err[:200]} — restarting anyway; needs a human"),
+                             footer="Aureon MT5 · repair agent auto")
+        except Exception:
+            pass
+        (self.restart or ops.restart_process)(self.agents, self.journal, self.notify, "repair-agent", f"rollback #{v['n']}",
+                                              log_dir=self.cfg.log_dir, update=lambda: {"status": "current", "discarded": []},
+                                              marker_kind="repair-rollback")
+        return "rolled back"

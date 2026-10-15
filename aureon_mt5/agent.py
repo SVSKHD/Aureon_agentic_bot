@@ -409,6 +409,10 @@ class SymbolAgent(threading.Thread):
     def _entry_ask(self, key, title, lines, **kw) -> bool:
         """notify.ask for P / cross / RE / ENTER cards. show: + REGIME line. block in CHOPPY/DEAD: the signal is carded
         'CHOP · not tradeable' with no buttons, no tracked ask, no Claude entry read — returns False."""
+        from . import server as _server
+        if _server.network_degraded():                                # v2.10.1: no new entries while the network is down
+            self.journal.log("entry_blocked_network", symbol=self.symbol, key=key)
+            return False
         tr = self.regime_tracker; gate = self.cfg.regime_gate
         if gate in ("show", "block") and tr.state:
             kw["fields"] = list(kw.get("fields") or []) + [field("Regime", tr.line(), inline=False)]

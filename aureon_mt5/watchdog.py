@@ -184,6 +184,11 @@ class Watchdog:
                 lines.append(f"gateway {self.monitor.gateway_state()} · reconnects last 4 h: {self.monitor.reconnects_since(4 * 3600)}")
             except Exception:
                 pass
+        try:                                                          # v2.10.1: disk · drift · updates pending · MT5 age
+            from .server import heartbeat_line
+            lines.append(heartbeat_line())
+        except Exception:
+            pass
         for sym, ag in self.agents.items():
             h = ag.health
             pos_n = len((getattr(ag, "snapshot", {}) or {}).get("positions", []))

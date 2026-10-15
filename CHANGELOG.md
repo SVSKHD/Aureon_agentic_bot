@@ -2,6 +2,36 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.10.1 — 2026-10-15  (operations: unattended operation + server ownership; defaults unchanged for trades)
+Parts E and F of the v2.10.0 brief (v2.10.0 shipped A–D). New tooling and commands, so MINOR-sized; numbered 2.10.1 to keep
+the v2.11.0 number for the notifications release.
+- **E1 cold start** (`aureon_mt5/server.py`): boot without a marker → **COLD START** card + journal `cold_start` (Windows boot
+  time, last 1074/6006/6008 event and its reason, minutes down since the last heartbeat, positions re-adopted from
+  guardian_state). BACK ONLINE cards: `down X s` (marker time); new marker kinds `maintenance`, `repair-auto`, `repair-rollback`.
+- **E2 MT5 before the bot**: `aureon_service.ps1` starts `terminal64.exe` (`AUREON_MT5_PATH` / `logs/mt5_path.txt`);
+  `server.connect_mt5` retries 5 s → 30 s for `AUREON_MT5_BOOT_WAIT`, **MT5 NOT UP** after 5 min, exit 75; `broker.reset()`.
+- **E3 env check**: every numeric `Config` field parses through `_num` (an unparsable value no longer crashes the import: default
+  + recorded); `config.validate()` / `apply_fallbacks()` / `env_check_table()`; **BOOT CHECK** card; `/env-check`.
+- **E4 repair `auto`**: `repair.maybe_auto_apply` (guards: clean patch, flat, outside session unless the bot is unhealthy,
+  daily cap `AUREON_REPAIR_AUTO_PER_DAY`, fingerprint not rolled back before) → **REPAIR AUTO-APPLY** → `repair.Verifier` on the
+  new process → **REPAIR VERIFIED** after `AUREON_REPAIR_VERIFY_S`, or `git revert` + restart once → **REPAIR ROLLED BACK**,
+  `needs_human`, fingerprint blocked from auto.
+- **F1 maintenance** (`server.Maintenance`, `scripts/aureon_server.ps1 -Action plan|harden`): hourly pending-reboot check;
+  reboot / code update (+ suite; red → stay on the old commit) / housekeeping only flat and outside the session (or pending ≥
+  `AUREON_SERVER_MAINT_FORCE_AFTER_H`, flat); 60 s countdown aborted by a new position; `rotate_logs` never touches the journal or
+  state; pip on a changed requirements.txt. **The 5-minute auto-update moved into this window.**
+- **F2** `server.Mt5Manager`: disconnected 60 s → restart terminal, verify login + symbols. **F3** `check_clock` (boot + 6 h,
+  > 2 s → resync + card); `NetworkWatch` → `network_degraded` blocks new entries (guardian unchanged, tested); Notifier backlog →
+  one **NETWORK BACK** card. **F4** `/server`; heartbeat card line `disk · drift · updates pending · MT5 age`.
+- **F5** `aureon_mt5/tuning_auto.py` (`AUREON_TUNING_AUTO=off|shadow|apply`): replay gate (points ↑, losing trades ↓, regime
+  sign-off, pins) → shadow sessions (each must agree) → apply through the registry (weekly cap) with **STRATEGY CHANGE
+  APPLIED** + `/veto`; never-list. `tuning.propose` accepts guardian/regime registry features (registry range).
+- Registry: `repair_agent` gains `auto`; group `server`: `tuning_auto`, `maint_force_after_h`, `log_keep_days`.
+- Known gap (unchanged, pre-existing): `logs/overrides.json` written by `/approve` is shown by `/tuning` but not read by the
+  guardian, so only registry knobs can change automatically.
+- Tests: `test_v2101_unattended.py`, `test_v2101_server.py` (all OS calls through a faked `run_ps`).
+- Strategy rules changed: NO — pins test unchanged and green
+
 ## v2.10.0 — 2026-10-15  (MINOR: operations + context; defaults unchanged)
 Built on v2.8.0 — there is no v2.9.0: the "v2.9.0" pieces this release builds on (structure-gated flip, giveback,
 `_flip_evidence`, `request_flip_read`, the 15-Oct fixture) shipped in v2.8.0.

@@ -110,6 +110,8 @@ class Notifier:
         import queue as _q
         self.ask_queue: "_q.Queue[dict]" = _q.Queue()   # consumed by the bot (TAKE / SKIP buttons)
         self.bot_ready = False                          # set by bot.py when it can post interactive asks
+        self.last_ok = True                             # v2.10.1: last webhook POST succeeded (network watch)
+        self.backlog: list[str] = []                    # v2.10.1: titles that failed to post; one summary on reconnect
         self.claude_edit_hook = None                    # v1.10.0: set by bot.py — adds the Claude field to a posted ask card
         self.card_edit_hook = None                      # v2.0.2: set by bot.py — upserts named fields on a posted ask card (alerts)
 
@@ -233,11 +235,28 @@ class Notifier:
             self.posts += int(ok); self.failures += int(not ok)
             if not ok:
                 print(f"  (discord post failed: HTTP {r.status_code} {r.text[:120]})")
+            self._track(ok, embed, body)
             return ok
         except Exception as e:
             self.failures += 1
             print("  (discord post failed:", e, ")")
+            self._track(False, embed, body)
             return False
+
+    def _track(self, ok: bool, embed, body):
+        """v2.10.1: remember what failed; on the first success after failures post ONE summary card of the backlog."""
+        self.last_ok = ok
+        if not ok:
+            self.backlog = (self.backlog + [((embed or {}).get("title") or (body or "").splitlines()[0])[:120]])[-200:]
+            return
+        if self.backlog and not getattr(self, "_flushing", False):
+            missed, self.backlog = self.backlog, []
+            self._flushing = True
+            try:
+                self.raw("", embed=self.make_embed("AUREON · MT5 · NETWORK BACK",
+                                                   f"{len(missed)} card(s) could not be posted while offline:\n" + "\n".join(f"• {t}" for t in missed[-25:])))
+            finally:
+                self._flushing = False
 
 
 # --------------------------------------------------------------------------- v1.11.0 COMPARE card
