@@ -65,6 +65,8 @@ class Actions:
             tr = getattr(ag, "regime_tracker", None) if ag is not None else None
             if tr is not None and tr.blocks():
                 return [f"regime {tr.state}"] + list(tr.reasons or [f"score {tr.score:.2f}"])
+            if getattr(self.cfg, "htf_align", "off") == "block" and m.get("htf_ok") is False:      # v2.14.0
+                return ["HTF against"] + list(m.get("htf_reasons") or [])
             if m.get("kind") == "alert" and not (m.get("suggested_side") or m.get("side")):
                 return ["alert card without a suggested side — answer LONG / SHORT in Discord"]
         return []

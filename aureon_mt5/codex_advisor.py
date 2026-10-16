@@ -11,7 +11,7 @@ Fast exit is identical: the guardian runs first, a closed trade turns the queued
 a verdict that arrives after the next bar closed is STALE."""
 from __future__ import annotations
 
-from .claude_advisor import BAR_S, ClaudeAdvisor
+from .claude_advisor import BAR_S, ClaudeAdvisor, _bar_s  # noqa: F401  (BAR_S kept for imports)
 from .common import codex_cli
 from .common.timeutil import now_server
 
@@ -89,7 +89,7 @@ class CodexAdvisor(ClaudeAdvisor):
     def apply_pullback(self, agent, job: dict, p: dict | None, st: dict) -> bool:
         """Always returns False. No call into the guardian, the broker or MT5 exists on this path."""
         v = job["verdict"]; dec = v["decision"]
-        stale = now_server(agent.off) >= job["bar_t"] + 2 * BAR_S
+        stale = now_server(agent.off) >= job["bar_t"] + 2 * _bar_s()
         if p is None:
             note = "position no longer open — nothing to do"
             self.stats["fast_exit_cancels"] += 1

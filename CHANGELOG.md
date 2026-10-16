@@ -2,6 +2,38 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.14.0 — 2026-10-16  (MINOR: configurable execution timeframe, HTF alignment gate, /decide-timeframe; defaults unchanged)
+- **Execution timeframe** (`AUREON_EXEC_TF`, default `M5`). `common/tf_synth.py` holds the ladder, `TF_RULES` and the
+  minutes table. `BAR_S`, the confirm rule and every bar-count window come from it:
+  - confirm windows, pullback windows, P separation, whipsaw zone, P timeout, max bars;
+  - the regime windows, the chart length, the leg "slow" age;
+  - Claude/Codex staleness, `exit_audit --tf`.
+  At M5 every conversion returns the v2.13.0 constant and `strategy_overrides` is `{}`: byte-identical.
+  - M15 and up: confirm = hold 2 bars + gap ≥ `AUREON_CONFIRM_GAP_X_RANGE` (0.25) × the 20-bar average range, window 6.
+  - `broker.bars(tf=…)` / `bars_tf` take every ladder TF, and the fetch scales.
+  - `exec_tf` is on the boot card and in the journal's `process_start` row. It is applied after the Discord overrides.
+- **Synthetic M45** (`synth_m45`): 3 × M15 aligned to the server day. The open group is dropped, and a group with a gap is
+  skipped. It is cached per exec bar with the other HTF frames.
+- **HTF alignment gate** (`AUREON_HTF_ALIGN=off|show|block`, `htf_align.py`). For each confirm TF: gap, gap_x_range,
+  gap_slope3, bars_since_cross → `with` / `with_stale` / `pre` / `against` / `unknown`. `AUREON_HTF_ALIGN_MIN` all | any.
+  - `show`: an `HTF` card line, an HTF chart panel (`common/htf_chart.py`), `htf_align` in the Claude snapshot (also
+    compact) and one prompt line.
+  - `block`: `… · HTF against · not tradeable`. No ask and no Claude read, journaled `entry_blocked_htf`. A TAKE from the
+    pad or push is refused with the reasons. Open positions are never touched.
+- **Replay:** `--set exec_tf=… htf_align=… htf_confirm_tfs=… confirm_*`. The `--compare` baseline is the same set with the
+  gate off. Prints `asks_blocked_by_htf` (would have won / lost, blocked points) and the `pre` vs `with` entry results.
+  Bars are fetched at M15 when the exec TF is a multiple of 15.
+- **`/decide-timeframe tf [apply:false] [days:30] [force]`** (admin, `decide_tf.py`): the plan with rescaled follow knobs,
+  and the replay block vs off, cached per (tf, days, date). `apply:true` writes the overrides, journals
+  `timeframe_decided`, posts a loud card and restarts. It is refused with an open position unless `force`, and the gate is
+  set to `show`, never `block`. With no tf: the ladder and the last decision. `/console/state` has `timeframe`.
+- **Registry group `timeframe`:**
+  - `exec_tf` (not hot, loud), `confirm_hold_bars`, `confirm_gap_x_range`, `confirm_window_bars`;
+  - `htf_align` (hot; `block` is loud), `htf_confirm_tfs`, `htf_pre_max_gap`, `htf_with_max_bars`, `htf_require_fresh`,
+    `htf_align_min`.
+- Tests: `tests/test_v2140_exec_tf.py`, `tests/test_v2140_htf_align.py`, `tests/test_v2140_decide_tf.py`.
+- Strategy rules changed: NO (defaults) — YES with AUREON_EXEC_TF≠M5 or AUREON_HTF_ALIGN=block
+
 ## v2.13.0 — 2026-10-16  (MINOR: new guardian profile, selectable; defaults unchanged)
 - **`follow` guardian profile** (`AUREON_GUARDIAN_PROFILE=follow`, or per symbol `AUREON_GUARDIAN_PROFILE_<SYMBOL>`).
   `SymbolAgent._guard_follow` is dispatched per ticket and sticky like `classic` / `leg`. It does five things:

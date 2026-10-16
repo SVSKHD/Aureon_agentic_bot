@@ -9,6 +9,8 @@ Everything is in price points; on gold $1 of price = $1 per ounce.
 """
 from __future__ import annotations
 
+import dataclasses
+
 from dataclasses import dataclass, asdict, field
 
 import numpy as np
@@ -99,7 +101,10 @@ UNFILTERED = Rules(confirm_bars=0, late_entry_bars=0, min_gap=0.0, min_slope50=0
 
 
 def rules_for(symbol: str) -> Rules:
-    return RULES_SILVER if ("XAG" in symbol.upper() or "SILVER" in symbol.upper()) else RULES
+    base = RULES_SILVER if ("XAG" in symbol.upper() or "SILVER" in symbol.upper()) else RULES
+    from ...common.tf_synth import strategy_overrides             # v2.14.0: exec TF ≠ M5 → minute-based windows
+    over = strategy_overrides("ema5080")
+    return dataclasses.replace(base, **over) if over else base
 
 
 from ...common.news import SESSIONS, session_of, nfp_times, load_news  # shared helpers live in common

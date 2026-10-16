@@ -108,10 +108,16 @@ def main(argv=None) -> str:
     ap.add_argument("--days", type=int, default=7)
     ap.add_argument("--log-dir", default=os.path.join(ROOT, "logs"))
     ap.add_argument("--bars")
-    ap.add_argument("--after", type=int, default=12)
+    ap.add_argument("--after", type=int, default=None, help="bars after the close (default: 60 min of --tf bars)")
+    ap.add_argument("--tf", default=os.environ.get("AUREON_EXEC_TF", "M5"), help="exec timeframe of the bars (v2.14.0)")
     ap.add_argument("--early", type=float, default=10.0)
     ap.add_argument("--offset", type=float, default=float(os.environ.get("AUREON_SERVER_OFFSET", "3")))
     a = ap.parse_args(argv)
+    from aureon_mt5.common.tf_synth import bar_s, bars_for
+    global BAR_S
+    BAR_S = bar_s(a.tf.upper())
+    if a.after is None:
+        a.after = bars_for(60, a.tf.upper())
     j = load_journal(a.log_dir, time.time() - a.days * 86400)
     bars = load_bars(a.bars, a.log_dir) if any(r.get("event") == "exit" for r in j) else None
     out = table(audit(j, bars, after=a.after, early=a.early, offset_h=a.offset), days=a.days, after=a.after, early=a.early)

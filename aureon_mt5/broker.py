@@ -119,19 +119,31 @@ def now_server(off: float) -> int:
 
 
 # ----------------------------------------------------------------------------- data
-def bars(symbol: str, n: int, source: str, off: float) -> Bars:
+NATIVE_TF = {"M1": "TIMEFRAME_M1", "M5": "TIMEFRAME_M5", "M10": "TIMEFRAME_M10", "M15": "TIMEFRAME_M15", "M20": "TIMEFRAME_M20",
+             "M30": "TIMEFRAME_M30", "H1": "TIMEFRAME_H1", "H2": "TIMEFRAME_H2", "H3": "TIMEFRAME_H3", "H4": "TIMEFRAME_H4",
+             "H6": "TIMEFRAME_H6", "H8": "TIMEFRAME_H8", "H12": "TIMEFRAME_H12", "D1": "TIMEFRAME_D1"}
+
+
+def bars(symbol: str, n: int, source: str, off: float, tf: str = "M5") -> Bars:
+    """The execution bars. v2.14.0: `tf` = AUREON_EXEC_TF (default M5, the v2.13.0 call exactly). The Bars label stays "M5":
+    it is the strategies' key for 'the exec frame'."""
+    tf = str(tf or "M5").upper()
     m = mt5()
     if source == "mt5" and m:
         with _lock:
             m.symbol_select(symbol, True)
-            rates = m.copy_rates_from_pos(symbol, m.TIMEFRAME_M5, 0, n)
+            rates = m.copy_rates_from_pos(symbol, m.TIMEFRAME_M5 if tf == "M5" else getattr(m, NATIVE_TF[tf]), 0, n)
         if rates is None or len(rates) == 0:
             raise RuntimeError(f"copy_rates_from_pos({symbol}) empty: {_err()}")
         df = pd.DataFrame(rates).rename(columns={"tick_volume": "volume"})
         df = df[["time", "open", "high", "low", "close", "volume"]].copy()
         df["time"] = df["time"].astype("int64")
         return Bars(symbol, "M5", df)
-    return resample(synthetic_m1(symbol, n * 5, end_time=now_server(off)), "M5")
+    if tf == "M5":
+        return resample(synthetic_m1(symbol, n * 5, end_time=now_server(off)), "M5")
+    from .common.tf_synth import resample_tf, tf_minutes
+    m1 = synthetic_m1(symbol, n * tf_minutes(tf), end_time=now_server(off))
+    return Bars(symbol, "M5", resample_tf(m1.df, tf))
 
 
 def positions(symbol: str) -> list[dict]:
@@ -316,7 +328,11 @@ def lot_for_risk(symbol: str, stop_distance: float, risk_pct: float) -> dict | N
 def bars_tf(symbol: str, timeframe: str, n: int, source: str, off: float) -> pd.DataFrame:
     """Bars of another timeframe (M15 / H1) for the HTF context line. Synthetic fallback without MT5."""
     m = mt5()
-    tf_map = {"M1": "TIMEFRAME_M1", "M5": "TIMEFRAME_M5", "M15": "TIMEFRAME_M15", "H1": "TIMEFRAME_H1"}
+    timeframe = str(timeframe).upper()
+    if timeframe == "M45":                                   # v2.14.0: synthetic, from 3 × M15 (closed groups only)
+        from .common.tf_synth import synth_m45
+        return synth_m45(bars_tf(symbol, "M15", n * 3 + 3, source, off))
+    tf_map = NATIVE_TF
     if source == "mt5" and m and timeframe in tf_map:
         with _lock:
             m.symbol_select(symbol, True)
@@ -326,9 +342,13 @@ def bars_tf(symbol: str, timeframe: str, n: int, source: str, off: float) -> pd.
         df = pd.DataFrame(rates).rename(columns={"tick_volume": "volume"})
         df = df[["time", "open", "high", "low", "close", "volume"]].copy(); df["time"] = df["time"].astype("int64")
         return df
-    mins = {"M1": 1, "M5": 5, "M15": 15, "H1": 60}[timeframe]
-    m1 = synthetic_m1(symbol, n * mins, end_time=now_server(off))
-    return resample(m1, timeframe).df if timeframe in ("M5", "M15") else m1.df
+    mins = {"M1": 1, "M5": 5, "M15": 15, "H1": 60}.get(timeframe)
+    if mins is not None:                                     # the v2.13.0 synthetic path, unchanged
+        m1 = synthetic_m1(symbol, n * mins, end_time=now_server(off))
+        return resample(m1, timeframe).df if timeframe in ("M5", "M15") else m1.df
+    from .common.tf_synth import resample_tf, tf_minutes
+    m1 = synthetic_m1(symbol, n * tf_minutes(timeframe), end_time=now_server(off))
+    return resample_tf(m1.df, timeframe)
 
 
 def close_partial(ticket: int, symbol: str, fraction: float, comment: str = "aureon-partial") -> BrokerResult:

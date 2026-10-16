@@ -24,6 +24,74 @@ Production: run it under the supervisor (auto-restart, hang kill, boot start) �
 
     powershell -ExecutionPolicy Bypass -File .\scripts\aureon_service.ps1 -Action install
 
+## v2.14.0 — execution timeframe, alignment gate, /decide-timeframe
+
+**The rule in plain words:** trade on one timeframe; take the entry only when the two timeframes above it have already
+crossed our way, or are about to.
+
+**Execution timeframe** — `AUREON_EXEC_TF` (default `M5`, exactly v2.13.0). Every bar-count rule is a number of minutes
+converted to bars of the exec TF (`common/tf_synth.py`: `TF_RULES` + `MINUTES`). Session, news and IST logic are unchanged.
+`exec_tf` is not hot (a restart applies it); it is on the boot card and in the journal's `process_start` row.
+
+| exec TF | confirm TFs (default) | confirm: hold · window · gap | regime windows | P timeout |
+|---|---|---|---|---|
+| M5  | M10, M15  | 3 · 18 · 1.5 pts (v2.13.0) | 24 / 12 bars | 12 bars |
+| M10 | M15, M20  | 3 · 9 · 0.25× avg range | 12 / 6 | 6 |
+| M15 | M20, M30  | 2 · 6 · 0.25× | 8 / 4 | 4 |
+| M20 | M30, M45* | 2 · 6 · 0.25× | 6 / 3 | 3 |
+| M30 | M45*, H1  | 2 · 6 · 0.25× | 4 / 2 | 2 |
+| H1  | H2, H3    | 2 · 6 · 0.25× | 2 / 1 | 1 |
+| H2  | H3, H4    | 2 · 6 · 0.25× | 1 / 1 | 1 |
+| H4  | H6, H8    | 2 · 6 · 0.25× | 1 / 1 | 1 |
+
+\* M45 is synthetic: three M15 bars aligned to the server day (00:00, 00:45, … 32 per day; none straddles midnight). The
+open group is dropped (closed bars only), and a group with a missing M15 bar is skipped, never merged across the gap.
+The confirm rule can be overridden with `AUREON_CONFIRM_HOLD_BARS`, `AUREON_CONFIRM_GAP_X_RANGE` and
+`AUREON_CONFIRM_WINDOW_BARS` (0 = the table).
+
+**HTF alignment gate** — `AUREON_HTF_ALIGN=off|show|block` (default `off`). The confirm TFs are
+`AUREON_HTF_CONFIRM_TFS` (default: the next two rungs). On each confirm TF's closed bars, with the strategy's EMA pair:
+
+| state | meaning |
+|---|---|
+| `with` | EMA fast is on our side, and the cross happened ≤ `AUREON_HTF_WITH_MAX_BARS` (8) bars ago |
+| `with_stale` | on our side, older cross. Counts as `with` unless `AUREON_HTF_REQUIRE_FRESH=1` |
+| `pre` | still against, but converging (gap 3 bars ago was wider) and \|gap\| ≤ `AUREON_HTF_PRE_MAX_GAP` (0.35) × that TF's 20-bar avg range |
+| `against` | anything else: wide against, or widening against |
+| `unknown` | no data. Fails closed: never counts as `with` / `pre` |
+
+`AUREON_HTF_ALIGN_MIN=all` (default) needs every confirm TF to be `with` / `pre`. `any` needs at least one `with` and
+none `against`.
+- `show`: the entry card gets an `HTF` line (`HTF · M45 pre (gap -0.21× rng, converging) · H1 with (crossed 2 bars ago)`)
+  and an HTF chart panel. Claude's snapshot gets an `htf_align` block and one prompt line.
+- `block`: an entry that fails is posted as `… · HTF against · not tradeable`. It gets no buttons, no tracked ask and no
+  Claude entry read, and it is journaled `entry_blocked_htf`. A TAKE from the pad or the push layer on an ask that failed
+  the gate is refused with the reasons.
+- Open positions are never touched by the gate.
+
+**Replay:**
+
+    python tools/replay_guardian.py --from 2026-08-01 --to 2026-10-15 --compare \
+        --set exec_tf=M30 --set htf_align=block --set htf_confirm_tfs=M45,H1 \
+        --set guardian_profile=follow --set follow_stop_x_range=1.5
+
+The baseline in `--compare` is the same set with `htf_align=off`. The table adds `asks_blocked_by_htf` (would have won /
+lost, blocked points) and the results of entries made on `pre` vs on `with`. The bars come from MT5 (M15 when the exec TF
+is a multiple of 15, else M5). They are cached in `logs/bars/`.
+
+**`/decide-timeframe tf [apply:false] [days:30] [force:false]`** (admin):
+- Shows the plan: exec, confirm TFs, the confirm rule, and the follow knobs rescaled from the exec TF's average range over
+  `days`:
+  - stop = max(`FOLLOW_STOP`, 1.5 × avg range);
+  - step ≈ 1.5 × avg range, rounded to 5, floor 10;
+  - secure at ≈ 0.5 × avg range, floor 3.
+- Then the replay with the gate `block` and with it `off`, cached per (tf, days, date).
+- `apply:true` writes exactly those overrides (source `discord`), journals `timeframe_decided`, posts a loud card and
+  restarts. It is refused while a position is open (or flat cannot be proven) unless `force:true`.
+- The gate goes in as `show`. Promoting it is a separate `/feature-set htf_align block`.
+- With no `tf`: the ladder and the last decision.
+- `GET /console/state` has `timeframe: {exec, confirm, htf_align}`.
+
 ## v2.13.0 — follow profile
 
 **The rule in plain words:** once you are in, only the stop can take you out. Secure at +3. Then lock +10 behind each +10
