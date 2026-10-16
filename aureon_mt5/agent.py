@@ -131,6 +131,9 @@ class SymbolAgent(threading.Thread):
         self._resolved_profile = cfg.resolved_guardian_profile(_demo)
         self.off = cfg.server_utc_offset
         self.state: dict[int, dict] = journal.load_state(symbol)
+        for _st in self.state.values():                    # v2.12.0: a pending pre-exit ask never survives a restart
+            if isinstance(_st, dict):
+                _st.pop("pending_exit", None)
         from .regime import RegimeTracker                                # v2.10.0 regime: computed every closed bar
         self.regime_tracker = RegimeTracker(cfg, journal, symbol)
         self.regime: dict | None = None
@@ -1263,13 +1266,15 @@ class SymbolAgent(threading.Thread):
         r = broker.set_sl(p["ticket"], self.symbol, sl)
         self.health["last_broker_action"] = f"{action} {r.status} {datetime.now(IST):%H:%M:%S}"
         if r.status in ("SL_CHANGED", "ALREADY_BETTER"):
+            if r.status == "SL_CHANGED":
+                self.note_action(self.state.get(p["ticket"]), "sl_move", f"{action} → {sl:.2f}" if sl is not None else action)
             return True
         telemetry.failure(self.notify, self.journal, title="AUREON GUARDIAN FAILURE", key=self.key("ERROR", f"sl-{p['ticket']}-{action}-{r.retcode}"),
                           mode=self.S.name, symbol=self.symbol, ticket=p["ticket"], action=action, requested=r.requested_sl or sl,
                           current=r.existing_sl, bid=r.bid, ask=r.ask, retcode=r.retcode, comment=r.comment, last_error=r.last_error)
         return False
 
-    def _close(self, p, reason, title, key, st, journal_reason=None, bar_t=None):
+    def _close(self, p, reason, title, key, st, journal_reason=None, bar_t=None, extra: dict | None = None):
         event_name = {"p_flip": "FLIP CLOSE", "news_flat": "BANKED BEFORE NEWS", "claude_close": "CLAUDE CLOSED",
                       "opposite_cross": "OPPOSITE CROSS · CLOSED", "giveback": "GIVEBACK · CLOSED",
                       "setup_invalidated": "SETUP INVALIDATED · CLOSED",
@@ -1283,7 +1288,10 @@ class SymbolAgent(threading.Thread):
         self.health["last_broker_action"] = f"close {r.status} {datetime.now(IST):%H:%M:%S}"
         self.journal.log("exit", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], points=p["points"],
                          reason=journal_reason or reason, auto=bool(r.ok), alert_id=st.get("alert_id"),
-                         **({"flip_evidence": st["flip_evidence"]} if journal_reason == "p_flip" and st.get("flip_evidence") else {}))
+                         **({"flip_evidence": st["flip_evidence"]} if journal_reason == "p_flip" and st.get("flip_evidence") else {}),
+                         **(extra or {}))
+        st.pop("pending_exit", None)                    # v2.12.0: a close of any kind ends a pending pre-exit ask
+        self.note_action(st, journal_reason or "close", reason)
         if r.ok:
             self.notify.send(key, ctitle(self.symbol, event_name or ("CLOSED " + ("WIN" if p["points"] > 0 else "LOSS")), p["direction"]), [reason],
                              fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"],
@@ -1427,7 +1435,8 @@ class SymbolAgent(threading.Thread):
             elif g.slow_ema_sl and not st["pre"] and st["secured"] < g.secure_level and against_s:
                 reason, jr = f"bar closed through EMA {self.S.slow} ({es:.2f})", "ema_slow_stop"
             if reason:
-                self._close(p, reason, f"{'✅' if p['points'] > 0 else '🛑'} CLOSED — {tag}", self.key("CLOSED", f"{p['ticket']}-{bar_key(bar_t, self.off)}"), st, jr, bar_t)
+                self._close_or_defer(p, reason, f"{'✅' if p['points'] > 0 else '🛑'} CLOSED — {tag}",
+                                     self.key("CLOSED", f"{p['ticket']}-{bar_key(bar_t, self.off)}"), st, jr, bar_t, df)
 
     # ------------------------------------------------------------------ guardian: leg profile (v2.7.0/v2.7.1)
     def _guard_leg(self, p, st, g, s, new_bar, bar_t, df, close, ef, es, sgn, gap, tag):
@@ -1496,7 +1505,8 @@ class SymbolAgent(threading.Thread):
             if new_bar and cfg.setup_stop and st.get("setup") is not None and not setup_mod.setup_alive(st["setup"]):
                 self.journal.log("setup_invalidated", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"],
                                  failed=setup_mod.failed_checks(st["setup"]), close=close, points=p["points"], guardian_profile="leg")
-                self._close_leg(p, f"setup invalidated: {', '.join(setup_mod.failed_checks(st['setup']))}", tag, st, "setup_invalidated", bar_t)
+                self._close_leg(p, f"setup invalidated: {', '.join(setup_mod.failed_checks(st['setup']))}", tag, st, "setup_invalidated", bar_t,
+                                df=df)
                 return
 
             # P phase → cross confirmed
@@ -1563,13 +1573,197 @@ class SymbolAgent(threading.Thread):
                     self._close_leg(p, reason, tag, st, jr, bar_t)
                     return
 
-    def _close_leg(self, p, reason, tag, st, jr, bar_t):
-        """Close with profile + exit_rule in the card and journal."""
+    # ------------------------------------------------------------------ v2.12.0 Part A: what the guardian is about to do
+    def _giveback_fires(self, pts_at_close: float, peak: float) -> bool:
+        """The 1c giveback rule (bar CLOSE): fires when the close kept <= (1 − pct) of the peak. Shared with guardian_intent."""
+        kept = pts_at_close / peak if peak > 0 else 1.0
+        return kept <= 1.0 - self.cfg.giveback_pct / 100.0
+
+    def _giveback_floor_pts(self, peak: float) -> float:
+        return peak * (1.0 - self.cfg.giveback_pct / 100.0)
+
+    @staticmethod
+    def note_action(st: dict | None, rule: str, detail: str = "", t: float | None = None):
+        """v2.12.0: ring buffer of the last 3 guardian actions on this ticket (closes, SL moves, structure SL, flip holds)."""
+        if st is None:
+            return
+        ra = list(st.get("recent_actions") or [])
+        ra.append({"t": int(t if t is not None else _time.time()), "rule": rule, "detail": str(detail)[:120]})
+        st["recent_actions"] = ra[-3:]
+
+    def guardian_intent(self, p: dict, st: dict, df, close: float, ef: float, es: float, gap=None) -> dict:
+        """Pure read of the state the guardian already holds (no MT5 call): phase, levels and the NEXT exit rule with its
+        distance. Levels come from the same thresholds / helpers the guardian uses."""
+        g = self.g; cfg = self.cfg
+        s = 1 if p["direction"] == "long" else -1
+        entry = float(p["price_open"]); pts = float(p["points"])
+        pts_close = (float(close) - entry) * s
+        secured = float(st.get("secured", 0.0)); peak = float(st.get("peak", 0.0))
+        prof = st.get("guardian_profile", getattr(self, "_resolved_profile", "classic"))
+        leg = prof == "leg"
+        pre = bool(st.get("pre"))
+        px = lambda pt: round(entry + s * pt, 2)
+        if leg:
+            phase = "ride" if st.get("leg_phase") == "B" else ("pre" if pre else "protect")
+        elif pre:
+            phase = "pre"
+        elif g is not None and secured >= g.secure_level:
+            phase = "ride" if secured > g.secure_level else "secured"
+        else:
+            phase = "protect"
+        cands = []                                           # (rule, level, distance_pts, bars_left, fires_on)
+
+        def add(rule, level, dist, bars_left=None, fires="close"):
+            cands.append({"rule": rule, "level": level, "distance_pts": None if dist is None else round(float(dist), 2),
+                          "bars_left": bars_left, "fires_on": fires})
+        sl = float(p["sl"]) if p.get("sl") else None
+        if sl is not None:                                   # the broker stop: always the last line (tick)
+            sl_pts = (sl - entry) * s
+            add("ride_step" if secured > 0 else "pre_stop", round(sl, 2), pts - sl_pts, fires="tick")
+        elif g is not None:
+            add("pre_stop", px(-g.pre_stop), pts + g.pre_stop, fires="tick")
+        if g is not None and not leg:
+            if secured >= g.secure_level:
+                add("ema_fast_turn", round(float(ef), 2), (float(close) - float(ef)) * s)
+            if pre:
+                add("pre_stop", px(-g.pre_stop), pts_close + g.pre_stop)
+                if secured == 0 and not st.get("timeout_hold"):
+                    left = max(0, int(g.pre_timeout_bars) - int(st.get("bars", 0)))
+                    add("pre_timeout", None, max(0.0, pts_close) if left <= 1 else None, bars_left=left)
+            if g.slow_ema_sl and not pre and secured < g.secure_level:
+                add("ema_slow_stop", round(float(es), 2), (float(close) - float(es)) * s)
+        if leg and g is not None:
+            if st.get("leg_phase") == "B":
+                add("ema_slow_close", round(float(es), 2), (float(close) - float(es)) * s)
+            elif st.get("soft_trail_armed") and st.get("soft_lock") is not None:
+                add("soft_trail", px(float(st["soft_lock"])), pts_close - float(st["soft_lock"]))
+        gb_level = None
+        if cfg.giveback_pct > 0 and peak >= cfg.giveback_arm:
+            floor = self._giveback_floor_pts(peak)
+            gb_level = px(floor)
+            add("giveback", gb_level, pts_close - floor)
+        structure = cap_px = None
+        cap_pts = st.get("cap_pts")
+        if cap_pts:
+            cap_px = px(-float(cap_pts))
+        if st.get("setup") is not None and (cfg.setup_stop or st.get("setup_alive") is not None):
+            try:
+                cap = float(cap_pts or self._setup_cap(df))
+                spts, _sw = self._structure_stop(p, df, cap, (sl - entry) * s if sl else -cap)
+                structure = px(spts)
+            except Exception:
+                structure = None
+            if cfg.setup_stop and secured < (g.secure_level if g is not None else 1e9):
+                add("setup_invalidated", structure, 0.0 if st.get("setup_alive") is False else
+                    ((float(close) - structure) * s if structure is not None else None))
+        ranked = [c for c in cands if c["distance_pts"] is not None]
+        nxt = min(ranked, key=lambda c: c["distance_pts"]) if ranked else \
+            (min(cands, key=lambda c: c["bars_left"] if c["bars_left"] is not None else 1e9) if cands else None)
+        trail = None
+        if leg and st.get("trail_pts") is not None:
+            trail = px(float(st["trail_pts"]))
+        elif secured > 0:
+            trail = px(secured)
+        mae = float(st.get("mae", min(0.0, pts)))
+        return {"phase": phase, "profile": prof, "bars_in_trade": int(st.get("bars", 0)), "secured": round(secured, 2),
+                "peak": round(peak, 2), "mae": round(mae, 2), "trail_level": trail, "giveback_level": gb_level,
+                "structure_stop": structure, "cap": cap_px,
+                "next_exit": nxt or {"rule": "none", "level": None, "distance_pts": None, "bars_left": None, "fires_on": None},
+                "flip_evidence": list(st["flip_evidence"]) if st.get("flip_evidence") else None,
+                "setup_alive": st.get("setup_alive"), "recent_actions": list(st.get("recent_actions") or [])[-3:]}
+
+    # ------------------------------------------------------------------ v2.12.0 Part B: pre-exit read (show | defer)
+    PRE_EXIT_RULES = ("ema_fast_turn", "giveback", "setup_invalidated", "pre_timeout", "p_flip")
+
+    def _pre_exit_claude(self):
+        return next((a for a in self.advisors() if getattr(a, "SOURCE", "") == "claude"
+                     and hasattr(a, "request_pre_exit_read") and a.advises(self.S)), None)
+
+    def _pre_exit_cap(self, st) -> float:
+        if self.cfg.setup_stop and st.get("cap_pts"):
+            return float(st["cap_pts"])
+        return float(self.g.pre_stop) if self.g is not None else float(self.cfg.setup_max_dd)
+
+    def _close_or_defer(self, p, reason, title, key, st, jr, bar_t, df=None, detail: str = ""):
+        """v2.12.0: every close-based software exit goes through here. AUREON_PRE_EXIT_READ=off → _close exactly as before.
+        show → _close + a pre_exit read (journaled next to the close). defer → no close this bar; Claude is asked; the verdict
+        is applied in drain() (EXIT / timeout / error close by the original rule; HOLD waits one more bar, at most MAX)."""
+        mode = getattr(self.cfg, "pre_exit_read", "off")
+        if mode not in ("show", "defer") or jr not in self.PRE_EXIT_RULES or df is None:
+            return self._close(p, reason, title, key, st, jr, bar_t)
+        claude = self._pre_exit_claude()
+        if claude is None or p["points"] <= -self._pre_exit_cap(st) + 2.0:      # no voter, or within 2 pts of the cap
+            return self._close(p, reason, title, key, st, jr, bar_t)
+        detail = detail or reason
+        if mode == "show":
+            self._close(p, reason, title, key, st, jr, bar_t)
+            claude.request_pre_exit_read(self, p, st, bar_t, df, rule=jr, detail=detail, show=True)
+            return
+        pe = st.get("pending_exit")
+        if pe and pe.get("rule") != jr:                                       # a different rule fired: the old ask is moot
+            self._cancel_pending_exit(p, st, f"superseded by {jr}")
+            pe = None
+        if pe:
+            pe["seen_bar"] = bar_t
+            if pe.get("bar_t") == bar_t or pe.get("state") == "waiting":
+                return                                                        # still waiting for this bar's verdict
+        n = int(st.get("deferrals", 0))
+        if n >= int(self.cfg.pre_exit_max_defer):
+            st.pop("pending_exit", None)
+            return self._close(p, reason, title, key, st, jr, bar_t, extra={"claude_pre_exit": "max_deferrals", "deferrals": n})
+        job_id = f"{p['ticket']}-{bar_t}-{n}"
+        st["pending_exit"] = {"rule": jr, "bar_t": bar_t, "seen_bar": bar_t, "detail": detail, "reason": reason, "title": title,
+                              "key": key, "t": _time.time(), "state": "waiting", "job_id": job_id}
+        self.journal.log("exit_pending", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], rule=jr, detail=detail,
+                         points=p["points"], deferral_n=n)
+        self.notify.send(self.key("EXIT_PENDING", f"{p['ticket']}-{bar_key(bar_t, self.off)}"),
+                         ctitle(self.symbol, f"EXIT PENDING · {jr} · asking Claude", p["direction"]),
+                         [detail, f"the broker stop stays where it is · deferral {n}/{self.cfg.pre_exit_max_defer} used · "
+                                  f"closes by the rule if no answer in {self.cfg.pre_exit_wait_s:g} s"],
+                         fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"],
+                                                points=p["points"], sl=p["sl"] or None, secured=st.get("secured"), peak=st["peak"]),
+                         color=EVENT_COLOURS["flip"], footer=cfooter(self.S.display_name, "pre-exit"))
+        if not claude.request_pre_exit_read(self, p, st, bar_t, df, rule=jr, detail=detail, job_id=job_id, deferral_n=n):
+            st.pop("pending_exit", None)                                      # could not even ask (queue full): close now
+            return self._close(p, reason, title, key, st, jr, bar_t, extra={"claude_pre_exit": "error"})
+
+    def finish_pending_exit(self, p, st, outcome: str):
+        """Close by the pending rule (EXIT / timeout / error) — the original reason, title and journal rule."""
+        pe = st.pop("pending_exit", None)
+        if not pe:
+            return False
+        self._close(p, pe["reason"], pe["title"], pe["key"], st, pe["rule"], None,
+                    extra={"claude_pre_exit": outcome, "deferrals": int(st.get("deferrals", 0))})
+        return True
+
+    def _cancel_pending_exit(self, p, st, why: str):
+        pe = st.pop("pending_exit", None)
+        if pe:
+            self.journal.log("exit_cancelled", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], rule=pe["rule"], why=why,
+                             points=p["points"])
+
+    def _pending_exit_tick(self, p, st, new_bar, bar_t):
+        """Every poll: a verdict that did not come in AUREON_PRE_EXIT_WAIT_S closes by the rule. On a new bar close where the
+        pending rule did not fire again, the ask is moot (exit_cancelled). Never touches the SL."""
+        pe = st.get("pending_exit")
+        if not pe:
+            return
+        if pe.get("state") == "waiting" and _time.time() - float(pe.get("t", 0)) > float(self.cfg.pre_exit_wait_s):
+            self.finish_pending_exit(p, st, "timeout")
+
+    def _pending_exit_moot(self, p, st, new_bar, bar_t):
+        """After this bar's exit rules ran: a pending ask whose rule did not fire again on this close is cancelled."""
+        pe = st.get("pending_exit")
+        if pe and new_bar and pe.get("seen_bar") != bar_t and pe.get("bar_t") != bar_t:
+            self._cancel_pending_exit(p, st, "rule no longer true on the close")
+
+    def _close_leg(self, p, reason, tag, st, jr, bar_t, df=None):
+        """Close with profile + exit_rule in the card and journal. v2.12.0: df given → may be deferred (pre-exit read)."""
         profile = st.get("guardian_profile", "leg")
         label = f"{profile} · {jr}" if jr else profile
-        self._close(p, f"{reason} [{label}]",
-                    f"{'✅' if p['points'] > 0 else '🛑'} CLOSED — {tag}",
-                    self.key("CLOSED", f"{p['ticket']}-{bar_key(bar_t, self.off)}"), st, jr, bar_t)
+        self._close_or_defer(p, f"{reason} [{label}]",
+                             f"{'✅' if p['points'] > 0 else '🛑'} CLOSED — {tag}",
+                             self.key("CLOSED", f"{p['ticket']}-{bar_key(bar_t, self.off)}"), st, jr, bar_t, df)
 
     # ------------------------------------------------------------------ v2.8.0 setup view (AUREON_SETUP_STOP / Claude snapshot)
     def _setup_wanted(self) -> bool:
@@ -1682,6 +1876,10 @@ class SymbolAgent(threading.Thread):
             tag = f"{self.symbol} #{p['ticket']} {p['direction'].upper()} @ {p['price_open']:.2f}"
             if st.get("frozen"):
                 continue                                   # mode mismatch: keep SL, apply no strategy rules
+            if st.get("pending_exit"):                     # v2.12.0: verdict timeout / a moot ask (never touches the SL)
+                self._pending_exit_tick(p, st, new_bar, bar_t)
+                if st.get("pending_exit") is None and p["ticket"] in self.closed_by_aureon:
+                    continue
             if self._setup_wanted():                                           # v2.8.0
                 self._update_setup(p, st, s, new_bar, df, close, ef, es)
             if open_read_key is not False:
@@ -1717,6 +1915,7 @@ class SymbolAgent(threading.Thread):
                     if self._move_sl(p, lvl, "STRUCTURE SL"):
                         self.journal.log("structure_sl", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], swing=swing, cap=cap,
                                          level=lvl, points=round(pts, 2))
+                        self.note_action(st, "structure_sl", f"swing {swing} → {lvl:.2f}")
                         p = {**p, "sl": lvl}
 
             # 1) opposite P → close (flip). The replacement trade is yours to place.
@@ -1726,15 +1925,18 @@ class SymbolAgent(threading.Thread):
                 ev = self._flip_evidence(p, df, close, ef, es, gap) if self.cfg.flip_require_structure else None
                 if ev is None or len(ev) >= self.cfg.flip_min_evidence:
                     if ev is None:
-                        self._close(p, f"opposite P ({sig['direction']}) — flip", f"🔁 FLIP CLOSE — {tag}", self.key("FLIP", f"{p['ticket']}-{bar_key(bar_t, self.off)}"), st, "p_flip", bar_t)
+                        self._close_or_defer(p, f"opposite P ({sig['direction']}) — flip", f"🔁 FLIP CLOSE — {tag}",
+                                             self.key("FLIP", f"{p['ticket']}-{bar_key(bar_t, self.off)}"), st, "p_flip", bar_t, df)
                     else:
                         st["flip_evidence"] = ev
-                        self._close(p, f"opposite P ({sig['direction']}) — flip · structure confirms: {', '.join(ev)}", f"🔁 FLIP CLOSE — {tag}",
-                                    self.key("FLIP", f"{p['ticket']}-{bar_key(bar_t, self.off)}"), st, "p_flip", bar_t)
+                        self._close_or_defer(p, f"opposite P ({sig['direction']}) — flip · structure confirms: {', '.join(ev)}",
+                                             f"🔁 FLIP CLOSE — {tag}", self.key("FLIP", f"{p['ticket']}-{bar_key(bar_t, self.off)}"), st,
+                                             "p_flip", bar_t, df)
                     continue
                 # held: the structure does not confirm the opposite P — keep the SL, keep managing by the other rules
                 self.journal.log("opposite_p_ignored", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], direction=sig["direction"],
                                  evidence=ev, points=p["points"], peak=st["peak"])
+                self.note_action(st, "FLIP_HOLD", f"P {sig['direction']} not confirmed ({len(ev)}/{self.cfg.flip_min_evidence})")
                 self.notify.send(self.key("FLIP_HOLD", f"{p['ticket']}-{bar_key(bar_t, self.off)}"), ctitle(self.symbol, "OPPOSITE P · HOLDING", p["direction"]),
                                  [f"P {sig['direction']} formed but structure does not confirm ({len(ev)}/{self.cfg.flip_min_evidence}: "
                                   f"{', '.join(ev) or 'none'}) — keeping the SL, not flipping"],
@@ -1755,10 +1957,10 @@ class SymbolAgent(threading.Thread):
             if new_bar and self.cfg.giveback_pct > 0 and st["peak"] >= self.cfg.giveback_arm:
                 pts_at_close = (close - p["price_open"]) * s                 # the bar CLOSE, never the tick
                 kept = pts_at_close / st["peak"] if st["peak"] > 0 else 1.0
-                if kept <= 1.0 - self.cfg.giveback_pct / 100.0:
-                    self._close(p, f"gave back {100 * (1 - kept):.0f}% of peak +{st['peak']:.1f} (closed {pts_at_close:+.1f})",
-                                (f"✅ GIVEBACK EXIT — {tag}" if pts_at_close > 0 else f"🛑 GIVEBACK EXIT — {tag}"),
-                                self.key("GIVEBACK", f"{p['ticket']}-{bar_key(bar_t, self.off)}"), st, "giveback", bar_t)
+                if self._giveback_fires(pts_at_close, st["peak"]):
+                    self._close_or_defer(p, f"gave back {100 * (1 - kept):.0f}% of peak +{st['peak']:.1f} (closed {pts_at_close:+.1f})",
+                                         (f"✅ GIVEBACK EXIT — {tag}" if pts_at_close > 0 else f"🛑 GIVEBACK EXIT — {tag}"),
+                                         self.key("GIVEBACK", f"{p['ticket']}-{bar_key(bar_t, self.off)}"), st, "giveback", bar_t, df)
                     continue
 
             # v2.7.0/v2.7.1: guardian profile — "leg" or "classic"
@@ -1786,6 +1988,8 @@ class SymbolAgent(threading.Thread):
                 self._guard_leg(p, st, g, s, new_bar, bar_t, df, close, ef, es, sgn, gap, tag)
             else:
                 self._guard_classic(p, st, g, s, new_bar, bar_t, df, close, ef, es, sgn, gap, tag)
+            if st.get("pending_exit"):
+                self._pending_exit_moot(p, st, new_bar, bar_t)
             if p["ticket"] not in self.state:
                 continue  # position was closed
 

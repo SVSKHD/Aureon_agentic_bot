@@ -1,4 +1,4 @@
-# Aureon MT5 v2.11.2
+# Aureon MT5 v2.12.0
 
 You place the trade. Aureon detects (per selected EMA mode), fires a Discord gunshot, then manages what you placed:
 protect → secure +10 → ride in +5 steps → close on the fast-EMA turn → news safeguard. Reports and slash commands.
@@ -23,6 +23,31 @@ protected (SL never loosened) but receive no strategy rules; a `⚠️ MODE MISM
 Production: run it under the supervisor (auto-restart, hang kill, boot start) — **[docs/SERVICE.md](docs/SERVICE.md)**:
 
     powershell -ExecutionPolicy Bypass -File .\scripts\aureon_service.ps1 -Action install
+
+## v2.12.0 — guardian-aware reads
+
+**Claude now sees what the guardian is about to do.** Every READ on a position (open, drawdown, flip-held, pullback,
+`/claude-read`) carries a `guardian` block: phase (pre / protect / secured / ride), secured, peak, MAE, the trail /
+giveback / structure-stop / cap levels, the last three guardian actions, and `next_exit`, the closest exit rule with its
+level, distance in points, bars left and whether it fires on a close or a tick. The prompt tells Claude that HOLD means
+holding through that rule.
+
+**A vote before a close-based exit** (`AUREON_PRE_EXIT_READ`, default `off`):
+- `show`: the guardian closes as before, and a `pre_exit` read is journaled next to the close (grading only).
+- `defer`: for `ema_fast_turn`, `giveback`, `setup_invalidated`, `pre_timeout` and a structure-confirmed `p_flip`, the
+  guardian asks first. The card says **EXIT PENDING · rule · asking Claude**.
+  - Claude EXIT, no answer in `AUREON_PRE_EXIT_WAIT_S` (45 s), budget used or a CLI error → it closes now by the
+    original rule.
+  - Claude HOLD → **EXIT DEFERRED · 1/2**, and the rule is checked again on the next close. After
+    `AUREON_PRE_EXIT_MAX_DEFER` (2) HOLDs it closes without asking.
+- **Never deferred:** the broker / pre-stop, `ema_slow_stop`, news, an opposite confirmed cross, the ride staircase, and any
+  trade within 2 pts of its cap. A deferral never moves the SL.
+
+`/advisor-report` gains a **pre-exit** section: deferrals, average gain per deferral (graded
+`AUREON_PRE_EXIT_GRADE_BARS` = 6 bars later), and how often a deferred trade went on to hit the cap.
+`python tools/exit_audit.py --days 7` shows which software exits close trades early. Per rule it lists the count, the
+average points at the close, the average MFE over the 12 bars after the close, and how often price went ≥ +10 further.
+Use it to pick the rules that deserve `defer`.
 
 ## v2.11.2 — a network loss never ends the process
 

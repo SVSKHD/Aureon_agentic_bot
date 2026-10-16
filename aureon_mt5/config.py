@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from dotenv import load_dotenv
 load_dotenv()   # load .env if present
 
-VERSION = "2.11.2"
+VERSION = "2.12.0"
 
 
 def _parse_lot_buttons(raw: str) -> list[float]:
@@ -202,6 +202,12 @@ class Config:
     # v2.11.2 network loss: entries stay off while degraded unless the operator allows them; optional MT5 host for the DNS check
     network_degraded_entries: bool = os.environ.get("AUREON_NETWORK_DEGRADED_ENTRIES", "0") == "1"
     mt5_host: str = os.environ.get("AUREON_MT5_HOST", "").strip()
+    # v2.12.0 pre-exit read: before a close-based software exit Claude gets a vote (off = v2.11.2, show = journal only,
+    # defer = HOLD delays the close by one bar, at most AUREON_PRE_EXIT_MAX_DEFER times; the broker stop never moves)
+    pre_exit_read: str = os.environ.get("AUREON_PRE_EXIT_READ", "off").strip().lower()
+    pre_exit_wait_s: float = _num("AUREON_PRE_EXIT_WAIT_S", "45", float)
+    pre_exit_max_defer: int = _num("AUREON_PRE_EXIT_MAX_DEFER", "2", int)
+    pre_exit_grade_bars: int = _num("AUREON_PRE_EXIT_GRADE_BARS", "6", int)
     # regime score weights (sum need not be 1; the score is clipped to [0, 1])
     regime_weights: dict = field(default_factory=lambda: {"crosses": 0.30, "flat_gap": 0.20, "adx": 0.20, "di": 0.10,
                                                           "failed_p": 0.10, "compression": 0.10})

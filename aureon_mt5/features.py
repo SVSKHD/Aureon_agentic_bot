@@ -56,6 +56,15 @@ def registry() -> list[Feature]:
                 consequence="Claude may now cut a losing trade from a drawdown read"),
         Feature("max_calls", "AUREON_CLAUDE_MAX_CALLS", "int", 30, "claude_max_calls", "claude",
                 "Claude calls per IST day, all symbols", min=0, max=1000),
+        Feature("pre_exit_read", "AUREON_PRE_EXIT_READ", "enum", "off", "pre_exit_read", "claude",
+                "before a close-based software exit (ema_fast_turn, giveback, setup_invalidated, pre_timeout, p_flip): off · "
+                "show = read journaled next to the close · defer = Claude HOLD delays the close one bar (broker stop unchanged)",
+                choices=("off", "show", "defer"), loud=True, loud_values=("defer",),
+                consequence="close-based exits may now wait up to {pre_exit_max_defer} bars for Claude (broker stop unchanged)"),
+        Feature("pre_exit_max_defer", "AUREON_PRE_EXIT_MAX_DEFER", "int", 2, "pre_exit_max_defer", "claude",
+                "pre-exit HOLDs per trade before the rule closes without asking", min=0, max=5),
+        Feature("pre_exit_wait_s", "AUREON_PRE_EXIT_WAIT_S", "float", 45.0, "pre_exit_wait_s", "claude",
+                "seconds the guardian waits for the pre-exit verdict before closing by the rule", min=10.0, max=240.0, unit="s"),
         # ---- guardian
         Feature("flip_require_structure", "AUREON_FLIP_REQUIRE_STRUCTURE", "bool", False, "flip_require_structure", "guardian",
                 "an opposite P closes the trade only when the structure confirms it (next bar)"),

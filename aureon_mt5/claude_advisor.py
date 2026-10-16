@@ -63,7 +63,12 @@ DD_RULES = ("DRAWDOWN READ: the trade is under water but the setup is still aliv
             "HOLD unless you see structure the rules do not. EXIT means take this loss now rather than wait for the stop at −{cap}.")
 FLIP_RULES = ("FLIP HELD: an opposite P formed but the structure did not confirm it, so the guardian kept the trade "
               "(flip_evidence lists what did confirm). Decide HOLD or EXIT for this position.")
-READ_TRIGGERS = ("open", "drawdown", "opposite P held")
+GUARDIAN_RULES = ("GUARDIAN block = what the bot will do on its own: `next_exit` is the closest exit rule and its distance. HOLD "
+                  "means hold THROUGH that rule; EXIT means agree with it or go earlier. Never ask for the SL to be moved away.")
+PRE_EXIT_RULES = ("PRE-EXIT READ: the guardian is about to close this trade by rule `{rule}` ({detail}). The broker stop stays where it "
+                  "is regardless. Answer HOLD only if the structure says the rule is reacting to noise (cite evidence); otherwise "
+                  "EXIT. A deferral is one bar; at most {max_defer}. Deferrals used so far: {used}.")
+READ_TRIGGERS = ("open", "drawdown", "opposite P held", "pre_exit")
 
 
 def read_prompt_text(base: str, extra: str = "") -> str:
@@ -182,6 +187,12 @@ def build_snapshot(agent, event: str, side: str, bar_t: int, df, *, position: di
                      "dist_to_sl": round(abs(float(position.get("current", close)) - sl), 2) if sl else None,
                      # v2.8.0 setup view (the guardian's per-ticket checks; None until computed)
                      "setup": st.get("setup"), "setup_alive": st.get("setup_alive"), "dist_to_cap": st.get("dist_to_cap")})
+        intent = getattr(agent, "guardian_intent", None)                # v2.12.0 Part A: what the guardian is about to do
+        if callable(intent):
+            try:
+                snap["guardian"] = intent(position, st, df, close, e50, e80, f_arr - s_arr)
+            except Exception as e:
+                telemetry.info(f"guardian_intent failed: {e!r}")
     return snap
 
 
@@ -206,7 +217,7 @@ def _day_stats(agent) -> tuple[float, int]:
 SNAPSHOT_KEEP = ("gap", "dist_to_fast_ema_pts", "swing_against_last6_pts", "atr20", "avg_range", "crosses_today", "bars_since_cross",
                  "confirm_state", "session", "trend_state", "minutes_to_news", "day_pnl_pts", "trades_today", "retrace_pct",
                  "retrace_from_peak_pts", "bars_since_peak", "mae_so_far", "closed_through_slow_ema", "dist_to_sl", "peak", "open_profit",
-                 "setup", "setup_alive", "dist_to_cap", "trigger", "zl", "regime")
+                 "setup", "setup_alive", "dist_to_cap", "trigger", "zl", "regime", "guardian", "pending_exit", "deferrals_used")
 
 
 def _compact(snap: dict) -> dict:
@@ -514,6 +525,35 @@ class ClaudeAdvisor:
         kind = sig["kind"] if (sig and sig.get("direction") == p["direction"].upper() and sig.get("bar_time") == bar_t) else None
         return self._request_read(agent, p, st, bar_t, df, trigger="open", extra=OPEN_RULES, kind=kind, card_key=card_key)
 
+    def request_pre_exit_read(self, agent, p: dict, st: dict, bar_t: int, df, *, rule: str, detail: str, show: bool = False,
+                              job_id: str | None = None, deferral_n: int = 0) -> bool:
+        """v2.12.0: the guardian is about to close by `rule`. show → journal only (the close already happened);
+        defer → the verdict decides in drain(): EXIT / error → close now, HOLD → one more bar. Claude only."""
+        if self.SOURCE != "claude" or not self.advises(agent.S):
+            return False
+        used = int(st.get("deferrals", 0))
+        level = None
+        try:
+            g = agent.guardian_intent(p, st, df, float(df["close"].iloc[-1]), float(df[agent.S.ema_cols[0]].iloc[-1]),
+                                      float(df[agent.S.ema_cols[1]].iloc[-1]))
+            ne = g.get("next_exit") or {}
+            level = ne.get("level") if ne.get("rule") == rule else None
+        except Exception:
+            pass
+        extra_snap = {"pending_exit": {"rule": rule, "detail": detail, "level": level}, "deferrals_used": used}
+        extra = PRE_EXIT_RULES.format(rule=rule, detail=detail, max_defer=int(getattr(self.cfg, "pre_exit_max_defer", 2)), used=used)
+        side = p["direction"].upper()
+        snap = build_snapshot(agent, "READ", side, bar_t, df, position=p, st=st)
+        snap["trigger"] = "pre_exit"
+        snap.update(extra_snap)
+        job = {"type": "read", "event": "READ", "symbol": agent.symbol, "side": side, "ticket": p["ticket"], "bar_t": bar_t,
+               "off": agent.off, "snapshot": snap, "agent": agent, "open_profit": p["points"], "trigger": "pre_exit", "extra": extra,
+               "model": self.entry_model, "mode_name": agent.S.name, "display": agent.S.display_name, "card_key": None,
+               "sl": p.get("sl") or None, "rule": rule, "deferral_n": deferral_n, "pre_exit_show": bool(show), "job_id": job_id}
+        if self.wants_image("READ"):
+            job["df"] = df.copy()
+        return self._enqueue(job)
+
     def maybe_drawdown(self, agent, p: dict, st: dict, bar_t: int, df) -> bool:
         """v2.8.0: event-driven READs while the trade is under water on the CLOSE and the setup is still alive:
         first drawdown >= DD_READ_AT, each new trough >= DD_READ_STEP deeper, one last chance when <= 2 pts from the cap.
@@ -553,14 +593,27 @@ class ClaudeAdvisor:
         if png:
             job["png"] = png
         res = self._call(self.read_prompt(job["snapshot"], job.get("extra", "")), job["model"], "READ", image=png)
+        pre_exit = job.get("trigger") == "pre_exit" and not job.get("pre_exit_show")
         if res is None:
-            self._journal(job, None, latency=0.0, acted=False, stale=False, error="budget used"); return
+            self._journal(job, None, latency=0.0, acted=False, stale=False, error="budget used")
+            if pre_exit:                                       # v2.12.0: the guardian closes by its rule now
+                job["verdict"] = None; job["error"] = "budget used"
+                inbox = self._inbox(job["agent"])
+                if inbox is not None:
+                    inbox.put(job)
+            return
         v = res.verdict if res.ok else None
         err = res.error or "no verdict"
         if v is not None and v["decision"] not in ("HOLD", "EXIT"):
             err = f"{v['decision']} is not valid on an open position"; v = None
         if v is None:
-            self._journal(job, None, latency=res.latency_s, acted=False, stale=False, error=err); return
+            self._journal(job, None, latency=res.latency_s, acted=False, stale=False, error=err)
+            if pre_exit:
+                job["verdict"] = None; job["error"] = err
+                inbox = self._inbox(job["agent"])
+                if inbox is not None:
+                    inbox.put(job)
+            return
         v["side"] = _side_word(job["side"])
         self.stats["last_verdict"] = f"{job['symbol']} READ ({job['trigger']}) {v['decision']} · {v['confidence']} · {datetime.now(IST):%H:%M} IST"
         self.stats["last_verdict_by_symbol"][job["symbol"]] = f"{datetime.now(IST):%H:%M} IST {v['decision']}"
@@ -603,7 +656,8 @@ class ClaudeAdvisor:
         fast, slow = (names["fast"], names["slow"]) if isinstance(names, dict) else names
         head = (f"MODE: {snapshot.get('mode', '?')} — fast EMA = {fast}, slow EMA = {slow}. Apply the section for this mode; "
                 f"ema_fast/ema_slow in the snapshot are {fast}/{slow}.\n\n")
-        extra = "".join(f"\n\n{t}" for k, t in (("zl", ZL_RULES), ("regime", REGIME_RULES)) if snapshot.get(k))
+        extra = "".join(f"\n\n{t}" for k, t in (("zl", ZL_RULES), ("regime", REGIME_RULES), ("guardian", GUARDIAN_RULES))
+                        if snapshot.get(k))
         return head + self.rules.strip() + extra + "\n\nSNAPSHOT:\n" + json.dumps(snapshot, default=str)
 
     def read_prompt(self, snapshot: dict, extra: str = "") -> str:
@@ -731,10 +785,46 @@ class ClaudeAdvisor:
                 p = next((x for x in positions if x["ticket"] == job["ticket"]), None)
                 if p is not None and p["ticket"] in getattr(agent, "closed_by_aureon", set()):
                     p = None                             # the guardian already closed it: hard exits win
+                if job.get("trigger") == "pre_exit":
+                    self.apply_pre_exit(agent, job, p, agent.state.get(job["ticket"], {}) if p else {})
+                    continue
                 self.apply_pullback(agent, job, p, agent.state.get(job["ticket"], {}) if p else {})
             except Exception as e:
                 telemetry.failure(self.health, self.journal, title=f"AUREON {self.TAG} ERROR", key=f"{agent.S.name}:{agent.symbol}:{self.TAG}_ERROR:apply",
                                   mode=agent.S.name, symbol=agent.symbol, action=f"{self.SOURCE} pullback verdict", exc=e)
+
+    def apply_pre_exit(self, agent, job: dict, p: dict | None, st: dict) -> str:
+        """v2.12.0 (AGENT thread): EXIT / no verdict → close now by the original rule; HOLD → one more bar (deferrals += 1).
+        show mode or a moot ask (closed / cancelled / superseded) → journaled only. Never moves the SL."""
+        v = job.get("verdict")
+        pe = st.get("pending_exit") if p is not None else None
+        if job.get("pre_exit_show") or p is None or not pe or pe.get("job_id") != job.get("job_id"):
+            if v is not None:
+                self._journal(job, v, latency=job.get("latency", 0.0), acted=False, stale=False,
+                              note="pre-exit read · shown with the close" if job.get("pre_exit_show") else "pre-exit ask no longer pending")
+            return "moot"
+        if v is None or v["decision"] == "EXIT":
+            outcome = "exit" if v is not None else ("error" if job.get("error") else "timeout")
+            agent.finish_pending_exit(p, st, outcome)
+            if v is not None:
+                self._journal(job, v, latency=job.get("latency", 0.0), acted=True, stale=False, note=f"closed by {job['rule']} (Claude EXIT)")
+            return outcome
+        st["deferrals"] = int(st.get("deferrals", 0)) + 1
+        pe["state"] = "held"
+        n, mx = st["deferrals"], int(getattr(self.cfg, "pre_exit_max_defer", 2))
+        agent.journal.log("exit_deferred", symbol=agent.symbol, mode=agent.S.name, ticket=p["ticket"], rule=job["rule"],
+                          reason=v.get("reason"), p_win=v.get("p_win"), deferral_n=n, points=p["points"], price=p.get("current"))
+        agent.note_action(st, "exit_deferred", f"{job['rule']} · Claude HOLD {n}/{mx}")
+        self._journal(job, v, latency=job.get("latency", 0.0), acted=True, stale=False, note=f"{job['rule']} deferred {n}/{mx}")
+        try:
+            agent._save_state_now()
+        except Exception:
+            pass
+        self.notify.send(agent.key("EXIT_DEFERRED", f"{p['ticket']}-{n}"),
+                         ctitle(agent.symbol, f"EXIT DEFERRED · {job['rule']} · Claude HOLD · {n}/{mx}", p["direction"]),
+                         [f"\"{v.get('reason') or ''}\"", "the broker stop is unchanged · the rule is checked again on the next close"],
+                         color=EVENT_COLOURS["flip"], footer=cfooter(agent.S.display_name, "pre-exit"))
+        return "hold"
 
     def apply_pullback(self, agent, job: dict, p: dict | None, st: dict) -> bool:
         """Returns True when an action was applied in MT5. Order: MT5 → confirm → state → journal → Discord."""
@@ -874,7 +964,8 @@ class ClaudeAdvisor:
                              trigger=job.get("trigger"), error=error or None, note=note or None,
                              evidence=(v or {}).get("evidence") or [], alert_id=job.get("alert_id"),
                              image=bool(job.get("png")), p_win=(v or {}).get("p_win"),
-                             snapshot_fields=_compact(job.get("snapshot") or {}))
+                             snapshot_fields=_compact(job.get("snapshot") or {}),
+                             **({"rule": job.get("rule"), "deferral_n": job.get("deferral_n")} if job.get("trigger") == "pre_exit" else {}))
         except Exception as e:
             telemetry.info(f"{self.SOURCE} journal failed: {e!r}")
 

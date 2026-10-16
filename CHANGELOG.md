@@ -2,6 +2,40 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.12.0 — 2026-10-16  (MINOR: guardian intent in reads; pre-exit read with bounded deferral behind env; defaults unchanged)
+- **Part A, guardian intent** (`SymbolAgent.guardian_intent`): a pure read of the guardian's state (no MT5 call).
+  - Fields: phase pre / protect / secured / ride (both profiles), bars in trade, secured, peak, MAE, the trail / giveback /
+    structure-stop / cap levels, flip evidence, setup_alive, and the last 3 guardian actions (`st["recent_actions"]`,
+    written by `_close`, `_move_sl`, structure SL, FLIP_HOLD and exit deferrals).
+  - `next_exit` is the candidate with the smallest distance: the broker stop (tick), ema_fast_turn, pre_stop, pre_timeout
+    (bars_left), ema_slow_stop, giveback (same `_giveback_fires` / `_giveback_floor_pts` helpers the guardian uses),
+    setup_invalidated, and the leg profile's soft_trail and ema_slow_close.
+  - The block goes in `snap["guardian"]` of every position snapshot (open, drawdown, flip-held, pullback, `/claude-read`)
+    and in `_compact`. The prompt gains a GUARDIAN paragraph.
+- **Part B, pre-exit read** (`AUREON_PRE_EXIT_READ=off|show|defer`, registry: `pre_exit_read` loud on `defer`,
+  `pre_exit_max_defer`, `pre_exit_wait_s`). The five close-based exits go through `_close_or_defer`:
+  - `show`: close plus a `pre_exit` read.
+  - `defer`: `pending_exit` + EXIT PENDING card. The verdict is applied in `drain()` on the agent thread:
+    - EXIT, timeout or error → close by the original rule (`claude_pre_exit` on the `exit` row).
+    - HOLD → `exit_deferred` + EXIT DEFERRED card; asked again only while `deferrals < MAX`, then the close is unconditional.
+  - Never deferred: `pre_stop`, `ema_slow_stop`, news, an opposite confirmed cross, the staircase, or a trade within 2 pts
+    of the cap. The SL is never touched (tested).
+  - `pending_exit` is cleared on any close, when the rule is no longer true on the next close (`exit_cancelled`), and
+    on restart.
+  - Pre-exit `claude_verdict` rows carry `trigger="pre_exit"`, `rule`, `deferral_n`.
+- **B3 grading:** `advisor_board.pre_exit_grades` computes `deferral_gain_pts` (points `AUREON_PRE_EXIT_GRADE_BARS` = 6
+  bars later, or at the exit, minus points at the rule). `/advisor-report` gets a pre-exit section.
+- **B4** `tools/exit_audit.py --days 7`. Exit audit for the last 7 days: this build ran on a copy of the repo with no live
+  journal (`logs/journal.jsonl` lives on the trading box), so the table is empty here:
+  ```
+  exit audit · last 7 days · MFE over 12 bars after the close · early = ≥ +10 pts
+  rule                    n  avg pts @close  avg MFE after  closed early
+  (no software exits in the journal for this window)
+  ```
+  Run `python tools/exit_audit.py --days 7` on the box. Bars come from `logs/bars/*.parquet`, else MT5.
+- Tests: `tests/test_v2120_guardian_reads.py` (20 tests). The rest of the suite is unchanged with the default `off`.
+- Strategy rules changed: NO (defaults) — YES with AUREON_PRE_EXIT_READ=defer (close-based exits may be delayed up to 2 bars; broker stop unchanged)
+
 ## v2.11.2 — 2026-10-15  (PATCH: process survival on network loss)
 Root cause: with DNS gone the Discord login raised, `bot._runner` let the `discord-bot` thread end, and once the gateway had
 been down for 300 s `HealthGuard._maybe_restart` treated that as a hang and called `ops.hard_exit(75)` → `os._exit(75)`
