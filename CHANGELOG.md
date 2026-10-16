@@ -2,6 +2,33 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.13.0 — 2026-10-16  (MINOR: new guardian profile, selectable; defaults unchanged)
+- **`follow` guardian profile** (`AUREON_GUARDIAN_PROFILE=follow`, or per symbol `AUREON_GUARDIAN_PROFILE_<SYMBOL>`).
+  `SymbolAgent._guard_follow` is dispatched per ticket and sticky like `classic` / `leg`. It does five things:
+  - **Adopt:** stop at entry − `FOLLOW_STOP` (or range-scaled), never loosened.
+  - **Secure:** +`SECURE_LEVEL` at live +`SECURE_AT`.
+  - **Step ladder:** k = floor((peak − CLEARANCE) / STEP); the stop is (k − 1)·STEP, floored at the secure level. Each k
+    gets a `follow_lock` journal row; a card is posted only when the stop moves. `continuous` mode keeps the stop at
+    peak − STEP. A lock is never placed above the live price; after a restart the ladder value for the live points is used.
+  - **Exits:** the broker stop (`closed` row `reason="stop"`, no "why?" ask); news flat while unsecured; an opposite
+    confirmed cross with ≥ `FLIP_MIN_EVIDENCE` (reason `flip`, through the v2.12 pre-exit read when on); `MAX_HOLD_BARS`
+    (unsecured AND setup dead).
+  - **Not used:** P timeout, EMA turn, P flip, giveback, slow-EMA close, setup stop. `setup_alive` is still computed.
+- Journal rows carry `profile="follow"`, `lock_level`, `peak`. `rebuild_state_for_ticket` restores the profile with peak
+  and secured; the live SL stays the truth.
+- **Guardian block for follow:** `next_exit` is the stop (`stop` / `ride_step`), plus `next_lock` (level and the trigger
+  peak). The v2.12 "within 2 pts of the cap" check uses the follow stop.
+- **Registry group `follow`:** `guardian_profile`, `follow_stop`, `follow_stop_x_range`, `follow_secure_at`,
+  `follow_secure_level`, `follow_step`, `follow_clearance`, `follow_trail_mode`, `follow_exit_on_flip`, `follow_news_flat`,
+  `follow_max_hold_bars` (not hot) and `follow_pre_exit_read` (hot).
+- **Commands:** `/governor` shows the profile, its knobs and each open ticket's profile. `/mode` warns that open tickets
+  keep theirs.
+- **Replay:** `tools/replay_guardian.py --set guardian_profile=follow` (and every `follow_*` knob). A broker-stop exit is
+  reported as `stop`, with the sequence per trade. The 15-Oct fixture: `classic` p_flip −1.20 → `follow`
+  `secured +3 → stop` +3.00.
+- Tests: `tests/test_v2130_follow.py` (24). `classic` and `leg` suites unchanged.
+- Strategy rules changed: NO (default profile) — YES when AUREON_GUARDIAN_PROFILE=follow
+
 ## v2.12.0 — 2026-10-16  (MINOR: guardian intent in reads; pre-exit read with bounded deferral behind env; defaults unchanged)
 - **Part A, guardian intent** (`SymbolAgent.guardian_intent`): a pure read of the guardian's state (no MT5 call).
   - Fields: phase pre / protect / secured / ride (both profiles), bars in trade, secured, peak, MAE, the trail / giveback /

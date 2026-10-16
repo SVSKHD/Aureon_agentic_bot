@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from dotenv import load_dotenv
 load_dotenv()   # load .env if present
 
-VERSION = "2.12.0"
+VERSION = "2.13.0"
 
 
 def _parse_lot_buttons(raw: str) -> list[float]:
@@ -208,6 +208,19 @@ class Config:
     pre_exit_wait_s: float = _num("AUREON_PRE_EXIT_WAIT_S", "45", float)
     pre_exit_max_defer: int = _num("AUREON_PRE_EXIT_MAX_DEFER", "2", int)
     pre_exit_grade_bars: int = _num("AUREON_PRE_EXIT_GRADE_BARS", "6", int)
+    # v2.13.0 follow guardian profile (AUREON_GUARDIAN_PROFILE=follow): secure early, lock every +STEP, exit only on the stop
+    follow_stop: float = _num("AUREON_FOLLOW_STOP", "25", float)
+    follow_stop_x_range: float = _num("AUREON_FOLLOW_STOP_X_RANGE", "0", float)
+    follow_secure_at: float = _num("AUREON_FOLLOW_SECURE_AT", "3", float)
+    follow_secure_level: float = _num("AUREON_FOLLOW_SECURE_LEVEL", "3", float)
+    follow_step: float = _num("AUREON_FOLLOW_STEP", "10", float)
+    follow_clearance: float = _num("AUREON_FOLLOW_CLEARANCE", "2", float)
+    follow_trail_mode: str = os.environ.get("AUREON_FOLLOW_TRAIL_MODE", "step").strip().lower()
+    follow_exit_on_flip: str = os.environ.get("AUREON_FOLLOW_EXIT_ON_FLIP", "structure").strip().lower()
+    follow_news_flat: bool = os.environ.get("AUREON_FOLLOW_NEWS_FLAT", "1") == "1"
+    follow_max_hold_bars: int = _num("AUREON_FOLLOW_MAX_HOLD_BARS", "0", int)
+    follow_pre_exit_read: bool = os.environ.get("AUREON_FOLLOW_PRE_EXIT_READ", "1") == "1"   # the flip exit asks Claude when
+                                                                                           # AUREON_PRE_EXIT_READ is on
     # regime score weights (sum need not be 1; the score is clipped to [0, 1])
     regime_weights: dict = field(default_factory=lambda: {"crosses": 0.30, "flat_gap": 0.20, "adx": 0.20, "di": 0.10,
                                                           "failed_p": 0.10, "compression": 0.10})
@@ -232,9 +245,13 @@ class Config:
     dry: bool = False
     _test_skip_session: bool = False   # set True in tests to skip governor session_window (never in production)
 
-    def resolved_guardian_profile(self, is_demo: bool | None = None) -> str:
+    def resolved_guardian_profile(self, is_demo: bool | None = None, symbol: str | None = None) -> str:
         """Resolve guardian profile: explicit value > auto (leg on demo, classic on live).
         is_demo=None (unknown) → classic (safe default)."""
+        if symbol:                                    # v2.13.0: per symbol, e.g. AUREON_GUARDIAN_PROFILE_XAUUSD=follow
+            per = os.environ.get(f"AUREON_GUARDIAN_PROFILE_{symbol.upper()}", "").strip().lower()
+            if per in ("classic", "leg", "follow"):
+                return per
         if self.guardian_profile not in ("auto", ""):
             return self.guardian_profile
         if is_demo is True:

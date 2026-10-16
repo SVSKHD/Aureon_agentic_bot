@@ -901,6 +901,36 @@ def ask_decision(cfg, agents, journal, item: dict, decision: str, user, notify=N
                          retry_sleep=retry_sleep, card_key=item.get("key"), lots=lots)
 
 
+def guardian_profile_text(cfg, agents: dict | None = None) -> str:
+    """v2.13.0 /governor: the profile new trades get, its knobs (follow), and what each open ticket runs."""
+    sym = cfg.symbols[0] if getattr(cfg, "symbols", None) else None
+    try:
+        prof = cfg.resolved_guardian_profile(None, sym)
+    except Exception:
+        prof = getattr(cfg, "guardian_profile", "classic")
+    out = [f"**Guardian profile:** {prof}"]
+    if prof == "follow":
+        out.append(f"follow · stop −{cfg.follow_stop:g}" + (f" (or {cfg.follow_stop_x_range:g}× range)" if cfg.follow_stop_x_range > 0 else "")
+                   + f" · secure +{cfg.follow_secure_level:g} at +{cfg.follow_secure_at:g} · lock every +{cfg.follow_step:g} "
+                   f"(+{cfg.follow_clearance:g} clearance, {cfg.follow_trail_mode}) · flip {cfg.follow_exit_on_flip} · "
+                   f"news flat {'on' if cfg.follow_news_flat else 'off'} · max hold {cfg.follow_max_hold_bars or 'off'}")
+    for s_, ag in (agents or {}).items():
+        for t, st in (getattr(ag, "state", None) or {}).items():
+            if isinstance(st, dict):
+                out.append(f"#{t} {s_}: {st.get('guardian_profile', getattr(ag, '_resolved_profile', '?'))} (sticky until it closes)")
+    return "\n".join(out)
+
+
+def profile_warning(cfg, agents) -> str:
+    """v2.13.0: the guardian profile is not hot — open tickets keep theirs until they close."""
+    open_t = [(s_, t, st.get("guardian_profile", getattr(ag, "_resolved_profile", "?"))) for s_, ag in (agents or {}).items()
+              for t, st in (getattr(ag, "state", None) or {}).items() if isinstance(st, dict)]
+    if not open_t:
+        return ""
+    return "⚠️ guardian profile is not hot: " + ", ".join(f"#{t} {s_} keeps {p}" for s_, t, p in open_t) + \
+        " until it closes; only new trades get the new profile"
+
+
 def lot_button_spec(cfg, meta: dict) -> list[dict]:
     """v2.3.7: build the lot button descriptors for ENTER / ALERT cards when execution is on.
     Returns [{"label", "value", "disabled", "star"}] — max 5 buttons. The ★ goes on the button nearest meta["lots"];
@@ -1574,7 +1604,7 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             for r in rules:
                 icon = "🟢" if r["ok"] else "🔴"
                 lines.append(f"{icon} **{r['rule']}** · {r['value']} / {r['limit']}")
-            return Reply(content="**Risk Governor:**\n" + "\n".join(lines))
+            return Reply(content="**Risk Governor:**\n" + "\n".join(lines) + "\n" + guardian_profile_text(cfg, agents))
         await run(inter, "governor", work)
 
     @client.event
@@ -2063,7 +2093,8 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             if mode not in ("ema2050", "ema5080"):
                 return Reply(content="Unsupported mode; use ema2050 or ema5080")
             if not force and ops.positions_block_mode_change(agents):
-                return Reply(content="position open or position status unverified — /mode after it closes or pass force:true")
+                return Reply(content="position open or position status unverified — /mode after it closes or pass force:true\n"
+                                     + profile_warning(cfg, agents))
             # .env is the deployment source of truth; never write to a different unknown path.
             env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
             try:
@@ -2071,7 +2102,8 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             except Exception as exc:
                 return Reply(content=f"MODE NOT CHANGED: {exc}")
             _restart_later(inter.user, f"mode change to {mode}", mode, names)
-            return Reply(content=f"MODE CHANGE → {mode} · restarting")
+            warn = profile_warning(cfg, agents) if force else ""
+            return Reply(content=f"MODE CHANGE → {mode} · restarting" + (f"\n{warn}" if warn else ""))
         await run(inter, "mode", work)
 
     # ------------------------------------------------------------------ v1.10.0 Claude add-on (all off the loop via run())

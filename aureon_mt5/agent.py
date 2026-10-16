@@ -128,7 +128,8 @@ class SymbolAgent(threading.Thread):
             _demo = broker.is_demo() if not cfg.dry else None
         except Exception:
             _demo = None
-        self._resolved_profile = cfg.resolved_guardian_profile(_demo)
+        self._demo = _demo
+        self._resolved_profile = cfg.resolved_guardian_profile(_demo, symbol)
         self.off = cfg.server_utc_offset
         self.state: dict[int, dict] = journal.load_state(symbol)
         for _st in self.state.values():                    # v2.12.0: a pending pre-exit ask never survives a restart
@@ -1573,6 +1574,169 @@ class SymbolAgent(threading.Thread):
                     self._close_leg(p, reason, tag, st, jr, bar_t)
                     return
 
+    def _advisor_tick(self, p, st, bar_t, df, ef, es, g, new_bar):
+        """5b) advisor + periodic snapshot (notifications only — no broker action). Shared by every profile."""
+        if not new_bar:
+            return
+        if not st.get("tracking_sent"):
+            st["tracking_sent"] = True
+            self.notify.send(self.key("TRACKING", p["ticket"]), ctitle(self.symbol, "TRACKING", p["direction"]),
+                             ["I see your position — managing it from here"],
+                             fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"],
+                                                    points=p["points"], sl=p["sl"] or None),
+                             color=EVENT_COLOURS["cross"], footer=cfooter(self.S.display_name))
+        codes = self._advise(p, st, bar_t, df, ef, es, g)
+        for adv in self.advisors():                                  # v1.10.0: enqueue only (one job per pullback, per advisor)
+            adv.maybe_pullback(self, p, st, bar_t, df, codes or ())
+            adv.maybe_drawdown(self, p, st, bar_t, df)               # v2.8.0: event-driven READs under water
+        if st["bars"] and st["bars"] % self.SNAPSHOT_BARS == 0:
+            self._snapshot(p, st, bar_t)
+
+    # ------------------------------------------------------------------ v2.13.0 follow profile
+    def _new_ticket_profile(self) -> str:
+        """The profile a NEW ticket gets: the live config (so /feature-set guardian_profile applies to the next trade)."""
+        try:
+            return self.cfg.resolved_guardian_profile(getattr(self, "_demo", None), self.symbol)
+        except Exception:
+            return self._resolved_profile
+
+    def follow_stop_pts(self, df) -> float:
+        cfg = self.cfg
+        base = float(cfg.follow_stop)
+        if float(cfg.follow_stop_x_range) > 0 and df is not None and len(df):
+            rng = (df["high"] - df["low"]).to_numpy()
+            avg = float(rng[-20:].mean())
+            base = max(base, float(cfg.follow_stop_x_range) * avg)
+        return round(base, 2)
+
+    def follow_lock_target(self, peak: float) -> float | None:
+        """The follow stop in points from entry for this peak (None before SECURE_AT). Shared by the guardian and the
+        guardian block. step: k = floor((peak − CLEARANCE) / STEP); k >= 1 → (k − 1) · STEP, never below SECURE_LEVEL.
+        continuous: max(SECURE_LEVEL, peak − STEP)."""
+        cfg = self.cfg
+        if peak < float(cfg.follow_secure_at):
+            return None
+        sec, step = float(cfg.follow_secure_level), float(cfg.follow_step)
+        if cfg.follow_trail_mode == "continuous":
+            return max(sec, round(peak - step, 2))
+        k = int(np.floor((peak - float(cfg.follow_clearance)) / step)) if step > 0 else 0
+        return max(sec, (k - 1) * step) if k >= 1 else sec
+
+    def _follow_stopped(self, st, final) -> bool:
+        """The ticket vanished: was it the broker stop? Final points within 1.5 of the stop level (the lock, or −FOLLOW_STOP)."""
+        if final is None:
+            return False
+        lvl = float(st.get("secured") or 0.0) if float(st.get("secured") or 0.0) > 0 else -float(st.get("follow_stop_pts") or 0.0)
+        return abs(float(final) - lvl) <= 1.5
+
+    def _follow_log(self, event, p, st, **kw):
+        self.journal.log(event, symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], profile="follow",
+                         lock_level=st.get("secured", 0.0), peak=st.get("peak", 0.0), **kw)
+
+    def _guard_follow(self, p, st, g, s, new_bar, bar_t, df, close, ef, es, sgn, gap, tag):
+        """v2.13.0 AUREON_GUARDIAN_PROFILE=follow. Once in, the trade is protected by the broker stop and nothing else:
+        adopt the stop (entry − FOLLOW_STOP, never loosened) → secure +SECURE_LEVEL at +SECURE_AT → lock (k−1)·STEP once the
+        peak is k·STEP + CLEARANCE. Exits: the broker stop, news flat while not secured, an opposite CONFIRMED cross with
+        >= FLIP_MIN_EVIDENCE (EXIT_ON_FLIP=structure), MAX_HOLD_BARS (unsecured AND setup dead). Nothing else."""
+        cfg = self.cfg; entry = float(p["price_open"])
+        st["pre"] = False                                              # no P phase in this profile
+        # 1) adopt: the stop, never loosened
+        if "follow_stop_pts" not in st:
+            st["follow_stop_pts"] = self.follow_stop_pts(df)
+        stop_pts = float(st["follow_stop_pts"])
+        want = round(entry - s * stop_pts, 2)
+        cur = float(p["sl"]) if p.get("sl") else None
+        looser = cur is None or ((cur < want) if s > 0 else (cur > want))
+        if st["secured"] <= 0 and looser and not st.get("follow_adopted_fail"):
+            if self._move_sl(p, want, f"FOLLOW STOP −{stop_pts:g}"):
+                p = {**p, "sl": want}
+                self._follow_log("protected", p, st, sl=want, stop_pts=stop_pts)
+                self.notify.send(self.key("PROTECTED", p["ticket"]), ctitle(self.symbol, "PROTECTED", p["direction"]),
+                                 [f"follow · stop −{stop_pts:g} · secures +{cfg.follow_secure_level:g} at +{cfg.follow_secure_at:g} · "
+                                  f"then locks every +{cfg.follow_step:g} · no other exits"],
+                                 fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=entry, now=p["current"],
+                                                        points=p["points"], sl=want),
+                                 color=EVENT_COLOURS["protected"], footer=cfooter(self.S.display_name, "follow"))
+            else:
+                st["follow_adopted_fail"] = True                       # failure card already sent by _move_sl; retry next start
+        # 2) secure + 3) follow
+        target = self.follow_lock_target(float(st["peak"]))
+        first = float(st["secured"]) < float(cfg.follow_secure_level) - 1e-9
+        if first and float(p["points"]) < float(cfg.follow_secure_at):
+            target = None                                              # secure on LIVE points (a rebuilt peak is not enough)
+        if target is not None and target > float(p["points"]):        # the peak's lock is above the price (rebuilt peak):
+            target = self.follow_lock_target(float(p["points"]))       # take the ladder value the live price supports
+        if target is not None and target > float(st["secured"]) + 1e-9 and (float(p["current"]) - (entry + s * target)) * s >= 0:
+            lvl = round(entry + s * target, 2)                         # (a lock is never above the live price)
+            if self._move_sl(p, lvl, f"FOLLOW {'SECURE' if first else 'LOCK'} +{target:g}"):
+                p = {**p, "sl": lvl}
+                prev = float(st["secured"]); st["secured"] = target; self._save_state_now()
+                self._follow_log("secured", p, st, level=target, price=p["current"], mode_trail=cfg.follow_trail_mode)
+                if first:
+                    title = f"SECURED +{target:g}"
+                    lines = [f"stop → entry +{target:g} · next lock at +{self._follow_next_peak(target):g}"]
+                elif cfg.follow_trail_mode == "continuous" and int(target // cfg.follow_step) == int(prev // cfg.follow_step):
+                    title = None                                       # continuous: card once per STEP, the SL moves silently
+                else:
+                    title = f"LOCK +{target:g} · peak +{st['peak']:.1f}"
+                    lines = [f"stop → entry +{target:g} · next lock at +{self._follow_next_peak(target):g}"]
+                if title:
+                    self.notify.send(self.key("FOLLOW_LOCK", f"{p['ticket']}-{target:g}"), ctitle(self.symbol, title, p["direction"]), lines,
+                                     fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=entry, now=p["current"],
+                                                            points=p["points"], sl=lvl, secured=target, peak=st["peak"]),
+                                     color=EVENT_COLOURS["secured"], footer=cfooter(self.S.display_name, "follow"))
+        # the step ladder, journaled once per k (k = 1 locks the secure level, so its row moves nothing)
+        if cfg.follow_trail_mode == "step" and float(st["secured"]) >= float(cfg.follow_secure_level) - 1e-9:
+            k = int(np.floor((float(st["peak"]) - float(cfg.follow_clearance)) / float(cfg.follow_step))) if cfg.follow_step > 0 else 0
+            if k >= 1 and k > int(st.get("follow_k", 0)):
+                for kk in range(int(st.get("follow_k", 0)) + 1, k + 1):
+                    self._follow_log("follow_lock", p, st, k=kk, level=max(float(cfg.follow_secure_level), (kk - 1) * float(cfg.follow_step)))
+                st["follow_k"] = k
+        # 4) exits on a bar close — the only software ones this profile has
+        if new_bar:
+            cc = self.last_confirmed_cross
+            if (cfg.follow_exit_on_flip == "structure" and cc and cc.get("bar_time") == bar_t
+                    and cc.get("direction") != p["direction"].upper() and not st.get("follow_flip_seen") == bar_t):
+                st["follow_flip_seen"] = bar_t
+                ev = self._flip_evidence(p, df, close, ef, es, gap)
+                if len(ev) >= int(cfg.flip_min_evidence):
+                    st["flip_evidence"] = ev
+                    reason = f"opposite confirmed cross ({cc['direction']}) · structure confirms: {', '.join(ev)}"
+                    title = f"🔁 FLIP CLOSE — {tag}"; key = self.key("FLIP", f"{p['ticket']}-{bar_key(bar_t, self.off)}")
+                    if cfg.follow_pre_exit_read:
+                        self._close_or_defer(p, reason, title, key, st, "flip", bar_t, df, extra=self._follow_extra(st))
+                    else:
+                        self._close(p, reason, title, key, st, "flip", bar_t, extra=self._follow_extra(st))
+                    return
+                self._follow_log("opposite_cross_ignored", p, st, direction=cc.get("direction"), evidence=ev, points=p["points"])
+                self.note_action(st, "FLIP_HOLD", f"cross {cc.get('direction')} not confirmed by structure ({len(ev)}/{cfg.flip_min_evidence})")
+            mh = int(cfg.follow_max_hold_bars)
+            if mh > 0 and st["bars"] >= mh and float(st["secured"]) <= 0 and st.get("setup_alive") is False:
+                self._close(p, f"max hold: {st['bars']} bars, never secured, setup dead", f"⌛ MAX HOLD — {tag}",
+                            self.key("CLOSED", f"{p['ticket']}-{bar_key(bar_t, self.off)}"), st, "max_hold", bar_t,
+                            extra=self._follow_extra(st))
+                return
+        # news: flat before high-impact news while not secured (the existing window)
+        tutc = int(_time.time())
+        if cfg.follow_news_flat and not st["news_done"] and g is not None and any(r - g.news_flat_min * 60 <= tutc < r for r in self.news):
+            st["news_done"] = True
+            if float(st["secured"]) <= 0:
+                self._close(p, f"news in <{g.news_flat_min} min (not secured)", f"📰 FLAT before news — {tag}", self.key("NEWS", p["ticket"]),
+                            st, "news_flat", bar_t, extra=self._follow_extra(st))
+
+    def _follow_extra(self, st) -> dict:
+        return {"profile": "follow", "lock_level": st.get("secured", 0.0), "peak": st.get("peak", 0.0)}
+
+    def _follow_next_peak(self, target: float) -> float:
+        """The peak at which the next lock happens. step: lock (k−1)·STEP > target needs k = floor(target/STEP) + 2, at
+        peak k·STEP + CLEARANCE. continuous: any new peak above target + STEP."""
+        cfg = self.cfg
+        step = float(cfg.follow_step)
+        if cfg.follow_trail_mode == "continuous":
+            return round(target + step, 2)
+        k = int(np.floor(target / step)) + 2
+        return round(k * step + float(cfg.follow_clearance), 2)
+
     # ------------------------------------------------------------------ v2.12.0 Part A: what the guardian is about to do
     def _giveback_fires(self, pts_at_close: float, peak: float) -> bool:
         """The 1c giveback rule (bar CLOSE): fires when the close kept <= (1 − pct) of the peak. Shared with guardian_intent."""
@@ -1600,6 +1764,8 @@ class SymbolAgent(threading.Thread):
         pts_close = (float(close) - entry) * s
         secured = float(st.get("secured", 0.0)); peak = float(st.get("peak", 0.0))
         prof = st.get("guardian_profile", getattr(self, "_resolved_profile", "classic"))
+        if prof == "follow":
+            return self._follow_intent(p, st, entry, s, pts, secured, peak)
         leg = prof == "leg"
         pre = bool(st.get("pre"))
         px = lambda pt: round(entry + s * pt, 2)
@@ -1672,31 +1838,56 @@ class SymbolAgent(threading.Thread):
                 "flip_evidence": list(st["flip_evidence"]) if st.get("flip_evidence") else None,
                 "setup_alive": st.get("setup_alive"), "recent_actions": list(st.get("recent_actions") or [])[-3:]}
 
+    def _follow_intent(self, p, st, entry, s, pts, secured, peak) -> dict:
+        """v2.13.0: the follow profile has one exit — the broker stop. next_exit = that stop (rule `stop` before securing,
+        `ride_step` after) with its distance; next_lock = the next lock level and the peak that triggers it."""
+        cfg = self.cfg
+        px = lambda pt: round(entry + s * pt, 2)
+        sl = float(p["sl"]) if p.get("sl") else px(-float(st.get("follow_stop_pts") or cfg.follow_stop))
+        sl_pts = (sl - entry) * s
+        phase = "protect" if secured <= 0 else ("secured" if secured <= float(cfg.follow_secure_level) + 1e-9 else "ride")
+        if secured <= 0:
+            nxt_lock_pts, at_peak = float(cfg.follow_secure_level), float(cfg.follow_secure_at)
+        else:
+            at_peak = self._follow_next_peak(secured)
+            nxt_lock_pts = self.follow_lock_target(at_peak)
+        return {"phase": phase, "profile": "follow", "bars_in_trade": int(st.get("bars", 0)), "secured": round(secured, 2),
+                "peak": round(peak, 2), "mae": round(float(st.get("mae", min(0.0, pts))), 2), "trail_level": px(secured) if secured > 0 else None,
+                "giveback_level": None, "structure_stop": None, "cap": px(-float(st.get("follow_stop_pts") or cfg.follow_stop)),
+                "next_exit": {"rule": "ride_step" if secured > 0 else "stop", "level": round(sl, 2), "distance_pts": round(pts - sl_pts, 2),
+                              "bars_left": None, "fires_on": "tick"},
+                "next_lock": {"level": px(nxt_lock_pts), "lock_pts": nxt_lock_pts, "at_peak": at_peak,
+                              "distance_pts": round(at_peak - pts, 2)},
+                "flip_evidence": list(st["flip_evidence"]) if st.get("flip_evidence") else None,
+                "setup_alive": st.get("setup_alive"), "recent_actions": list(st.get("recent_actions") or [])[-3:]}
+
     # ------------------------------------------------------------------ v2.12.0 Part B: pre-exit read (show | defer)
-    PRE_EXIT_RULES = ("ema_fast_turn", "giveback", "setup_invalidated", "pre_timeout", "p_flip")
+    PRE_EXIT_RULES = ("ema_fast_turn", "giveback", "setup_invalidated", "pre_timeout", "p_flip", "flip")
 
     def _pre_exit_claude(self):
         return next((a for a in self.advisors() if getattr(a, "SOURCE", "") == "claude"
                      and hasattr(a, "request_pre_exit_read") and a.advises(self.S)), None)
 
     def _pre_exit_cap(self, st) -> float:
+        if st.get("guardian_profile") == "follow" and st.get("follow_stop_pts"):
+            return float(st["follow_stop_pts"])                     # v2.13.0: the follow stop is the cap
         if self.cfg.setup_stop and st.get("cap_pts"):
             return float(st["cap_pts"])
         return float(self.g.pre_stop) if self.g is not None else float(self.cfg.setup_max_dd)
 
-    def _close_or_defer(self, p, reason, title, key, st, jr, bar_t, df=None, detail: str = ""):
+    def _close_or_defer(self, p, reason, title, key, st, jr, bar_t, df=None, detail: str = "", extra: dict | None = None):
         """v2.12.0: every close-based software exit goes through here. AUREON_PRE_EXIT_READ=off → _close exactly as before.
         show → _close + a pre_exit read (journaled next to the close). defer → no close this bar; Claude is asked; the verdict
         is applied in drain() (EXIT / timeout / error close by the original rule; HOLD waits one more bar, at most MAX)."""
         mode = getattr(self.cfg, "pre_exit_read", "off")
         if mode not in ("show", "defer") or jr not in self.PRE_EXIT_RULES or df is None:
-            return self._close(p, reason, title, key, st, jr, bar_t)
+            return self._close(p, reason, title, key, st, jr, bar_t, extra=extra)
         claude = self._pre_exit_claude()
         if claude is None or p["points"] <= -self._pre_exit_cap(st) + 2.0:      # no voter, or within 2 pts of the cap
-            return self._close(p, reason, title, key, st, jr, bar_t)
+            return self._close(p, reason, title, key, st, jr, bar_t, extra=extra)
         detail = detail or reason
         if mode == "show":
-            self._close(p, reason, title, key, st, jr, bar_t)
+            self._close(p, reason, title, key, st, jr, bar_t, extra=extra)
             claude.request_pre_exit_read(self, p, st, bar_t, df, rule=jr, detail=detail, show=True)
             return
         pe = st.get("pending_exit")
@@ -1710,10 +1901,10 @@ class SymbolAgent(threading.Thread):
         n = int(st.get("deferrals", 0))
         if n >= int(self.cfg.pre_exit_max_defer):
             st.pop("pending_exit", None)
-            return self._close(p, reason, title, key, st, jr, bar_t, extra={"claude_pre_exit": "max_deferrals", "deferrals": n})
+            return self._close(p, reason, title, key, st, jr, bar_t, extra={**(extra or {}), "claude_pre_exit": "max_deferrals", "deferrals": n})
         job_id = f"{p['ticket']}-{bar_t}-{n}"
         st["pending_exit"] = {"rule": jr, "bar_t": bar_t, "seen_bar": bar_t, "detail": detail, "reason": reason, "title": title,
-                              "key": key, "t": _time.time(), "state": "waiting", "job_id": job_id}
+                              "key": key, "t": _time.time(), "state": "waiting", "job_id": job_id, "extra": extra or {}}
         self.journal.log("exit_pending", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], rule=jr, detail=detail,
                          points=p["points"], deferral_n=n)
         self.notify.send(self.key("EXIT_PENDING", f"{p['ticket']}-{bar_key(bar_t, self.off)}"),
@@ -1725,7 +1916,7 @@ class SymbolAgent(threading.Thread):
                          color=EVENT_COLOURS["flip"], footer=cfooter(self.S.display_name, "pre-exit"))
         if not claude.request_pre_exit_read(self, p, st, bar_t, df, rule=jr, detail=detail, job_id=job_id, deferral_n=n):
             st.pop("pending_exit", None)                                      # could not even ask (queue full): close now
-            return self._close(p, reason, title, key, st, jr, bar_t, extra={"claude_pre_exit": "error"})
+            return self._close(p, reason, title, key, st, jr, bar_t, extra={**(extra or {}), "claude_pre_exit": "error"})
 
     def finish_pending_exit(self, p, st, outcome: str):
         """Close by the pending rule (EXIT / timeout / error) — the original reason, title and journal rule."""
@@ -1733,7 +1924,7 @@ class SymbolAgent(threading.Thread):
         if not pe:
             return False
         self._close(p, pe["reason"], pe["title"], pe["key"], st, pe["rule"], None,
-                    extra={"claude_pre_exit": outcome, "deferrals": int(st.get("deferrals", 0))})
+                    extra={**(pe.get("extra") or {}), "claude_pre_exit": outcome, "deferrals": int(st.get("deferrals", 0))})
         return True
 
     def _cancel_pending_exit(self, p, st, why: str):
@@ -1813,9 +2004,21 @@ class SymbolAgent(threading.Thread):
                 for adv in self.advisors():
                     adv.forget(self.symbol, t)
                 final, approx = self._final_points(t, st)             # v1.11.0: for the weekly compare (measurement only)
+                follow_stop = (st.get("guardian_profile") == "follow" and t not in self.closed_by_aureon
+                               and self._follow_stopped(st, final))
                 self.journal.log("closed", symbol=self.symbol, mode=self.S.name, ticket=t, direction=st.get("direction"),
                                  entry=st.get("entry"), secured=st.get("secured"), peak=st.get("peak"),
-                                 final_points=final, final_approx=approx, alert_id=st.get("alert_id"))
+                                 final_points=final, final_approx=approx, alert_id=st.get("alert_id"),
+                                 **({"reason": "stop", "profile": "follow", "lock_level": st.get("secured", 0.0)} if follow_stop else {}))
+                if follow_stop:                                # v2.13.0: the follow profile's only exit — no "why?" ask
+                    self.notify.send(self.key("CLOSED", f"{t}-stop"), ctitle(self.symbol, f"STOPPED {'+' if (final or 0) >= 0 else ''}{(final or 0):.1f}",
+                                                                              st.get("direction")),
+                                     [f"follow · broker stop at entry {'+' if st.get('secured', 0) > 0 else '−'}"
+                                      f"{(st.get('secured') or st.get('follow_stop_pts') or 0):g} · peak +{st.get('peak', 0):.1f}"],
+                                     color=EVENT_COLOURS["closed_win" if (final or 0) > 0 else "closed_loss"],
+                                     footer=cfooter(self.S.display_name, "follow · stop"), event="CLOSED" if (final or 0) > 0 else "STOP",
+                                     points=final)
+                    self.closed_by_aureon.add(t)
                 if t not in self.closed_by_aureon:            # closed by you (or your own SL/TP): ask why, one tap
                     last = st.get("last_points", 0.0)
                     self.notify.ask(self.key("CLOSED_BY_YOU", t), ctitle(self.symbol, "CLOSED BY YOU", st.get("direction")),
@@ -1885,6 +2088,17 @@ class SymbolAgent(threading.Thread):
             if open_read_key is not False:
                 for adv in self.advisors():                                    # v2.8.0: one READ at open (Claude; shown only)
                     adv.request_open_read(self, p, st, bar_t, df, card_key=open_read_key)
+            if "guardian_profile" not in st and self._new_ticket_profile() == "follow":
+                st["guardian_profile"] = "follow"                              # v2.13.0: sticky per ticket, like classic / leg
+            if st.get("guardian_profile") == "follow":
+                if not self._setup_wanted():
+                    self._update_setup(p, st, s, new_bar, df, close, ef, es)   # setup_alive for max_hold / the snapshot
+                self._guard_follow(p, st, g, s, new_bar, bar_t, df, close, ef, es, sgn, gap, tag)
+                if st.get("pending_exit"):
+                    self._pending_exit_moot(p, st, new_bar, bar_t)
+                if p["ticket"] not in self.closed_by_aureon:
+                    self._advisor_tick(p, st, bar_t, df, ef, es, g, new_bar)
+                continue
             _structure = self.cfg.setup_stop and st.get("guardian_profile", self._resolved_profile) != "leg"
 
             # 0) protect a naked position (never touch an existing manual SL here)
@@ -1994,20 +2208,7 @@ class SymbolAgent(threading.Thread):
                 continue  # position was closed
 
             # 5b) advisor + periodic snapshot (notifications only — no broker action)
-            if new_bar:
-                if not st.get("tracking_sent"):
-                    st["tracking_sent"] = True
-                    self.notify.send(self.key("TRACKING", p["ticket"]), ctitle(self.symbol, "TRACKING", p["direction"]),
-                                     ["I see your position — managing it from here"],
-                                     fields=position_fields(ticket=p["ticket"], direction=p["direction"], entry=p["price_open"], now=p["current"],
-                                                            points=p["points"], sl=p["sl"] or None),
-                                     color=EVENT_COLOURS["cross"], footer=cfooter(self.S.display_name))
-                codes = self._advise(p, st, bar_t, df, ef, es, g)
-                for adv in self.advisors():                                  # v1.10.0: enqueue only (one job per pullback, per advisor)
-                    adv.maybe_pullback(self, p, st, bar_t, df, codes or ())
-                    adv.maybe_drawdown(self, p, st, bar_t, df)               # v2.8.0: event-driven READs under water
-                if st["bars"] and st["bars"] % self.SNAPSHOT_BARS == 0:
-                    self._snapshot(p, st, bar_t)
+            self._advisor_tick(p, st, bar_t, df, ef, es, g, new_bar)
 
             # 6) news safeguard
             tutc = int(_time.time())

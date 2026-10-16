@@ -1,4 +1,4 @@
-# Aureon MT5 v2.12.0
+# Aureon MT5 v2.13.0
 
 You place the trade. Aureon detects (per selected EMA mode), fires a Discord gunshot, then manages what you placed:
 protect → secure +10 → ride in +5 steps → close on the fast-EMA turn → news safeguard. Reports and slash commands.
@@ -23,6 +23,34 @@ protected (SL never loosened) but receive no strategy rules; a `⚠️ MODE MISM
 Production: run it under the supervisor (auto-restart, hang kill, boot start) — **[docs/SERVICE.md](docs/SERVICE.md)**:
 
     powershell -ExecutionPolicy Bypass -File .\scripts\aureon_service.ps1 -Action install
+
+## v2.13.0 — follow profile
+
+**The rule in plain words:** once you are in, only the stop can take you out. Secure at +3. Then lock +10 behind each +10
+the trade makes.
+
+`AUREON_GUARDIAN_PROFILE=follow` (or per symbol: `AUREON_GUARDIAN_PROFILE_XAUUSD=follow`). `classic` stays the default.
+- **Adopt:** the stop goes to entry − `AUREON_FOLLOW_STOP` (25). With `AUREON_FOLLOW_STOP_X_RANGE` > 0 it is the larger of
+  that and that multiple of the 20-bar average range. A tighter stop that is already there is kept.
+- **Secure:** at live +`FOLLOW_SECURE_AT` (3) the stop moves to entry + `FOLLOW_SECURE_LEVEL` (3).
+- **Lock:** with peak +12 the stop is +3 (+0 floored to the secure level), +22 → +10, +32 → +20, +42 → +30.
+  `FOLLOW_CLEARANCE` (2) is the wick margin; at +11.9 nothing moves. `FOLLOW_TRAIL_MODE=continuous` instead keeps the stop
+  at peak − 10, ratcheted.
+- **Exits:**
+  - the broker stop;
+  - flat before high-impact news while not secured (`FOLLOW_NEWS_FLAT`);
+  - an opposite **confirmed** cross only when the structure confirms it (`FOLLOW_EXIT_ON_FLIP=structure`, ≥
+    `FLIP_MIN_EVIDENCE`), through the v2.12 pre-exit read when that is on;
+  - `FOLLOW_MAX_HOLD_BARS` (off by default): only when never secured **and** the setup is dead.
+- **No other exits:** no P timeout, EMA turn, plain P flip, giveback, slow-EMA close or setup stop.
+
+Where it comes from: the operator's study of 91 M15 crosses (Aug–Oct 2026): +500 pts, max drawdown 97. Those numbers are
+from that study; this repo does not reproduce them. `FOLLOW_STOP=25` is the M15 value. For `ema2050` on M5, start from
+`AUREON_FOLLOW_STOP_X_RANGE=1.5` with `FOLLOW_STOP` as the floor, and check it with
+`python tools/replay_guardian.py --set guardian_profile=follow` (every `follow_*` knob takes `--set`).
+
+The profile is not hot. A ticket keeps the profile it opened with until it closes. `/governor` shows the profile and the
+knobs, `/features follow` lists them, and `/mode` warns which open tickets keep their profile.
 
 ## v2.12.0 — guardian-aware reads
 
