@@ -115,4 +115,6 @@ class Journal:
             "secured": max(secured_levels) if secured_levels else 0.0,
             "alert_id": seen.get("alert_id"),
         }
+        if any(r.get("profile") == "follow" for r in ticket_recs):           # v2.13.0: the profile is sticky across restarts
+            st["guardian_profile"] = "follow"; st["pre"] = False
         return st, "journal"

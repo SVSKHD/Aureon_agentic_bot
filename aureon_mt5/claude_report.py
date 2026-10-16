@@ -112,6 +112,12 @@ def advisor_report(cfg, agents, journal, period="week", now=None, gather=None):
             if rb:
                 fields.append({"name": f"{label} · READ votes by trigger (final points)", "value": read_buckets_text(rb)[:1024],
                                "inline": False})
+            from .advisor_board import pre_exit_grades, pre_exit_summary, pre_exit_text   # v2.12.0
+            pg = pre_exit_grades(logs, grade_bars=int(getattr(cfg, "pre_exit_grade_bars", 6)), source=src)
+            if pg or any(r.get("event") == "exit_deferred" for r in logs):
+                cap = float(getattr(cfg, "setup_max_dd", 10.0)) if getattr(cfg, "setup_stop", False) else 6.0
+                fields.append({"name": f"{label} · pre-exit", "value": pre_exit_text(pre_exit_summary(logs, pg, cap))[:1024],
+                               "inline": False})
     h = result.h2h or {}
     if h.get("both"):
         fields.append({"name": "Head-to-head · Claude vs Codex",

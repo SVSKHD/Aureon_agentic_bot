@@ -115,8 +115,12 @@ def run_combo(bars, ents, over: dict, m15: str | None = "BULLISH", signals: dict
         r = simulate(bars, e["i"], e["direction"], e["entry"], signals=sig, m15=m15, cfg_over=over)
         ex = r["exit"] or {"i": len(bars) - 1, "time": r["last_time"], "points": round((r["last_close"] - r["entry"]) * (1 if e["direction"] == "long" else -1), 2),
                             "reason": "open_at_end"}
+        follow = over.get("guardian_profile") == "follow"
+        if follow and ex["reason"] == "sl_hit":
+            ex = {**ex, "reason": "stop"}                         # v2.13.0: the follow profile's only exit
         row = {"entry_time": hhmm(bars["time"].iloc[e["i"]]), "direction": e["direction"], "entry": round(r["entry"], 2),
                "exit_time": ex["time"], "points": ex["points"], "reason": ex["reason"], "source": e["source"],
+               **({"sequence": follow_sequence(r["journal"], ex["reason"])} if follow else {}),
                "events": sorted({x["event"] for x in r["journal"] if x["event"] in ("opposite_p_ignored", "structure_sl", "pre_timeout_paused")})}
         st = reg_by_i.get(e["i"])
         if gate == "block" and st in ("CHOPPY", "DEAD"):
@@ -135,6 +139,19 @@ def run_combo(bars, ents, over: dict, m15: str | None = "BULLISH", signals: dict
         res["blocked"] = blocked
     res["trades_detail"] = rows
     return res
+
+
+def follow_sequence(journal: list[dict], exit_reason: str) -> str:
+    """v2.13.0: `secured +3 → lock +3 → lock +10 → … → stop` from the follow profile's journal rows."""
+    out = []
+    for r in journal:
+        if r.get("profile") != "follow":
+            continue
+        if r["event"] == "secured" and not out:
+            out.append(f"secured +{r['level']:g}")
+        elif r["event"] == "follow_lock":
+            out.append(f"lock +{r['level']:g}")
+    return " → ".join(out + [exit_reason])
 
 
 def summarize(rows: list[dict]) -> dict:
@@ -160,6 +177,8 @@ def table(name: str, r: dict) -> str:
     for t in r["trades_detail"]:
         out.append(f"   {t['entry_time']} {t['direction']:<5} @ {t['entry']:.2f} → {t['exit_time']} {t['points']:+.2f} ({t['reason']})"
                    + (f" [{', '.join(t['events'])}]" if t["events"] else ""))
+        if t.get("sequence"):
+            out.append(f"      {t['sequence']}")
     if "entries_blocked" in r:
         out.append(f"   regime gate: entries_blocked {r['entries_blocked']} · would_have_lost {r['would_have_lost']} · "
                    f"would_have_won {r['would_have_won']} · blocked points {r['blocked_points']:+.2f} · no_trade_days {r['no_trade_days']}")
