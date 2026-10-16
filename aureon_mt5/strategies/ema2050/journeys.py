@@ -25,6 +25,8 @@ Everything is in price points; on gold $1 of price = $1 per ounce.
 """
 from __future__ import annotations
 
+import dataclasses
+
 from dataclasses import dataclass, asdict, field
 
 import numpy as np
@@ -57,6 +59,7 @@ class Rules:
     confirm_bars: int = 3           # the order must hold every bar for this many bars (cross bar included)...
     confirm_gap: float = 1.5        # ...AND |EMA20 − EMA50| >= this (points) -> confirmed at the first bar with both
     confirm_window: int = 18        # ...within this many bars of the cross; any flip before -> multi cross
+    confirm_gap_x_range: float = 0.0  # v2.14.0: if > 0 the gap test is |gap| >= this × 20-bar avg range (exec TF ≠ M5)
     touch_tol: float = 1.5          # pullback: low <= EMA20 + tol (longs) / high >= EMA20 − tol (shorts)
     pullback_window: int = 12       # first touch after the confirm bar, up to confirm + this
     max_chase: float = 5.0          # the FALLBACK entry must close within this of EMA20 (never applied to touch entries)
@@ -101,7 +104,17 @@ UNFILTERED_SILVER = Rules(confirm_gap=0.02, touch_tol=0.02, max_chase=0.07, guar
 
 def rules_for(symbol: str) -> Rules:
     s = symbol.upper()
-    return SILVER if ("XAG" in s or "SILVER" in s) else GOLD
+    base = SILVER if ("XAG" in s or "SILVER" in s) else GOLD
+    from ...common.tf_synth import strategy_overrides             # v2.14.0: exec TF ≠ M5 → minute-based windows, TF gap
+    over = strategy_overrides("ema2050")
+    if over and ("XAG" in s or "SILVER" in s):
+        over = {k: v for k, v in over.items() if k not in ("confirm_gap", "confirm_gap_x_range")}
+    return dataclasses.replace(base, **over) if over else base
+
+
+def _bar_s() -> int:
+    from ...common.tf_synth import bar_s
+    return bar_s()
 
 
 def unfiltered_for(symbol: str) -> Rules:
@@ -242,13 +255,14 @@ def build(df: pd.DataFrame, rules: Rules, server_offset_h: float = 3.0, trade_fr
     n = len(df)
     g = rules.guardian
     sign = np.array([_sign(x) for x in gap])
+    avg_rng = pd.Series(high - low).rolling(20, min_periods=1).mean().to_numpy() if rules.confirm_gap_x_range else None
     cross_idx = [i for i in range(1, n) if sign[i] != 0 and sign[i - 1] != 0 and sign[i] != sign[i - 1]]
     cross_set = set(cross_idx)
     last_k = n - 1                                     # the day-end bar (forced close) when the data reaches the day end
     if day_end is not None:
         inside = np.nonzero(time < day_end)[0]
         last_k = int(inside[-1]) if len(inside) else n - 1
-        at_day_end = (time[last_k] + 300 >= day_end)
+        at_day_end = (time[last_k] + _bar_s() >= day_end)
     else:
         at_day_end = False
 
@@ -264,7 +278,7 @@ def build(df: pd.DataFrame, rules: Rules, server_offset_h: float = 3.0, trade_fr
         shoot = float((close[i] - low[lo_b:i].min()) if s > 0 else (high[lo_b:i].max() - close[i])) if i > lo_b else 0.0
         info = CrossInfo(i, int(time[i]), d, nxt, round(shoot, 2), tradeable=(trade_from is None or time[i] >= trade_from))
         for j in range(i + rules.confirm_bars - 1, min(i + rules.confirm_window, nxt - 1) + 1):
-            if abs(gap[j]) >= rules.confirm_gap:
+            if abs(gap[j]) >= max(rules.confirm_gap, rules.confirm_gap_x_range * avg_rng[j] if rules.confirm_gap_x_range else 0.0):
                 info.confirm_index = j; break
         if info.confirm_index is None:
             if nxt < n and nxt <= i + rules.confirm_window:

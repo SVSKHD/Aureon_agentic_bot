@@ -29,21 +29,22 @@ from tools.guardian_sim import hhmm, p_signals, simulate  # noqa: E402
 SIGN_OFF = "the gate is acceptable when blocked losers >= 3 x blocked winners over the window"
 
 
-def load_bars(args) -> pd.DataFrame:
+def load_bars(args, base_tf: str = "M5") -> pd.DataFrame:
     if args.bars:
         if args.bars.endswith(".parquet"):
             df = pd.read_parquet(args.bars)
         else:
             d = json.load(open(args.bars, encoding="utf-8")); df = pd.DataFrame(d.get("bars", d))
     else:
-        cache = os.path.join(ROOT, "logs", "bars", f"{args.symbol}_{args.date_from}_{args.date_to}.parquet")
+        cache = os.path.join(ROOT, "logs", "bars", f"{args.symbol}_{args.date_from}_{args.date_to}"
+                                                    f"{'' if base_tf == 'M5' else '_' + base_tf}.parquet")
         if os.path.exists(cache):
             df = pd.read_parquet(cache)
         else:
             from aureon_mt5 import broker
             if not broker.connect():
                 sys.exit("no --bars file, no cached parquet and MT5 is not connected")
-            df = broker.bars_tf(args.symbol, "M5", 20000, "mt5", 3.0)
+            df = broker.bars_tf(args.symbol, base_tf, 20000, "mt5", 3.0)
             a = int(datetime.strptime(args.date_from, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
             b = int(datetime.strptime(args.date_to, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()) + 86400
             df = df[(df["time"] >= a - 300 * 300) & (df["time"] < b)].reset_index(drop=True)
@@ -103,14 +104,27 @@ def extra_signals(bars, specs: list[str]) -> dict:
     return out
 
 
-def run_combo(bars, ents, over: dict, m15: str | None = "BULLISH", signals: dict | None = None) -> dict:
+def htf_at(frames: dict, t_close: int, direction: str, over: dict) -> tuple[bool, dict, list]:
+    """v2.14.0: the alignment gate at an exec bar that closed at t_close, on each confirm TF's bars closed by then."""
+    from aureon_mt5 import htf_align as H
+    from aureon_mt5.common.tf_synth import bar_s
+    states = {}
+    for tf, df in frames.items():
+        d = df[df["time"] + bar_s(tf) <= t_close].reset_index(drop=True)
+        states[tf] = H.htf_state(d.tail(300), "LONG" if direction == "long" else "SHORT",
+                                 pre_max_gap=float(over.get("htf_pre_max_gap", 0.35)), with_max_bars=int(over.get("htf_with_max_bars", 8)))
+    ok, reasons = H.gate(states, mode_min=over.get("htf_align_min", "all"), require_fresh=bool(over.get("htf_require_fresh", False)))
+    return ok, states, reasons
+
+
+def run_combo(bars, ents, over: dict, m15: str | None = "BULLISH", signals: dict | None = None, htf: dict | None = None) -> dict:
     sig = {**p_signals(bars), **(signals or {})}
     gate = over.get("regime_gate", "off")
     reg_by_i = {}
     if gate != "off":
         from aureon_mt5 import regime as R
         reg_by_i, days = R.replay_states(bars, over)
-    rows, blocked = [], []
+    rows, blocked, htf_blocked = [], [], []
     for e in ents:
         r = simulate(bars, e["i"], e["direction"], e["entry"], signals=sig, m15=m15, cfg_over=over)
         ex = r["exit"] or {"i": len(bars) - 1, "time": r["last_time"], "points": round((r["last_close"] - r["entry"]) * (1 if e["direction"] == "long" else -1), 2),
@@ -123,6 +137,14 @@ def run_combo(bars, ents, over: dict, m15: str | None = "BULLISH", signals: dict
                **({"sequence": follow_sequence(r["journal"], ex["reason"])} if follow else {}),
                "events": sorted({x["event"] for x in r["journal"] if x["event"] in ("opposite_p_ignored", "structure_sl", "pre_timeout_paused")})}
         st = reg_by_i.get(e["i"])
+        hgate = over.get("htf_align", "off")
+        if htf and hgate != "off":
+            from aureon_mt5.common.tf_synth import bar_s
+            ok, hst, why = htf_at(htf, int(bars["time"].iloc[e["i"]]) + bar_s(), e["direction"], over)
+            row["htf"] = {tf: x["state"] for tf, x in hst.items()}
+            row["htf_entry"] = "blocked" if not ok else ("pre" if any(x["state"] == "pre" for x in hst.values()) else "with")
+            if hgate == "block" and not ok:
+                row["htf_why"] = why; htf_blocked.append(row); continue
         if gate == "block" and st in ("CHOPPY", "DEAD"):
             row["regime"] = st; blocked.append(row)
         else:
@@ -137,6 +159,13 @@ def run_combo(bars, ents, over: dict, m15: str | None = "BULLISH", signals: dict
         res["sign_off"] = SIGN_OFF
         res["gate_acceptable"] = res["would_have_lost"] >= 3 * res["would_have_won"] if blocked else None
         res["blocked"] = blocked
+    if htf and over.get("htf_align", "off") != "off":
+        res["asks_blocked_by_htf"] = len(htf_blocked)
+        res["htf_would_have_lost"] = sum(1 for b in htf_blocked if b["points"] <= 0)
+        res["htf_would_have_won"] = sum(1 for b in htf_blocked if b["points"] > 0)
+        res["htf_blocked_points"] = round(sum(b["points"] for b in htf_blocked), 2)
+        res["htf_blocked"] = htf_blocked
+        res["by_htf_entry"] = {k: summarize([r for r in rows if r.get("htf_entry") == k]) for k in ("pre", "with")}
     res["trades_detail"] = rows
     return res
 
@@ -179,6 +208,15 @@ def table(name: str, r: dict) -> str:
                    + (f" [{', '.join(t['events'])}]" if t["events"] else ""))
         if t.get("sequence"):
             out.append(f"      {t['sequence']}")
+    if "asks_blocked_by_htf" in r:
+        out.append(f"   HTF gate: asks_blocked_by_htf {r['asks_blocked_by_htf']} · would_have_lost {r['htf_would_have_lost']} · "
+                   f"would_have_won {r['htf_would_have_won']} · blocked points {r['htf_blocked_points']:+.2f}")
+        for k in ("pre", "with"):
+            b = r["by_htf_entry"][k]
+            out.append(f"   entered on `{k}`: trades {b['trades']} · win {b['win_rate']}% · total {b['total_points']:+.2f} · max DD {b['max_drawdown']:.2f}")
+        for b in r["htf_blocked"]:
+            out.append(f"   BLOCKED (HTF {', '.join(f'{k} {v}' for k, v in b['htf'].items())}) {b['entry_time']} {b['direction']} → "
+                       f"{b['points']:+.2f} ({b['reason']})")
     if "entries_blocked" in r:
         out.append(f"   regime gate: entries_blocked {r['entries_blocked']} · would_have_lost {r['would_have_lost']} · "
                    f"would_have_won {r['would_have_won']} · blocked points {r['blocked_points']:+.2f} · no_trade_days {r['no_trade_days']}")
@@ -200,26 +238,44 @@ def main(argv=None) -> dict:
     ap.add_argument("--out", default=os.path.join(ROOT, "logs", "replay"))
     a = ap.parse_args(argv)
     over = parse_sets(a.sets)
-    bars = prepare(load_bars(a), a.mode, zl=bool(over.get("zl_context") or over.get("flip_use_zl") or over.get("regime_gate", "off") != "off"))
+    from types import SimpleNamespace
+    from aureon_mt5.common import tf_synth
+    exec_tf = str(over.get("exec_tf", "m5")).upper()               # v2.14.0: the execution timeframe of the replay
+    base_tf = "M5" if (exec_tf == "M5" or tf_synth.tf_minutes(exec_tf) % 15) else "M15"
+    raw = load_bars(a, base_tf)
+    tf_synth.set_exec_tf(exec_tf, SimpleNamespace(**{k: over[k] for k in ("confirm_hold_bars", "confirm_gap_x_range",
+                                                                          "confirm_window_bars") if k in over}))
+    exec_raw = raw if exec_tf == "M5" else tf_synth.resample_tf(raw, exec_tf)
+    bars = prepare(exec_raw, a.mode, zl=bool(over.get("zl_context") or over.get("flip_use_zl") or over.get("regime_gate", "off") != "off"))
+    htf = None
+    if over.get("htf_align", "off") != "off":
+        from aureon_mt5.htf_align import confirm_tfs_for
+        tfs = confirm_tfs_for(SimpleNamespace(exec_tf=exec_tf, htf_confirm_tfs=over.get("htf_confirm_tfs", ())))
+        htf = {tf: prepare(tf_synth.resample_tf(raw, tf), a.mode) for tf in tfs}
     ents = entries(bars, a.trade, a.mode, a.symbol)
     m15 = None if a.m15.lower() == "none" else a.m15
     sig = extra_signals(bars, a.signal)
     result = {"symbol": a.symbol, "bars": len(bars), "from": hhmm(bars["time"].iloc[0]), "to": hhmm(bars["time"].iloc[-1]),
               "set": {k: (list(v) if isinstance(v, tuple) else v) for k, v in over.items()}}
     if a.compare:
-        base = run_combo(bars, ents, {}, m15, sig); new = run_combo(bars, ents, over, m15, sig)
+        # v2.14.0: with the HTF gate in the set, the baseline is the SAME set with the gate off (block vs off); otherwise
+        # the defaults on the same exec TF
+        base_over = ({**over, "htf_align": "off"} if over.get("htf_align", "off") != "off"
+                     else {"exec_tf": over["exec_tf"]} if "exec_tf" in over else {})
+        base = run_combo(bars, ents, base_over, m15, sig); new = run_combo(bars, ents, over, m15, sig, htf=htf)
         result.update(defaults=base, combo=new,
                       delta={k: round(new[k] - base[k], 2) for k in ("trades", "win_rate", "total_points", "max_drawdown")})
-        print(table("defaults", base)); print(table("set " + " ".join(a.sets), new))
+        print(table("htf_align=off (same set)" if "htf_align" in over else "defaults", base)); print(table("set " + " ".join(a.sets), new))
         print("delta: " + " · ".join(f"{k} {v:+g}" for k, v in result["delta"].items()))
     else:
-        result["combo"] = run_combo(bars, ents, over, m15, sig)
+        result["combo"] = run_combo(bars, ents, over, m15, sig, htf=htf)
         print(table("set " + (" ".join(a.sets) or "(defaults)"), result["combo"]))
     os.makedirs(a.out, exist_ok=True)
     path = os.path.join(a.out, f"{datetime.now(timezone.utc):%Y-%m-%d}.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=1, default=str)
     print(f"summary → {path}")
+    tf_synth.set_exec_tf("M5")
     return result
 
 

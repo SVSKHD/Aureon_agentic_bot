@@ -129,6 +129,13 @@ class SymbolAgent(threading.Thread):
         except Exception:
             _demo = None
         self._demo = _demo
+        from .common import tf_synth                       # v2.14.0: the execution timeframe (minutes → bars everywhere)
+        tf_synth.set_exec_tf(getattr(cfg, "exec_tf", "M5"), cfg)
+        self.exec_tf = tf_synth.exec_tf(); self.bar_s = tf_synth.bar_s()
+        self.chart_bars = max(60, tf_synth.bars_for(600)) if self.exec_tf != "M5" else 120
+        if self.exec_tf != "M5" and self.g is not None:    # the guardian's P timeout is an hour of bars
+            import dataclasses as _dc
+            self.g = g = _dc.replace(self.g, pre_timeout_bars=tf_synth.bars_for(60))
         self._resolved_profile = cfg.resolved_guardian_profile(_demo, symbol)
         self.off = cfg.server_utc_offset
         self.state: dict[int, dict] = journal.load_state(symbol)
@@ -201,8 +208,9 @@ class SymbolAgent(threading.Thread):
                     announced_closed = False
                     self.notify.send(self.key("MARKET", f"open-{datetime.now(IST):%Y-%m-%d-%H}"), ctitle(self.symbol, "MARKET OPEN"), ["Aureon resumed"], color=EVENT_COLOURS["secured"], footer=cfooter(self.S.display_name))
                 self.health["status"] = "running"
-                m5 = broker.bars(self.symbol, self.cfg.bars, self.cfg.source, self.off)
-                closed = m5.df[m5.df["time"] + 300 <= broker.now_server(self.off)].reset_index(drop=True)
+                m5 = (broker.bars(self.symbol, self.cfg.bars, self.cfg.source, self.off) if self.exec_tf == "M5" else
+                      broker.bars(self.symbol, self.cfg.bars, self.cfg.source, self.off, tf=self.exec_tf))   # v2.14.0: exec-TF bars
+                closed = m5.df[m5.df["time"] + self.bar_s <= broker.now_server(self.off)].reset_index(drop=True)
                 if len(closed) < 120:
                     self._refresh_snapshot(True)
                     _time.sleep(self.cfg.poll_seconds); continue
@@ -255,7 +263,7 @@ class SymbolAgent(threading.Thread):
         if self.last_df is None:
             return None
         return context_chart(self.last_df, self.symbol, self.S.display_name, self.S.fast, self.S.slow, self.S.ema_cols, self.off,
-                             self.chart_dir, bars=120, title_extra="on request")
+                             self.chart_dir, bars=self.chart_bars, title_extra="on request")
 
     # ------------------------------------------------------------------ v1.9.8 cached status snapshot (read by slash commands)
     def _refresh_snapshot(self, market_open: bool):
@@ -426,8 +434,59 @@ class SymbolAgent(threading.Thread):
                              f"regime {tr.state}: {', '.join(tr.reasons) or 'score ' + format(tr.score, '.2f')} — no ask, no Claude entry read"],
                              kw.get("png"), fields=kw.get("fields"), color=EVENT_COLOURS["market"], footer=kw.get("footer"))
             return False
+        hg = getattr(self.cfg, "htf_align", "off")                      # v2.14.0 HTF alignment gate
+        side = str((kw.get("meta") or {}).get("side") or ("LONG" if "LONG" in title.upper() else "SHORT" if "SHORT" in title.upper() else ""))
+        if hg in ("show", "block") and side:
+            al = self.htf_alignment(side)
+            kw["fields"] = list(kw.get("fields") or []) + [field("HTF", al["line"], inline=False)]
+            kw["meta"] = {**(kw.get("meta") or {}), "htf_ok": al["ok"], "htf_reasons": al["reasons"], "htf": al["compact"]}
+            if kw.get("png") and al.get("frames"):
+                try:
+                    from .common.htf_chart import add_htf_panel
+                    kw["png"] = add_htf_panel(kw["png"], al["frames"], self.S.ema_cols, self.symbol) or kw["png"]
+                except Exception as e:
+                    telemetry.info(f"htf panel failed: {e!r}")
+            if hg == "block" and not al["ok"]:
+                self.journal.log("entry_blocked_htf", symbol=self.symbol, key=key, side=side, reasons=al["reasons"], htf=al["compact"])
+                self.notify.send(key, f"{title} · HTF against · not tradeable", [lines[0] if lines else "",
+                                 f"{al['line']} — no ask, no Claude entry read"],
+                                 kw.get("png"), fields=kw.get("fields"), color=EVENT_COLOURS["market"], footer=kw.get("footer"))
+                return False
         self.notify.ask(key, title, lines, **kw)
         return True
+
+    def htf_frames(self) -> dict:
+        """v2.14.0: closed bars + EMAs of each confirm TF, cached per exec bar. M45 is synthetic (from M15)."""
+        from .htf_align import confirm_tfs_for
+        from .common.tf_synth import closed_only
+        cache = getattr(self, "_htf_frames_cache", None)
+        if cache is not None and cache[0] == self.last_bar:
+            return cache[1]
+        out = {}
+        now = broker.now_server(self.off)
+        for tf in confirm_tfs_for(self.cfg):
+            try:
+                d = broker.bars_tf(self.symbol, tf, 300, self.cfg.source, self.off)
+                d = closed_only(d, tf, now) if tf != "M45" else d          # synth_m45 already drops the open group
+                out[tf] = self.S.add_emas(d.reset_index(drop=True))
+            except Exception as e:
+                telemetry.info(f"{self.symbol} {tf} bars failed: {e!r}")
+                out[tf] = None
+        self._htf_frames_cache = (self.last_bar, out)
+        return out
+
+    def htf_alignment(self, side: str) -> dict:
+        """{states, ok, reasons, line, compact, frames} for a LONG / SHORT entry on the latest exec bar."""
+        from . import htf_align as H
+        cf, cs = self.S.ema_cols
+        frames = self.htf_frames()
+        states = {tf: H.htf_state(df, side, cf=cf, cs=cs, pre_max_gap=float(self.cfg.htf_pre_max_gap),
+                                  with_max_bars=int(self.cfg.htf_with_max_bars)) for tf, df in frames.items()}
+        ok, reasons = H.gate(states, mode_min=self.cfg.htf_align_min, require_fresh=bool(self.cfg.htf_require_fresh))
+        al = {"side": side.upper(), "states": states, "ok": ok, "reasons": reasons, "line": H.line(states),
+              "compact": H.compact(states), "frames": frames}
+        self.last_htf = al
+        return al
 
     def _m15_state(self) -> str | None:
         """v2.8.0: raw M15 50/80 state on closed bars ("BULLISH · PULLBACK", …), cached per M5 bar. Any failure → None
@@ -887,7 +946,7 @@ class SymbolAgent(threading.Thread):
             if _chop:
                 re_fields.append(field("⚠️ Chop day", f"{_chop_n} crosses before 11:00 server — half size suggested", inline=False))
             png = context_chart(df, self.symbol, self.S.display_name, self.S.fast, self.S.slow, self.S.ema_cols, self.off, self.chart_dir,
-                                bars=120, title_extra="re-entry", reentries=[{"index": r.index, "side": r.side}],
+                                bars=self.chart_bars, title_extra="re-entry", reentries=[{"index": r.index, "side": r.side}],
                                 marker={"index": r.index, "side": r.side, "label": "RE", "stop": stop,
                                         "secure": (r.price + s_ * g.secure_at) if g else None})
             re_key = self.key(f"RE_{r.side}", bar_key(bar_t, self.off))
@@ -959,12 +1018,12 @@ class SymbolAgent(threading.Thread):
                              fields=[field("Signal", f"{lg['kind'].upper()} **{lg['side']}**"), field("From", f"{lg['start_px']:.2f}"),
                                      field("Best", f"**{lg['best_px']:.2f}** ({lg['best']:+.1f})"), field("Now", f"{close:.2f} ({now_move:+.1f})"),
                                      field("Against", f"−{lg['against']:.1f}"),
-                                     field("Running", f"{max(0, (bar_t - lg['start_t']) // 300)} bars · {ist(lg['best_t'], self.off)[-5:]} peak")],
+                                     field("Running", f"{max(0, (bar_t - lg['start_t']) // self.bar_s)} bars · {ist(lg['best_t'], self.off)[-5:]} peak")],
                              color=EVENT_COLOURS["signal_long" if long else "signal_short"], footer=cfooter(self.S.display_name, "leg progress"))
         # the leg ends when the 50/80 order turns against it
         if new_bar and ((long and sgn < 0) or ((not long) and sgn > 0)) and lg["kind"] != "P":
             self._end_leg(df, bar_t, f"EMA {self.S.fast}/{self.S.slow} crossed back")
-        elif new_bar and lg["kind"] == "P" and (bar_t - lg["start_t"]) // 300 > 48 and lg["best"] < step:
+        elif new_bar and lg["kind"] == "P" and (bar_t - lg["start_t"]) // self.bar_s > self._leg_slow_bars() and lg["best"] < step:
             self._end_leg(df, bar_t, "P never developed (4h)")
 
     def _end_leg(self, df, bar_t, why):
@@ -1110,7 +1169,7 @@ class SymbolAgent(threading.Thread):
                     res = self.S.analyse({"M5": Bars(self.symbol, "M5", closed)}, self.symbol, self.off, self.news)["M5"]; self.last_res = res
                 card = alerts_mod.reached_card(self, a, a["hit_price"], tk["time"], bar_t, df, res)
                 png = context_chart(df, self.symbol, self.S.display_name, self.S.fast, self.S.slow, self.S.ema_cols, self.off, self.chart_dir,
-                                    bars=120, title_extra=f"alert {a['price']:.2f}")
+                                    bars=self.chart_bars, title_extra=f"alert {a['price']:.2f}")
                 self.notify.ask(card["key"], card["title"], card["lines"], png=png, fields=card["fields"], color=card["color"],
                                 footer=card["footer"], meta=card["meta"])
                 self.health["last_signal"] = f"ALERT {a['price']:.2f} @ {ist(bar_t, self.off)}"
@@ -1573,6 +1632,10 @@ class SymbolAgent(threading.Thread):
                 if reason:
                     self._close_leg(p, reason, tag, st, jr, bar_t)
                     return
+
+    def _leg_slow_bars(self) -> int:
+        from .common.tf_synth import bars_for
+        return bars_for(240) if self.exec_tf != "M5" else 48      # 4 h
 
     def _advisor_tick(self, p, st, bar_t, df, ef, es, g, new_bar):
         """5b) advisor + periodic snapshot (notifications only — no broker action). Shared by every profile."""

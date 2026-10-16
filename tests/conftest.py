@@ -33,3 +33,12 @@ def _netguard_reset():
     netguard.reset(); ops.STOP.clear()
     yield
     netguard.reset(); ops.STOP.clear()
+
+
+@_pytest.fixture(autouse=True)
+def _exec_tf_reset():
+    """v2.14.0: the execution timeframe is process-wide — every test starts on M5."""
+    from aureon_mt5.common import tf_synth
+    tf_synth.set_exec_tf("M5")
+    yield
+    tf_synth.set_exec_tf("M5")

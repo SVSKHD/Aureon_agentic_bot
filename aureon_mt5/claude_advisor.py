@@ -38,7 +38,12 @@ ADVISE_MODES = ("advisory", "manage")
 STRATEGY = "ema5080"                       # key prefix for the ALL-symbol cards (kept for dedupe compatibility)
 STRATEGIES = ("ema5080", "ema2050")        # v2.0.0: the add-on advises both modes
 UNAVAILABLE_BACKOFF_S = 300
-BAR_S = 300
+BAR_S = 300                                 # the M5 value, kept for imports; v2.14.0 code calls _bar_s() (the exec TF)
+
+
+def _bar_s() -> int:
+    from .common.tf_synth import bar_s
+    return bar_s()
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 from .common.rules import RULES_PATH, read_rules   # v2.3.0: prompts/advisor_rules.md, shared with Codex
 KIND_TO_EVENT = {"P": "P", "cross": "CROSS", "reentry": "RE", "enter": "ENTER", "pullback": "ENTER", "no-pullback": "ENTER"}
@@ -69,6 +74,8 @@ PRE_EXIT_RULES = ("PRE-EXIT READ: the guardian is about to close this trade by r
                   "is regardless. Answer HOLD only if the structure says the rule is reacting to noise (cite evidence); otherwise "
                   "EXIT. A deferral is one bar; at most {max_defer}. Deferrals used so far: {used}.")
 READ_TRIGGERS = ("open", "drawdown", "opposite P held", "pre_exit")
+HTF_RULES = ("HTF_ALIGN = the two higher timeframes: `with` = already crossed our way, `pre` = converging toward it, "
+             "`against` = no. Prefer SKIP when any is `against`.")
 
 
 def read_prompt_text(base: str, extra: str = "") -> str:
@@ -154,6 +161,11 @@ def build_snapshot(agent, event: str, side: str, bar_t: int, df, *, position: di
         snap["spread_warning"] = " · ".join(agent._warnings(df)) or None
     except Exception:
         pass
+    if getattr(getattr(agent, "cfg", None), "htf_align", "off") != "off" and _side_word(side) and hasattr(agent, "htf_alignment"):
+        try:                                                           # v2.14.0: the two higher timeframes
+            snap["htf_align"] = agent.htf_alignment("LONG" if _side_word(side) == "BUY" else "SHORT")["compact"]
+        except Exception as e:
+            telemetry.info(f"htf_align snapshot failed: {e!r}")
     if "zl50" in df:                                                   # v2.10.0 AUREON_ZL_CONTEXT
         from .common.zl import zl_block
         snap["zl"] = zl_block(df)
@@ -182,7 +194,7 @@ def build_snapshot(agent, event: str, side: str, bar_t: int, df, *, position: di
                      "mae_so_far": round(float(st.get("mae", min(0.0, pts))), 2),
                      "retrace_from_peak_pts": round(max(0.0, peak - pts), 2),
                      "retrace_pct": round(100 * max(0.0, peak - pts) / peak, 1) if peak > 0 else None,
-                     "bars_since_peak": int(max(0, (bar_t - int(peak_t)) // BAR_S)) if peak_t else None,
+                     "bars_since_peak": int(max(0, (bar_t - int(peak_t)) // _bar_s())) if peak_t else None,
                      "closed_through_slow_ema": bool((close < e80) if long else (close > e80)),
                      "dist_to_sl": round(abs(float(position.get("current", close)) - sl), 2) if sl else None,
                      # v2.8.0 setup view (the guardian's per-ticket checks; None until computed)
@@ -217,7 +229,8 @@ def _day_stats(agent) -> tuple[float, int]:
 SNAPSHOT_KEEP = ("gap", "dist_to_fast_ema_pts", "swing_against_last6_pts", "atr20", "avg_range", "crosses_today", "bars_since_cross",
                  "confirm_state", "session", "trend_state", "minutes_to_news", "day_pnl_pts", "trades_today", "retrace_pct",
                  "retrace_from_peak_pts", "bars_since_peak", "mae_so_far", "closed_through_slow_ema", "dist_to_sl", "peak", "open_profit",
-                 "setup", "setup_alive", "dist_to_cap", "trigger", "zl", "regime", "guardian", "pending_exit", "deferrals_used")
+                 "setup", "setup_alive", "dist_to_cap", "trigger", "zl", "regime", "guardian", "pending_exit", "deferrals_used",
+                 "htf_align")
 
 
 def _compact(snap: dict) -> dict:
@@ -656,8 +669,8 @@ class ClaudeAdvisor:
         fast, slow = (names["fast"], names["slow"]) if isinstance(names, dict) else names
         head = (f"MODE: {snapshot.get('mode', '?')} — fast EMA = {fast}, slow EMA = {slow}. Apply the section for this mode; "
                 f"ema_fast/ema_slow in the snapshot are {fast}/{slow}.\n\n")
-        extra = "".join(f"\n\n{t}" for k, t in (("zl", ZL_RULES), ("regime", REGIME_RULES), ("guardian", GUARDIAN_RULES))
-                        if snapshot.get(k))
+        extra = "".join(f"\n\n{t}" for k, t in (("zl", ZL_RULES), ("regime", REGIME_RULES), ("guardian", GUARDIAN_RULES),
+                                                  ("htf_align", HTF_RULES)) if snapshot.get(k))
         return head + self.rules.strip() + extra + "\n\nSNAPSHOT:\n" + json.dumps(snapshot, default=str)
 
     def read_prompt(self, snapshot: dict, extra: str = "") -> str:
@@ -705,7 +718,7 @@ class ClaudeAdvisor:
         if res is None:
             out["budget_used"] = True; out["error"] = "daily budget used — no call made"; return out
         out["latency"] = res.latency_s
-        out["stale"] = now_server(agent.off) >= bar_t + 2 * BAR_S
+        out["stale"] = now_server(agent.off) >= bar_t + 2 * _bar_s()
         v = res.verdict if res.ok else None
         err = "" if v is not None else (res.error or "no verdict")
         if v is not None:
@@ -763,7 +776,7 @@ class ClaudeAdvisor:
         self.stats["last_verdict_by_symbol"][job["symbol"]] = f"{datetime.now(IST):%H:%M} IST {v['decision']}"
         job["latency"] = res.latency_s
         if job["type"] == "entry":
-            stale = now_server(job["off"]) >= job["bar_t"] + 2 * BAR_S
+            stale = now_server(job["off"]) >= job["bar_t"] + 2 * _bar_s()
             self._journal(job, v, latency=res.latency_s, acted=False, stale=stale)
             self._entry_card(job, v, stale)
         else:
@@ -829,7 +842,7 @@ class ClaudeAdvisor:
     def apply_pullback(self, agent, job: dict, p: dict | None, st: dict) -> bool:
         """Returns True when an action was applied in MT5. Order: MT5 → confirm → state → journal → Discord."""
         v = job["verdict"]; dec = v["decision"]
-        stale = now_server(agent.off) >= job["bar_t"] + 2 * BAR_S
+        stale = now_server(agent.off) >= job["bar_t"] + 2 * _bar_s()
         acted = False; note = ""
         if p is None:
             note = "position no longer open — nothing to do"

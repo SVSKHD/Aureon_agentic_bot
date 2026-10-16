@@ -277,6 +277,7 @@ HELP = {
     "Control": {
         "restart": "Restart bot — admin only",
         "mode": "Change process mode and restart — admin only",
+        "decide-timeframe": "Exec timeframe + its two confirm TFs: plan, replay, apply:true restarts — admin only",
         "discord-bot": "Bot administration — admin",
         "commands": "This directory — read-only",
     },
@@ -2105,6 +2106,21 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             warn = profile_warning(cfg, agents) if force else ""
             return Reply(content=f"MODE CHANGE → {mode} · restarting" + (f"\n{warn}" if warn else ""))
         await run(inter, "mode", work)
+
+    @tree.command(name="decide-timeframe", description="Admin: pick the exec timeframe (+2 confirm TFs) — plan, replay, apply restarts")
+    @app_commands.describe(tf="M5 M10 M15 M20 M30 H1 H2 H4 (blank: the ladder and the last decision)",
+                           apply="write the overrides and restart (default false: plan + replay only)",
+                           days="replay window in days (default 30)", force="apply with a position open (unsafe)")
+    async def decide_timeframe_cmd(inter: discord.Interaction, tf: str = "", apply: bool = False, days: int = 30,
+                                   force: bool = False):
+        from . import decide_tf
+
+        def work():
+            return Reply(content=decide_tf.decide(
+                cfg, agents, journal, notify, inter.user, tf, apply=apply, days=max(1, min(int(days), 120)), force=force,
+                restart=lambda user, reason: _restart_later(user, reason),
+                advisors=[claude] if claude is not None else []))
+        await run(inter, "decide-timeframe", work, timeout=600)
 
     # ------------------------------------------------------------------ v1.10.0 Claude add-on (all off the loop via run())
     claude_wait = float(getattr(cfg, "claude_timeout", 90)) * 2 + 15      # a call may queue behind one in flight

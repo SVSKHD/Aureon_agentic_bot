@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from dotenv import load_dotenv
 load_dotenv()   # load .env if present
 
-VERSION = "2.13.0"
+VERSION = "2.14.0"
 
 
 def _parse_lot_buttons(raw: str) -> list[float]:
@@ -221,6 +221,18 @@ class Config:
     follow_max_hold_bars: int = _num("AUREON_FOLLOW_MAX_HOLD_BARS", "0", int)
     follow_pre_exit_read: bool = os.environ.get("AUREON_FOLLOW_PRE_EXIT_READ", "1") == "1"   # the flip exit asks Claude when
                                                                                            # AUREON_PRE_EXIT_READ is on
+    # v2.14.0 execution timeframe + the higher-timeframe alignment gate (defaults = v2.13.0: M5, gate off)
+    exec_tf: str = os.environ.get("AUREON_EXEC_TF", "M5").strip().lower()        # m5 | m10 | … (readers upper() it)
+    confirm_hold_bars: int = _num("AUREON_CONFIRM_HOLD_BARS", "0", int)          # 0 = the exec TF's default (M5 3, M30 2)
+    confirm_gap_x_range: float = _num("AUREON_CONFIRM_GAP_X_RANGE", "0", float)  # 0 = the exec TF's default (M5 1.5 pts, M30 0.25×)
+    confirm_window_bars: int = _num("AUREON_CONFIRM_WINDOW_BARS", "0", int)      # 0 = the exec TF's default (M5 18, M30 6)
+    htf_align: str = os.environ.get("AUREON_HTF_ALIGN", "off").strip().lower()
+    htf_confirm_tfs: tuple = field(default_factory=lambda: tuple(x.strip().upper() for x in
+                                   os.environ.get("AUREON_HTF_CONFIRM_TFS", "").replace(" ", ",").split(",") if x.strip()))
+    htf_pre_max_gap: float = _num("AUREON_HTF_PRE_MAX_GAP", "0.35", float)
+    htf_with_max_bars: int = _num("AUREON_HTF_WITH_MAX_BARS", "8", int)
+    htf_require_fresh: bool = os.environ.get("AUREON_HTF_REQUIRE_FRESH", "0") == "1"
+    htf_align_min: str = os.environ.get("AUREON_HTF_ALIGN_MIN", "all").strip().lower()
     # regime score weights (sum need not be 1; the score is clipped to [0, 1])
     regime_weights: dict = field(default_factory=lambda: {"crosses": 0.30, "flat_gap": 0.20, "adx": 0.20, "di": 0.10,
                                                           "failed_p": 0.10, "compression": 0.10})

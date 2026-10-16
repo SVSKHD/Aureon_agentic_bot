@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 IMAGE_EVENT_CHOICES = ("P", "CROSS", "RE", "ENTER", "ALERT", "READ")
 MENTION_EVENT_CHOICES = ("ASK", "FILLED", "CLOSED", "STOP", "FLIP_HOLD", "POSITION_ASK", "CLOSED_BY_YOU")
 PUSH_CHOICES = ("NTFY", "PUSHOVER", "TELEGRAM")
+TF_LADDER_CHOICES = ("M5", "M10", "M15", "M20", "M30", "M45", "H1", "H2", "H3", "H4", "H6", "H8", "H12", "D1")
 TRUE_WORDS = ("1", "true", "on", "yes", "y")
 FALSE_WORDS = ("0", "false", "off", "no", "n")
 
@@ -110,6 +111,32 @@ def registry() -> list[Feature]:
                 hot=False, min=0, max=1000),
         Feature("follow_pre_exit_read", "AUREON_FOLLOW_PRE_EXIT_READ", "bool", True, "follow_pre_exit_read", "follow",
                 "follow: the structure-flip exit goes through the pre-exit read when AUREON_PRE_EXIT_READ is on"),
+        # ---- timeframe (v2.14.0)
+        Feature("exec_tf", "AUREON_EXEC_TF", "enum", "m5", "exec_tf", "timeframe",
+                "execution timeframe — every bar-count rule is converted from minutes (needs a restart: /decide-timeframe)",
+                choices=("m5", "m10", "m15", "m20", "m30", "h1", "h2", "h4"), hot=False, loud=True,
+                consequence="the bot now trades on {exec_tf} bars after the restart"),
+        Feature("confirm_hold_bars", "AUREON_CONFIRM_HOLD_BARS", "int", 0, "confirm_hold_bars", "timeframe",
+                "ema2050 cross confirmation: bars the order must hold (0 = the exec TF default: M5 3, M30 2)", hot=False, min=0, max=10),
+        Feature("confirm_gap_x_range", "AUREON_CONFIRM_GAP_X_RANGE", "float", 0.0, "confirm_gap_x_range", "timeframe",
+                "ema2050 cross confirmation: |gap| >= this × avg range (0 = the exec TF default: M5 1.5 pts, M30 0.25×)",
+                hot=False, min=0.0, max=3.0),
+        Feature("confirm_window_bars", "AUREON_CONFIRM_WINDOW_BARS", "int", 0, "confirm_window_bars", "timeframe",
+                "ema2050 cross confirmation window in bars (0 = the exec TF default: M5 18, M30 6)", hot=False, min=0, max=60),
+        Feature("htf_align", "AUREON_HTF_ALIGN", "enum", "off", "htf_align", "timeframe",
+                "the two higher timeframes: off · show (HTF line on the card) · block (no ask unless every confirm TF is with/pre)",
+                choices=("off", "show", "block"), loud=True, loud_values=("block",),
+                consequence="entry asks are now blocked unless the higher timeframes are with the cross or about to cross"),
+        Feature("htf_confirm_tfs", "AUREON_HTF_CONFIRM_TFS", "enum-set", (), "htf_confirm_tfs", "timeframe",
+                "confirm timeframes (none = the next two rungs above the exec TF, e.g. M30 → M45,H1)", choices=TF_LADDER_CHOICES),
+        Feature("htf_pre_max_gap", "AUREON_HTF_PRE_MAX_GAP", "float", 0.35, "htf_pre_max_gap", "timeframe",
+                "`pre` = gap against but converging and |gap| <= this × that TF's avg range", min=0.0, max=3.0),
+        Feature("htf_with_max_bars", "AUREON_HTF_WITH_MAX_BARS", "int", 8, "htf_with_max_bars", "timeframe",
+                "`with` = crossed our way within this many bars of that TF (older = with_stale)", min=1, max=200),
+        Feature("htf_require_fresh", "AUREON_HTF_REQUIRE_FRESH", "bool", False, "htf_require_fresh", "timeframe",
+                "a stale same-direction cross (older than HTF_WITH_MAX_BARS) does not count as `with`"),
+        Feature("htf_align_min", "AUREON_HTF_ALIGN_MIN", "enum", "all", "htf_align_min", "timeframe",
+                "all = every confirm TF with/pre · any = at least one with and none against", choices=("all", "any")),
         # ---- plan
         Feature("daily_plan", "AUREON_DAILY_PLAN", "bool", True, "daily_plan", "plan", "post the daily plan card"),
         # ---- repair

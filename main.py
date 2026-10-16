@@ -111,6 +111,17 @@ def news_status(path: str | None) -> tuple[str, bool]:
     return ("UNVERIFIED — file contains example events" if unverified else "file + NFP auto"), unverified
 
 
+def timeframe_line(cfg) -> str:
+    """v2.14.0: exec TF · the two confirm TFs · the gate."""
+    from aureon_mt5.common import tf_synth
+    ex = str(getattr(cfg, "exec_tf", "M5")).upper()
+    try:
+        conf = list(getattr(cfg, "htf_confirm_tfs", ()) or ()) or list(tf_synth.confirm_tfs(ex))
+    except ValueError:
+        conf = []
+    return f"exec {ex} · confirm {', '.join(conf) or '—'} · HTF gate {getattr(cfg, 'htf_align', 'off')}"
+
+
 def greet(notify, cfg, S, why, news_line):
     art = banner()
     gv = git_version() if "git_version" in globals() else ""
@@ -132,6 +143,7 @@ def greet(notify, cfg, S, why, news_line):
         fields=[
             {"name": "Mode", "value": S.display_name, "inline": True},
             {"name": "Symbols", "value": ", ".join(cfg.symbols), "inline": True},
+            {"name": "Timeframe", "value": timeframe_line(cfg), "inline": True},
             {"name": "Guardian", "value": "🟢 ON" if guardian_on else "⚪ OFF", "inline": True},
             {"name": "MT5", "value": ("🟢 " if mt5_state in ("CONNECTED", "DRY") else "🔴 ") + mt5_state, "inline": True},
             {"name": "Server", "value": f"{srv:%a %d %b %H:%M} · UTC{cfg.server_utc_offset:+g}", "inline": True},
@@ -288,6 +300,10 @@ def main():
     if feature_overrides:
         _features.apply(cfg, feature_overrides)
         print("feature overrides (Discord): " + ", ".join(f"{k}={v}" for k, v in feature_overrides.items()))
+    from aureon_mt5.common import tf_synth                             # v2.14.0: the execution timeframe, process-wide
+    tf_synth.set_exec_tf(cfg.exec_tf, cfg)                             # after the overrides: /decide-timeframe writes exec_tf there
+    journal.log("process_start", version=VERSION, mode=cfg.mode, exec_tf=tf_synth.exec_tf(), htf_align=cfg.htf_align,
+                symbols=list(cfg.symbols))
     health_notify = Notifier(cfg.health_webhook) if cfg.health_webhook else notify
     # v2.10.1 BOOT CHECK: unparsable / out-of-range / contradictory settings fall back to the safe default, loudly
     from aureon_mt5.config import apply_fallbacks, validate as validate_cfg

@@ -88,6 +88,7 @@ def console_state(cfg, agents: dict, actions, notify=None, *, started: float | N
         "pending_ask": pending,
         "last_reads": list(getattr(actions, "last_reads", []) or [])[-5:],
         "network": _network_state(),
+        "timeframe": _timeframe(cfg),
         "health": {"uptime_s": round(now - started) if started else None,
                    "discord_ok": bool(getattr(notify, "last_ok", True)),
                    "network_degraded": bool(server.network_degraded()),
@@ -95,6 +96,13 @@ def console_state(cfg, agents: dict, actions, notify=None, *, started: float | N
                    "agents": {s: {"status": (getattr(a, "health", {}) or {}).get("status"),
                                   "last_bar": (getattr(a, "health", {}) or {}).get("last_bar")} for s, a in (agents or {}).items()}},
     }
+
+
+def _timeframe(cfg) -> dict:
+    """v2.14.0: the execution timeframe and its two confirm timeframes (pad / apps display it)."""
+    from .htf_align import confirm_tfs_for
+    return {"exec": str(getattr(cfg, "exec_tf", "M5")).upper(), "confirm": confirm_tfs_for(cfg),
+            "htf_align": getattr(cfg, "htf_align", "off")}
 
 
 def _network_state() -> dict:

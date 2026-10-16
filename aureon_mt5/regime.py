@@ -24,8 +24,23 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 
 IST = timezone(timedelta(hours=5, minutes=30))
-WINDOW = 24                    # 2 h of M5 bars
-FLAT_WINDOW = 12
+WINDOW = 24                    # 2 h of M5 bars (v2.14.0: _window() converts 2 h to the exec TF)
+FLAT_WINDOW = 12               # 1 h of M5 bars (_flat_window())
+
+
+def _window() -> int:
+    from .common.tf_synth import bars_for, exec_tf
+    return WINDOW if exec_tf() == "M5" else bars_for(120)
+
+
+def _bar_s() -> int:
+    from .common.tf_synth import bar_s
+    return bar_s()
+
+
+def _flat_window() -> int:
+    from .common.tf_synth import bars_for, exec_tf
+    return FLAT_WINDOW if exec_tf() == "M5" else bars_for(60)
 SESSION_START_IST = (5, 30)
 NY_OPEN_IST = (19, 0)          # 09:30 New York ≈ 19:00 IST
 DEFAULT_WEIGHTS = {"crosses": 0.30, "flat_gap": 0.20, "adx": 0.20, "di": 0.10, "failed_p": 0.10, "compression": 0.10}
@@ -36,12 +51,12 @@ def _sign_changes(a: np.ndarray) -> int:
     return int(np.sum(s[1:] != s[:-1])) if len(s) > 1 else 0
 
 
-def failed_ps(gap: np.ndarray, p_idx: list[tuple[int, int]], window: int = WINDOW) -> int:
+def failed_ps(gap: np.ndarray, p_idx: list[tuple[int, int]], window: int | None = None) -> int:
     """P's (index, +1 long / −1 short) in the last `window` bars whose cross never came within 6 bars, or came and reversed
     within 3. A P younger than 6 bars without its cross yet is not counted."""
     n = len(gap); bad = 0
     for k, d in p_idx:
-        if k < n - window or k >= n:
+        if k < n - (window or _window()) or k >= n:
             continue
         j = next((i for i in range(k + 1, min(n, k + 7)) if np.sign(gap[i]) == d), None)
         if j is None:
@@ -62,15 +77,15 @@ def regime_features(df, cf: str = "ema_fast", cs: str = "ema_slow", p_idx: list 
         a, p, m = adx(df, 14); adx14, dip, dim = a.to_numpy(), p.to_numpy(), m.to_numpy()
     r20 = (df["high"].rolling(20).max() - df["low"].rolling(20).min()).to_numpy(dtype=float)
     ref = np.nanmean(r20[-120:]) if np.isfinite(r20[-120:]).any() else np.nan
-    f = {"crosses_2h": _sign_changes(gap[-(WINDOW + 1):]),
-         "flat_gap_bars": int(np.sum(np.abs(gap[-FLAT_WINDOW:]) < 0.3 * avg20)) if avg20 > 0 else 0,
+    f = {"crosses_2h": _sign_changes(gap[-(_window() + 1):]),
+         "flat_gap_bars": int(np.sum(np.abs(gap[-_flat_window():]) < 0.3 * avg20)) if avg20 > 0 else 0,
          "adx14": round(float(adx14[-1]), 1) if len(adx14) else 0.0,
          "adx14_rising": bool(len(adx14) > 3 and adx14[-1] > adx14[-4]),
          "di_spread": round(float(abs(dip[-1] - dim[-1])), 1) if len(dip) else 0.0,
          "failed_p_2h": failed_ps(gap, p_idx or []),
          "range_compression": round(float(r20[-1] / ref), 2) if ref and np.isfinite(ref) and ref > 0 and np.isfinite(r20[-1]) else 1.0}
     if "zl50" in df:
-        f["zl_crosses_2h"] = _sign_changes((df["zl50"] - df["zl80"]).to_numpy(dtype=float)[-(WINDOW + 1):])
+        f["zl_crosses_2h"] = _sign_changes((df["zl50"] - df["zl80"]).to_numpy(dtype=float)[-(_window() + 1):])
     return f
 
 
@@ -78,7 +93,7 @@ def components(f: dict) -> dict:
     clip = lambda x: float(min(1.0, max(0.0, x)))
     crosses = max(f["crosses_2h"], f.get("zl_crosses_2h", 0) - 1)
     adx = clip((f["adx14"] - 15.0) / 20.0) + (0.15 if f["adx14_rising"] and f["adx14"] >= 15 else 0.0)
-    return {"crosses": 1.0 - min(crosses, 3) / 3.0, "flat_gap": 1.0 - f["flat_gap_bars"] / FLAT_WINDOW, "adx": clip(adx),
+    return {"crosses": 1.0 - min(crosses, 3) / 3.0, "flat_gap": 1.0 - f["flat_gap_bars"] / _flat_window(), "adx": clip(adx),
             "di": clip(f["di_spread"] / 20.0), "failed_p": 1.0 - min(f["failed_p_2h"], 2) / 2.0,
             "compression": clip(f["range_compression"])}
 
@@ -100,7 +115,7 @@ def reasons(f: dict) -> list[str]:
     if f.get("zl_crosses_2h", 0) >= 3:
         out.append(f"{f['zl_crosses_2h']} ZL crosses in 2 h")
     if f["flat_gap_bars"] >= 6:
-        out.append(f"EMA gap flat {f['flat_gap_bars']}/{FLAT_WINDOW} bars")
+        out.append(f"EMA gap flat {f['flat_gap_bars']}/{_flat_window()} bars")
     if f["adx14"] < 20:
         out.append(f"ADX 14 {'flat' if not f['adx14_rising'] else 'low'} ({f['adx14']:.0f})")
     if f["di_spread"] < 5:
@@ -156,7 +171,7 @@ class RegimeTracker:
 
     def update(self, df, bar_t: int, cf: str = "ema_fast", cs: str = "ema_slow", wall: float | None = None) -> dict:
         times = df["time"].to_numpy()
-        idx = {int(t): i for i, t in enumerate(times[-(WINDOW + 10):], start=len(times) - min(len(times), WINDOW + 10))}
+        idx = {int(t): i for i, t in enumerate(times[-(_window() + 10):], start=len(times) - min(len(times), _window() + 10))}
         p_idx = [(idx[t], d) for t, d in self.p_hist if t in idx]
         f = regime_features(df, cf, cs, p_idx)
         score = regime_score(f, getattr(self.cfg, "regime_weights", None))
@@ -176,7 +191,7 @@ class RegimeTracker:
         return self.as_dict(bar_t)
 
     def as_dict(self, bar_t: int | None = None) -> dict:
-        since = int((int(bar_t) - self.since_bar) // 300) if (bar_t is not None and self.since_bar is not None) else None
+        since = int((int(bar_t) - self.since_bar) // _bar_s()) if (bar_t is not None and self.since_bar is not None) else None
         return {"state": self.state, "score": self.score, "reasons": list(self.reasons), "since_bar": self.since_bar,
                 "since_bars": since, "no_trade_day": self.no_trade_day, "features": dict(self.features)}
 
