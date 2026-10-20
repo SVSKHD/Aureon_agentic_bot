@@ -2,6 +2,25 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## Unreleased — restart: pre-flight + reboot recovery
+- **Pre-flight** (`aureon_mt5/preflight.py`, `main.py` before any agent):
+  1. start `terminal64.exe` when it is not running (`AUREON_MT5_PATH`, else the cached path; else a warning);
+  2. wait for `initialize()` + `account_info()` every 5 s, up to 90 s, touching `logs/heartbeat.txt` on every attempt; still
+     down → exit 75;
+  3. market closed → nothing exits, the agents sleep until the open;
+  4. one **BACK ONLINE after restart** card (MT5 build, account, open positions re-adopted).
+  - Every step is logged to `logs/aureon.log`. `logs/preflight.json` keeps the outage across restarts, so **MT5 NOT UP** is
+    posted once. The COLD START card reads the heartbeat from before the pre-flight touched it.
+  - Fixes: after a reboot, a slow terminal was killed as a HANG by the launcher (the 300 s MT5 wait equalled the 300 s start
+    grace, with no heartbeat yet) and the supervisor looped. A terminal that was not yet logged in passed the old check.
+- **`scripts/install_logon_tasks.ps1`**: Scheduled Tasks at log on, in the interactive session (no NSSM):
+  - `Aureon-MT5` starts the terminal (0 s);
+  - `Aureon` runs the launcher loop (+30 s, restarted every minute).
+  It prints the auto-logon (Sysinternals Autologon) and `powercfg -change -standby-timeout-ac 0` reminders.
+- `docs/SERVICE.md`: the reboot sequence (boot → auto-logon → terminal task → bot task → pre-flight → BACK ONLINE).
+- Tests: `tests/test_v2150_preflight.py`.
+- Strategy rules changed: NO
+
 ## v2.14.0 — 2026-10-16  (MINOR: configurable execution timeframe, HTF alignment gate, /decide-timeframe; defaults unchanged)
 - **Execution timeframe** (`AUREON_EXEC_TF`, default `M5`). `common/tf_synth.py` holds the ladder, `TF_RULES` and the
   minutes table. `BAR_S`, the confirm rule and every bar-count window come from it:

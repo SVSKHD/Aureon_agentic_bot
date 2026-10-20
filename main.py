@@ -347,9 +347,12 @@ def main():
             previous_thread_hook(args)
     threading.excepthook = agent_thread_hook
 
+    preflight_res = None; prev_heartbeat = None
     if not cfg.dry:
-        from aureon_mt5 import server as _server                      # v2.10.1: MT5 may still be starting after a reboot
-        if not _server.connect_mt5(broker.connect, boot_wait=cfg.mt5_boot_wait, notify=health_notify, reset=broker.reset):
+        from aureon_mt5 import preflight, server as _server           # v2.15.0: pre-flight (terminal, MT5 + login, heartbeat)
+        prev_heartbeat = _server.last_heartbeat(cfg.log_dir)           # before the pre-flight touches heartbeat.txt
+        preflight_res = preflight.run(cfg, broker, health_notify)
+        if not preflight_res["ok"]:
             print("MT5 not available — is the terminal open and logged in? (use --dry for a pipe test)")
             from aureon_mt5 import ops as _o
             sys.exit(_o.EXIT_RESTART)                                 # the launcher restarts us (and MT5 first)
@@ -407,7 +410,8 @@ def main():
         if not marker and not os.environ.get("AUREON_RESTART_REASON") and not os.environ.get("AUREON_AUTO_RESTARTED"):
             why = "cold start"
             _srv.cold_start(cfg, journal, health_notify,
-                            {s_: (broker.positions(s_) if not cfg.dry else []) for s_ in cfg.symbols}, last_exit=last_exit)
+                            {s_: (broker.positions(s_) if not cfg.dry else []) for s_ in cfg.symbols}, last_exit=last_exit,
+                            heartbeat=prev_heartbeat)
         if marker.get("kind") in ("maintenance", "repair-auto", "repair-rollback"):
             why = f"restarted · {marker['kind']}"
             text = {"maintenance": f"maintenance reboot · {marker.get('reason', '')}",
@@ -449,6 +453,12 @@ def main():
                         fields=[{"name": "Enable explicitly", "value": "`--enable-silver`", "inline": True}],
                         footer="Aureon MT5")
     start_agents()
+    if preflight_res is not None:                                  # v2.15.0 pre-flight steps 3–4
+        from aureon_mt5 import preflight as _pf
+        closed = not broker.market_open(cfg.symbols[0], cfg.server_utc_offset, cfg.dry)
+        if closed:      # never exit on a closed market: the agents sleep and keep the position snapshot fresh (the
+            _pf.log("market closed — agents sleeping until the next open")     # /mode and restart gates read it)
+        _pf.back_online(health_notify, preflight_res, {s_: broker.positions(s_) for s_ in cfg.symbols}, closed=closed)
     monitor = None
     bot_repair: dict | None = {}                                   # filled below; the bot reads it lazily
     # v2.11.0 notifications: mentions + asks channel (notify), the push layer, the action console (one shared actions path)

@@ -129,3 +129,47 @@ What a network loss does now (`aureon_mt5/netguard.py`):
   single BACK ONLINE summary. NETWORK DEGRADED / RESTORED cards carry a DNS self-check.
 - **Every exit is recorded:** `process_exit` in the journal and in `restart_marker.json` / `logs/exit_marker.json`.
   Unplanned exits return 1, so NSSM restarts the process; planned exits return 0, restarts return 75.
+
+## v2.15.0 — reboot sequence (no human)
+
+MT5 runs in the **interactive desktop session** of the user who owns the terminal. The recommended install is now two
+**logon Scheduled Tasks**, not an NSSM service. This replaces "run the NSSM service" above: a service runs outside that session,
+so `MetaTrader5.initialize()` cannot reach the terminal.
+
+```powershell
+cd C:\Aureon
+.\scripts\aureon_service.ps1 -Action uninstall           # only if an NSSM service 'Aureon' was installed before
+powershell -ExecutionPolicy Bypass -File .\scripts\install_logon_tasks.ps1     # -Mt5Path "...\terminal64.exe" if not in .env
+# once: Sysinternals Autologon for this user, and never sleep:
+powercfg -change -standby-timeout-ac 0
+powercfg -change -hibernate-timeout-ac 0
+```
+
+The sequence after a Windows reboot (or a Windows Update restart):
+
+```
+boot → auto-logon → task Aureon-MT5 (0 s: terminal64.exe) → task Aureon (+30 s: launcher loop) → python main.py
+     → pre-flight → BACK ONLINE after restart
+```
+
+**Pre-flight** (`aureon_mt5/preflight.py`, first thing in `main.py` after the config, before any agent; every step is logged
+to `logs/aureon.log` as `preflight: …`):
+1. **Terminal.** If `terminal64.exe` is not running, start it from `AUREON_MT5_PATH` (else the path cached in `logs/mt5_path.txt`).
+   It is started through `Start-Process`, not as a child, so a supervisor `taskkill /T` of the bot never takes the terminal
+   with it. No known path → a warning, and the step is skipped.
+2. **MT5 + login.** Retry `MetaTrader5.initialize()` **and** `account_info()` every 5 s for up to 90 s. `initialize()` alone
+   succeeds against a terminal that has not logged in yet, and the old wait only checked that.
+   - `logs/heartbeat.txt` is touched on every attempt. Before v2.15.0 the heartbeat only started after MT5 connected. The MT5
+     wait (300 s) equalled the launcher's start grace (300 s), so a slow terminal was killed as a **HANG** and the supervisor
+     looped.
+   - Still down after 90 s → exit 75. The launcher (re)starts the terminal and the bot about 5 s later.
+   - The first failure time is kept in `logs/preflight.json` across those restarts. **MT5 NOT UP** is posted once when the
+     outage passes `AUREON_MT5_BOOT_WAIT` (300 s).
+3. **Market closed** → nothing exits. The agents start and sleep until the open, keeping the position snapshot fresh (the
+   `/mode` and restart gates read it).
+4. **One card:** **BACK ONLINE after restart · MT5 build · account · open positions re-adopted** (plus how long MT5 took and the
+   outage across restarts). It is posted after the existing COLD START / BACK ONLINE cards, which still give the reason for the
+   restart.
+
+Check it: `Restart-Computer`, then within about 2 min Discord shows BACK ONLINE after restart, `logs/aureon.log` has the
+`preflight:` lines, and `.\scripts\aureon_service.ps1 -Action status` shows a fresh heartbeat.
