@@ -1,7 +1,7 @@
 """Strategy registry. Each mode is an isolated package; nothing is shared between ema5080 and ema2050 except this interface.
 
     get_strategy("ema5080")   -> Strategy
-    available()               -> ["ema5080", "ema2050"] (installed ones)
+    available()               -> ["ema5080", "ema2050", "ema9200"] (installed ones)
 Aliases: 5080 -> ema5080, 2050 -> ema2050.
 """
 from __future__ import annotations
@@ -11,7 +11,8 @@ from dataclasses import dataclass
 from typing import Callable
 
 ALIASES = {"5080": "ema5080", "ema5080": "ema5080", "ema50/80": "ema5080",
-           "2050": "ema2050", "ema2050": "ema2050", "ema20/50": "ema2050"}
+           "2050": "ema2050", "ema2050": "ema2050", "ema20/50": "ema2050",
+           "9200": "ema9200", "ema9200": "ema9200", "ema9/200": "ema9200"}
 DEFAULT_MODE = "ema5080"
 
 
@@ -63,7 +64,7 @@ def resolve_mode(cli: str | None) -> str:
 
 def installed() -> dict[str, bool]:
     out = {}
-    for name in ("ema5080", "ema2050"):
+    for name in ("ema5080", "ema2050", "ema9200"):
         try:
             __import__(f"aureon_mt5.strategies.{name}.strategy")
             out[name] = True

@@ -102,6 +102,8 @@ def strategy_overrides(strategy: str, tf: str | None = None) -> dict:
     if strategy == "ema5080":
         return {"late_entry_bars": 0, "pullback_wait_bars": r["pullback_wait_bars"], "reentry_window": r["reentry_window"],
                 "p_sep_bars": r["p_sep_bars"], "wz_bars": r["wz_bars"], "pre_timeout": r["pre_timeout_bars"], "max_bars": r["max_bars"]}
+    if strategy == "ema9200":
+        return {}                       # v2.15.0: rules are native M30 bar counts; no minute conversion
     return {}
 
 
