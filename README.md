@@ -10,7 +10,7 @@ protect → secure +10 → ride in +5 steps → close on the fast-EMA turn → n
 | `ema2050` | ACTIVE (v2.0.0) | EMA 20/50: confirmed cross (3 bars + 1.5 gap) + pullback entry, own Gold guardian profile (−12 / +3→+1 / +10 / ride +5) |
 | `ema9200` | ACTIVE (v2.15.0) | EMA 9/200 on **M30**: candidates only (pullback to EMA9 with the bias / momentum bar) → TAKE / SKIP, own Gold guardian profile (−30 / +40→+30 / ride +10 / EMA9 turn / Friday flat) |
 
-Nothing is ported between them. Resolution: `--mode` → `AUREON_MODE` → `ema5080`. Aliases `5080`, `2050`.
+Nothing is ported between them. Resolution: `--mode` → `AUREON_MODE` → `ema5080`. Aliases `5080`, `2050`, `9200`.
 The mode is fixed for the life of the process; a change needs a restart. Positions managed under another mode are kept
 protected (SL never loosened) but receive no strategy rules; a `⚠️ MODE MISMATCH` warning is posted.
 
@@ -51,7 +51,27 @@ in position / hour / news), then the usual `ask_*` / `take` / `skip` / `expired`
 Replay (offline, CSV from `fetch_bars.py`):
 
     python tools/replay_9200.py --csv xauusd_m30_20260403_20261020.csv --from 2026-05-01
+    python tools/export_decisions_9200.py --from 2026-10-19 --to 2026-10-24     # journal → logs/decisions_9200.json
     python tools/replay_9200.py --csv ... --decisions logs/decisions_9200.json      # replay a recorded TAKE/SKIP log
+
+`tools/export_decisions_9200.py` reads `logs/journal.jsonl` (mode `ema9200` only) and writes `{bar_time_epoch: true|false}`.
+- `true` = TAKE.
+- `false` = SKIP or EXPIRED, and also a `signal` nobody answered. EXPIRED is journaled only by the Discord view's timeout, so
+  without the bot running, an unanswered ask leaves no decision row.
+- The last decision on a bar wins.
+
+The TAKE / SKIP / EXPIRED answers are `decision` rows (`decision=TAKE|SKIP|EXPIRED`, `bar`, `side`, `signal_kind`, `by`).
+
+**First-class mode:** `/mode ema9200` and `ops.write_mode` accept it. `/alert`'s guardian context uses the ema9200 hour /
+Friday / news rule; before, it read the ema5080-only `entry_hours_ist` and raised. The Claude snapshot labels its EMAs `ema9` / `ema200`.
+`AUREON_ASK_TTL_MIN` is read from the environment; it was hard-coded to 20 before v2.15.0. Every ask expiry counts wall-clock
+minutes, not bars.
+
+**Not yet in this mode** (the replay has them, the live agent does not):
+- **Friday flat:** no live Friday close. The guardian's −30 / +40→+30 / ride +10 / EMA 9 turn are live.
+- **Claude / Codex entry reads:** the advisors' mode list is still `ema5080`, `ema2050`, so `request_entry` is a no-op here.
+- **`/alert`:** the entry window and news block use this mode's rule. The cross / confirm read on the alert card uses the
+  generic path (no ema9200-specific candidate check yet).
 
 The take-all baseline on Apr–Oct 2026 is **−$19.6k / lot** (218 candidates, 40% win, 11 / 15 weeks). That is the point: the
 value is in the selection. Three hand-traded weeks: +$12.3k, +$14.6k blind (and +$13.0k / +$24.2k on a replayed week).

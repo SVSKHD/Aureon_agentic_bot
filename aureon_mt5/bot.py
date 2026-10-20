@@ -2086,13 +2086,13 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
         await run(inter, "restart", work)
 
     @tree.command(name="mode", description="Admin: change EMA process mode and restart; rejects open positions")
-    @app_commands.describe(mode="ema2050 or ema5080", symbols="Comma-separated symbols; blank preserves existing", force="Override open-position gate (unsafe)")
+    @app_commands.describe(mode="ema2050, ema5080 or ema9200", symbols="Comma-separated symbols; blank preserves existing", force="Override open-position gate (unsafe)")
     async def mode_cmd(inter: discord.Interaction, mode: str, symbols: str = "", force: bool = False):
         def work():
             if not ops.admin_allowed(inter.user, os.environ.get("AUREON_ADMIN_ROLE_ID", "")):
                 return Reply(content="Denied: configured administrator role required")
-            if mode not in ("ema2050", "ema5080"):
-                return Reply(content="Unsupported mode; use ema2050 or ema5080")
+            if mode not in ("ema2050", "ema5080", "ema9200"):
+                return Reply(content="Unsupported mode; use ema2050, ema5080 or ema9200")
             if not force and ops.positions_block_mode_change(agents):
                 return Reply(content="position open or position status unverified — /mode after it closes or pass force:true\n"
                                      + profile_warning(cfg, agents))
