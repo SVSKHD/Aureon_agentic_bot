@@ -61,7 +61,7 @@ class Config:
     health_webhook: str | None = os.environ.get("DISCORD_HEALTH_WEBHOOK") or None   # bot/Claude health cards; falls back to DISCORD_WEBHOOK
     channel_id: int | None = int(os.environ["DISCORD_CHANNEL"]) if os.environ.get("DISCORD_CHANNEL", "").isdigit() else None   # for TAKE/SKIP buttons
     guild_id: int | None = int(os.environ["DISCORD_GUILD"]) if os.environ.get("DISCORD_GUILD", "").isdigit() else None         # v2.0.2: command sync target
-    ask_ttl_min: int = 20          # an ask expires after this many minutes
+    ask_ttl_min: int = _num("AUREON_ASK_TTL_MIN", "20", int)   # an ask expires after this many minutes (wall clock; M30: 30)
     risk_pct: float = _num("AUREON_RISK_PCT", "1.0", float)   # AUREON-005: lot helper on ask cards (display only)
     heartbeat_stale_min: int = 15  # AUREON-004: red card if no closed bar processed for this long while the market is open
     daily_report_ist: str = "23:00"   # AUREON-003

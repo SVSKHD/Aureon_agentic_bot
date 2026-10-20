@@ -164,3 +164,16 @@ def test_logon_task_script():
     assert "Aureon-MT5" in ps and '"Aureon"' in ps and "AtLogOn" in ps and "PT30S" in ps
     assert "RestartInterval (New-TimeSpan -Minutes 1)" in ps and "Autologon" in ps and "standby-timeout-ac 0" in ps
     assert "& $nssm" not in ps and "nssm install" not in ps.lower() and "New-Service" not in ps   # interactive session only
+
+
+def test_ask_ttl_reads_env(monkeypatch):
+    """AUREON_ASK_TTL_MIN was documented but hard-coded to 20; the expiry paths are wall-clock minutes (TF-independent)."""
+    import importlib
+    from aureon_mt5 import config as C
+    monkeypatch.setenv("AUREON_ASK_TTL_MIN", "30")
+    try:
+        assert importlib.reload(C).Config().ask_ttl_min == 30
+    finally:
+        monkeypatch.delenv("AUREON_ASK_TTL_MIN")
+        importlib.reload(C)
+    assert C.Config().ask_ttl_min == 20
