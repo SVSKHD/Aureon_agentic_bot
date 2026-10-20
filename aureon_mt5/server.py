@@ -109,11 +109,11 @@ def last_heartbeat(log_dir: str) -> tuple[str | None, float | None]:
 
 
 def cold_start(cfg, journal, notify, positions_by_symbol: dict, *, run=run_ps, now: float | None = None,
-               last_exit: dict | None = None) -> dict:
+               last_exit: dict | None = None, heartbeat: tuple | None = None) -> dict:
     """Card + journal on a boot with NO restart marker. positions_by_symbol: {sym: [live positions]} (after MT5 connect)."""
     now = _time.time() if now is None else now
     info = boot_info(run)
-    hb_line, hb_t = last_heartbeat(cfg.log_dir)
+    hb_line, hb_t = heartbeat if heartbeat is not None else last_heartbeat(cfg.log_dir)   # v2.15.0: read before the pre-flight
     down_s = int(now - hb_t) if hb_t else None
     sd = info["shutdown"]
     reason = f"{sd['reason']} ({sd['id']})" if sd else "unknown"

@@ -193,8 +193,13 @@ short token, a public bind and a backend with missing credentials.
 The operator is often not at the server. Details and setup: [docs/SERVICE.md](docs/SERVICE.md#v2101--unattended-operation-the-box-belongs-to-aureon).
 - **Cold start**: a boot without a restart marker posts **COLD START** (boot time, last shutdown reason from the System log,
   minutes down, positions re-adopted). Every BACK ONLINE card says `down X s`.
-- **MT5 before the bot**: the launcher starts `terminal64.exe` first; the bot waits for it (5 s → 30 s backoff,
-  `AUREON_MT5_BOOT_WAIT`), posts **MT5 NOT UP** after 5 min, exits 75 if it never comes up; a hung terminal is restarted.
+- **MT5 before the bot**: the launcher starts `terminal64.exe` first, and a hung terminal is restarted.
+  - v2.15.0 restart pre-flight (`aureon_mt5/preflight.py`) waits for initialize() **and** the account login (every 5 s, up to
+    90 s), keeps the heartbeat fresh so the supervisor never kills the wait as a hang, then exits 75 if MT5 is still down.
+  - **MT5 NOT UP** is posted once per outage (after `AUREON_MT5_BOOT_WAIT`, across restarts). Then
+    **BACK ONLINE after restart · MT5 build · account · open positions re-adopted**.
+  - Reboot recovery: `scripts/install_logon_tasks.ps1` installs the logon tasks `Aureon-MT5` and `Aureon`. It needs auto-logon
+    and never-sleep; see [docs/SERVICE.md](docs/SERVICE.md#v2150--reboot-sequence-no-human).
 - **Env check**: `config.validate()` — unparsable numbers, values outside the feature registry's ranges, Discord plumbing,
   contradictions (`EXIT_LOSING` without manage, `SETUP_MAX_DD` < `pre_stop`, regime thresholds out of order). Guardian
   problems fall back to the safe default and post **BOOT CHECK**; `/env-check` shows what the guardian runs on.
