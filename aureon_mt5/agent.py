@@ -1098,6 +1098,8 @@ class SymbolAgent(threading.Thread):
             return self._detect_2050(res, df, bar_t, close, ef, es)
         if self.S.name == "ema9200":
             return self._detect_9200(res, df, bar_t, close, ef, es)
+        if self.S.name == "ema921":
+            return self._detect_921(res, df, bar_t, close, ef, es)
         for ev in res["events"]:
             if ev.index != last or not ev.label.startswith(("EB", "ES")):
                 continue
@@ -1350,6 +1352,126 @@ class SymbolAgent(threading.Thread):
             self.track_ask(ask_key, side, kind, close, bar_t, self._suggested(g.pre_stop).get("lots") if g else None, stop)
             for adv in self.advisors():
                 adv.request_entry(self, "enter", side, bar_t, df, card_key=ask_key, png=png)
+
+
+    # ------------------------------------------------------------------ EMA 9/21 (v2.16.0): the cross is the order
+    def _equity_dd_block(self) -> str | None:
+        """AUREON_MAX_DD_USD: once equity is that far below its running peak, no new auto entries (the funded-account rule, enforced here)."""
+        if not self.cfg.max_dd_usd or self.dry:
+            return None
+        try:
+            a = broker.account(); eq = float(a["equity"])
+        except Exception:
+            return None
+        peak = max(float(self.health.get("equity_peak") or 0.0), eq); self.health["equity_peak"] = peak
+        if peak - eq >= self.cfg.max_dd_usd:
+            return f"drawdown guard: equity {eq:,.0f} is {peak - eq:,.0f} below peak {peak:,.0f} (limit {self.cfg.max_dd_usd:,.0f})"
+        return None
+
+    def _detect_921(self, res, df, bar_t, close, ef, es):
+        last = len(df) - 1; off = self.off; g = self.g; r = res.get("rules"); bk = bar_key(bar_t, off)
+        names = {"asia": "Asia", "london": "London", "ny": "New York", "off": "off-hours"}
+        for ev in res["events"]:
+            if ev.index != last:
+                continue
+            side = "LONG" if ev.direction == "bull" else "SHORT"; s = 1 if side == "LONG" else -1; info = dict(ev.info)
+            if ev.label == "PRE":                                                    # informational only (AUREON_PRE_CARDS=0 to silence)
+                if os.environ.get("AUREON_PRE_CARDS", "1") != "1":
+                    continue
+                self.notify.send(self.key("PRE", bk), ctitle(self.symbol, f"PRE-CROSS · 9/21 converging → likely {side}"),
+                                 ["no entry on a pre-cross · the close that crosses is the order"],
+                                 fields=[field("Gap", f"{info['gap']:+.2f}"), field("Price", f"{close:.2f}"), field("EMA 9 / 21", f"{info['ema9']:.2f} / {info['ema21']:.2f}"),
+                                         field("EMA 200", f"{info['ema200']:.2f} ({info['dist200']:+.1f})"), field("Last 3", " ".join(info["last3"])),
+                                         field("Session", names.get(info["session"], "—"))],
+                                 color=EVENT_COLOURS["info"], footer=cfooter(self.S.display_name, f"pre-cross · {ist(bar_t, off)} · M30"), event="PRE")
+                self.journal.log("pre_cross", symbol=self.symbol, mode=self.S.name, side=side, bar=bar_t, price=close, gap=info["gap"])
+                continue
+            if ev.label == "F":
+                self.journal.log("cross_skipped", symbol=self.symbol, mode=self.S.name, side=side, bar=bar_t, price=close, why=ev.reason)
+                if getattr(self.cfg, "verbose", False):
+                    self.notify.send(self.key("SKIP", bk), ctitle(self.symbol, f"cross {side} skipped"), [ev.reason], color=EVENT_COLOURS["info"],
+                                     footer=cfooter(self.S.display_name, ist(bar_t, off)))
+                continue
+            if ev.label not in ("EB", "ES"):
+                continue
+            sl = close - s * r.stop; tp = (close + s * r.tp) if r.tp else None
+            self.latest_signal = {"bar_time": bar_t, "symbol": self.symbol, "strategy": self.S.name, "kind": "cross", "direction": side, "consumed": False}
+            self.health["last_signal"] = f"{side} 9/21 cross @ {ist(bar_t, off)}"
+            self.journal.log("signal", symbol=self.symbol, mode=self.S.name, side=side, signal_kind="cross", price=close, bar=bar_t,
+                             gap=info["gap"], dist200=info["dist200"], last3=info["last3"], spread_pts=self._spread_pts())
+            lots = (self._suggested(r.stop) or {}).get("lots") or self.cfg.max_lots
+            why = None
+            if broker.positions(self.symbol):
+                why = "already in a position"
+            elif not self.cfg.auto_mode:
+                why = "AUREON_AUTO is off — signal only"
+            else:
+                why = self._equity_dd_block()
+            placed = None
+            if why is None:
+                if self.cfg.paper or self.dry:
+                    placed = broker.BrokerResult(True, "PAPER", changed=False, price=close, ticket=None, volume=lots)
+                    self.journal.log("paper_fill", symbol=self.symbol, mode=self.S.name, side=side, lots=lots, price=close, sl=sl, tp=tp, bar=bar_t)
+                    self._paper = getattr(self, "_paper", []) + [{"side": side, "entry": close, "lots": lots, "sl": sl, "tp": tp, "bar": bar_t, "peak": 0.0}]
+                elif self.cfg.execution_enabled and (broker.is_demo() or self.cfg.allow_live):
+                    placed = broker.place_market(self.symbol, side, lots, sl, comment="aureon 921", tp=tp)
+                    self.journal.decision("order_placed", actor="agent", rationale="ema921 cross", symbol=self.symbol, mode=self.S.name, side=side,
+                                          lots=lots, sl=sl, tp=tp, ok=bool(placed.ok), status=placed.status, retcode=placed.retcode, ticket=placed.ticket, fill=placed.price)
+                    if placed.ok:
+                        self.closed_by_aureon.discard(placed.ticket)
+                else:
+                    why = "execution off (AUREON_EXECUTION=1 and demo / AUREON_ALLOW_LIVE=1 needed)"
+            colour = EVENT_COLOURS["signal_long" if side == "LONG" else "signal_short"]
+            fields = [field("Side", f"**{side}**"), field("Entry", f"**{close:.2f}** (bar close)"), field("Lot", f"{lots:g}" + (" · PAPER" if (self.cfg.paper or self.dry) else "")),
+                      field("EMA 9 / 21", f"{info['ema9']:.2f} / {info['ema21']:.2f}"), field("EMA 200", f"{info['ema200']:.2f} ({info['dist200']:+.1f})"),
+                      field("Session", names.get(info["session"], "—")), field("Last 3", " ".join(info["last3"])),
+                      field("Stop / TP", f"{sl:.2f} (−{r.stop:g}) / " + (f"{tp:.2f} (+{r.tp:g})" if tp else "none"), inline=False),
+                      field("Lock", f"+{r.lock_at:g} seen → SL {close + s * r.lock_to:.2f} (+{r.lock_to:g})"),
+                      field("Exit", "first M30 close through EMA 9" + (f" · EMA 200 after +{r.lock_at:g}" if r.exit_mode == "e9>e200" else "")),
+                      field("Backtest", "Jan–Oct 2026: 42% win · avg +1.6/trade · 35% reach +20", inline=False)]
+            if why:
+                fields.append(field("Not placed", why, inline=False))
+            elif placed is not None:
+                fields.append(field("Order", f"{placed.status}" + (f" · ticket #{placed.ticket}" if placed.ticket else "") + (f" · fill {placed.price:.2f}" if placed.price else ""), inline=False))
+            png = context_chart(df, self.symbol, self.S.display_name, self.S.fast, self.S.slow, self.S.ema_cols, off, self.chart_dir,
+                                marker={"index": last, "side": side, "label": "CROSS", "stop": sl, "secure": close + s * r.lock_at})
+            title = f"ENTER {side} · 9/21 cross" if why is None else f"SIGNAL {side} · 9/21 cross"
+            self.notify.send(self.key(f"ENTER_{side}", bk), ctitle(self.symbol, title, side), [], png=png, fields=fields + self._context_fields(df),
+                             color=colour, footer=cfooter(self.S.display_name, f"bar {ist(bar_t, off)} · M30"), event="ENTER")
+            for adv in self.advisors():
+                adv.request_entry(self, "enter", side, bar_t, df, card_key=self.key(f"ENTER_{side}", bk), png=png)
+
+    def _guard_921(self, p, st, s, new_bar, bar_t, df, close):
+        """Lock at +lock_at → broker SL to entry + lock_to · exit on the first bar CLOSING through the exit line (EMA 9, or EMA 200
+        after the lock in e9>e200 mode) · Friday flat. The broker SL/TP placed at entry handle everything else."""
+        r = self.S.rules_for(self.symbol); e = p["price_open"]; pts = p["points"]; st["peak"] = max(st.get("peak", 0.0), pts)
+        st["last_points"] = pts; st.setdefault("entry", e); st.setdefault("direction", p["direction"])
+        lock_px = e + s * r.lock_to
+        if st["peak"] >= r.lock_at and not st.get("locked"):
+            rr = broker.set_sl(p["ticket"], self.symbol, lock_px) if not self.dry else broker.BrokerResult(True, "DRY", changed=True)
+            if rr.ok:
+                st["locked"] = True; st["secured"] = r.lock_to
+                self.journal.log("locked", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], sl=lock_px, peak=st["peak"])
+                self.notify.send(self.key("LOCK", p["ticket"]), ctitle(self.symbol, f"🔒 +{r.lock_at:g} seen → floor +{r.lock_to:g}", p["direction"]),
+                                 [f"SL moved to {lock_px:.2f} · peak +{st['peak']:.1f}"], color=EVENT_COLOURS["info"],
+                                 footer=cfooter(self.S.display_name, f"#{p['ticket']}"), event="LOCK")
+        if not new_bar:
+            return
+        from .strategies.ema921.journeys import exit_line, server_weekday
+        line = exit_line(r, st["peak"]); lv = float(df[line].iloc[-1]); c = float(df["close"].iloc[-1])
+        against = (c < lv) if s > 0 else (c > lv)
+        st["against_run"] = st.get("against_run", 0) + 1 if against else 0
+        friday_last = r.friday_flat and server_weekday(int(bar_t)) == 4 and (bar_t % 86400) / 3600 >= 22.0
+        if st["against_run"] >= r.n_close or friday_last:
+            why = f"close through {line.upper()}" if not friday_last else "Friday flat"
+            rr = broker.close(p["ticket"], self.symbol, "aureon 921") if not self.dry else broker.BrokerResult(True, "DRY", changed=True)
+            if rr.ok:
+                self.closed_by_aureon.add(p["ticket"])
+                self.journal.log("closed_by_rule", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], reason=why, points=pts, peak=st["peak"])
+                self.notify.send(self.key("CLOSED", f"{p['ticket']}-rule"), ctitle(self.symbol, f"CLOSED {p['direction'].upper()} {pts:+.1f} · {why}", p["direction"]),
+                                 [f"entry {e:.2f} → {c:.2f} · peak +{st['peak']:.1f} · worst −{max(0.0, -min(st.get('mae', 0.0), 0.0)):.1f}"],
+                                 color=EVENT_COLOURS["closed_win" if pts > 0 else "closed_loss"], footer=cfooter(self.S.display_name, why),
+                                 event="CLOSED" if pts > 0 else "STOP", points=pts)
 
     # ------------------------------------------------------------------ guardian helpers
     def _locked(self, p: dict) -> float:
@@ -2207,6 +2329,10 @@ class SymbolAgent(threading.Thread):
                     adv.request_open_read(self, p, st, bar_t, df, card_key=open_read_key)
             if "guardian_profile" not in st and self._new_ticket_profile() == "follow":
                 st["guardian_profile"] = "follow"                              # v2.13.0: sticky per ticket, like classic / leg
+            if self.S.name == "ema921":                                        # v2.16.0: mechanical guardian, nothing else runs
+                st["guardian_profile"] = "ema921"
+                self._guard_921(p, st, s, new_bar, bar_t, df, close)
+                continue
             if st.get("guardian_profile") == "follow":
                 if not self._setup_wanted():
                     self._update_setup(p, st, s, new_bar, df, close, ef, es)   # setup_alive for max_hold / the snapshot

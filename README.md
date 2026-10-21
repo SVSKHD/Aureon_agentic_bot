@@ -1,4 +1,4 @@
-# Aureon MT5 v2.15.0
+# Aureon MT5 v2.16.0
 
 You place the trade. Aureon detects (per selected EMA mode), fires a Discord gunshot, then manages what you placed:
 protect → secure +10 → ride in +5 steps → close on the fast-EMA turn → news safeguard. Reports and slash commands.
@@ -8,6 +8,7 @@ protect → secure +10 → ride in +5 steps → close on the fast-EMA turn → n
 |---|---|---|
 | `ema5080` (default) | ACTIVE | EMA 50/80 detector + Gold guardian profile (unchanged in v2.0.0) |
 | `ema2050` | ACTIVE (v2.0.0) | EMA 20/50: confirmed cross (3 bars + 1.5 gap) + pullback entry, own Gold guardian profile (−12 / +3→+1 / +10 / ride +5) |
+| `ema921` | ACTIVE (v2.16.0) | EMA 9/21 on **M30**, **mechanical**: every cross taken at the bar close · broker SL −30 · +20 → SL +15 · exit on the first close through EMA 9 (or EMA 200 after +20) · Friday flat · drawdown guard |
 | `ema9200` | ACTIVE (v2.15.0) | EMA 9/200 on **M30**: candidates only (pullback to EMA9 with the bias / momentum bar) → TAKE / SKIP, own Gold guardian profile (−30 / +40→+30 / ride +10 / EMA9 turn / Friday flat) |
 
 Nothing is ported between them. Resolution: `--mode` → `AUREON_MODE` → `ema5080`. Aliases `5080`, `2050`, `9200`.
@@ -24,6 +25,36 @@ protected (SL never loosened) but receive no strategy rules; a `⚠️ MODE MISM
 Production: run it under the supervisor (auto-restart, hang kill, boot start) — **[docs/SERVICE.md](docs/SERVICE.md)**:
 
     powershell -ExecutionPolicy Bypass -File .\scripts\aureon_service.ps1 -Action install
+
+## v2.16.0 — `ema921`: the cross is the order
+
+Researched Jan–Oct 2026 on XAUUSD M30 (43 weeks; Jan–Apr held out, never used for tuning). Fully mechanical — no asks.
+
+    AUREON_MODE=ema921
+    AUREON_EXEC_TF=M30
+    AUREON_EXECUTION=1 AUREON_AUTO=1      # both needed before an order is placed; demo, or AUREON_ALLOW_LIVE=1
+    AUREON_PAPER=1                        # first week: real feed, real cards, fills journaled only
+    AUREON_MAX_DD_USD=7000                # no new entries once equity is this far below its peak (your funded-account rule)
+    AUREON_PRE_CARDS=1                    # 0 silences the pre-cross cards
+
+| piece | rule |
+|---|---|
+| entry | every EMA 9/21 cross, market order at the bar close |
+| broker SL | entry −30 (safety net; the exit rule is the real stop) · no TP (every cap tested cost money) |
+| lock | once +20 has printed (checked at the bar close) → broker SL to entry +15 |
+| exit | first M30 bar closing through EMA 9 against the trade (`exit_mode=e9`) · or EMA 9 until +20, then EMA 200 (`e9>e200`) |
+| days / hours | Mon–Fri · no entries Friday from 16:00 server · news 60/30 · flat at Friday's last bar |
+| pre-cross | EMA 9 within 0.35 ATR of EMA 21 and converging 2 bars → informational card, no action |
+| cards | PRE · ENTER (with SL/TP/lock/exit lines and the backtest reference) · 🔒 LOCK · CLOSED (reason + points) |
+
+Backtest, 1 lot, lock armed at the bar close, $0.20 spread: May–Oct **+$53k** (16 / 10 weeks, worst −$8.2k, max DD −$17.5k);
+Jan–Oct (your server run, `backtest.py`) **+$54k**, Jan–Apr unseen +$1.4k, **max DD −$28k**. Size the lot from the drawdown:
+`lot ≈ (allowed max DD ÷ 3) ÷ $28,000` → 0.24 per $100k on a 10 % rule.
+
+    python tools/replay_921.py --csv xauusd_m30_20260101_20261021.csv --from 2026-01-01
+    python tools/replay_921.py --csv ... --set exit_mode=e9>e200 --set stop=30
+
+Journal rows: `pre_cross`, `signal`, `cross_skipped` (why), `order_placed` / `paper_fill`, `locked`, `closed_by_rule`.
 
 ## v2.15.0 — `ema9200`: you decide, Aureon executes
 
