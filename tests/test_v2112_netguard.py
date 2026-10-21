@@ -67,6 +67,9 @@ def test_network_loss_never_ends_the_process(tmp_path, monkeypatch, no_dns, exit
     the guardian ran and moved the stop, nothing called exit / os._exit / loop.stop, no thread died."""
     from aureon_mt5 import netguard
     monkeypatch.setattr(netguard, "GATEWAY_BACKOFF", (0.05, 0.2))
+    from aureon_mt5 import selfheal as _sh                                     # v2.16.2: the unsupervised schedule too
+    monkeypatch.setattr(_sh, "REBUILD_BACKOFF_S", (0.05, 0.1, 0.2))
+    monkeypatch.delenv("AUREON_SUPERVISED", raising=False)
     # MT5 keeps ticking
     fake = FakeMT5("long", 4200.0, 0.0, 4202.0)
     monkeypatch.setattr(broker, "_m", fake); monkeypatch.setattr(broker, "_offset_h", 3.0)

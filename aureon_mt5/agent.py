@@ -1533,8 +1533,11 @@ class SymbolAgent(threading.Thread):
                              gap=info["gap"], dist200=info["dist200"], last3=info["last3"], spread_pts=self._spread_pts())
             lots = (self._suggested(r.stop) or {}).get("lots") or self.cfg.max_lots
             why = None
-            if broker.positions(self.symbol) or ((self.cfg.paper or self.dry) and self._paper_open()):
-                why = "already in a position" + (" (paper)" if not broker.positions(self.symbol) else "")
+            from . import position_cap                                      # v2.16.2: max one open position per symbol
+            capped = position_cap.block(self.symbol, side, journal=self.journal, source="ema921 auto",
+                                        paper_positions=(self._paper_open() if (self.cfg.paper or self.dry) else ()))
+            if capped:
+                why = "already in a position — " + capped
             elif not self.cfg.auto_mode:
                 why = "AUREON_AUTO is off — signal only"
             elif self._feed_or_network_down():
@@ -1647,6 +1650,8 @@ class SymbolAgent(threading.Thread):
             self.health["last_broker_action"] = f"{action} DRY {datetime.now(IST):%H:%M:%S}"; return True
         r = broker.set_sl(p["ticket"], self.symbol, sl)
         self.health["last_broker_action"] = f"{action} {r.status} {datetime.now(IST):%H:%M:%S}"
+        if r.status == "COOLDOWN":                       # v2.16.2: 10016 cooldown — the broker posted the one red card
+            return False
         if r.status in ("SL_CHANGED", "ALREADY_BETTER"):
             if r.status == "SL_CHANGED":
                 self.note_action(self.state.get(p["ticket"]), "sl_move", f"{action} → {sl:.2f}" if sl is not None else action)

@@ -33,7 +33,17 @@ DEADMAN_EVERY_S = 60.0
 HEARTBEAT_EVERY_S = 30.0
 STALL_DUMP_LAG_S = 3.0
 RESTART_LAG_S = 30.0
-RESTART_GATEWAY_S = 300.0         # v2.11.2: no longer an exit condition (kept for the heartbeat text)
+RESTART_GATEWAY_S = 300.0         # v2.16.2: gateway down this long → in-process rebuild (no supervisor) or exit 75 (supervised)
+REBUILD_BACKOFF_S = (5.0, 30.0, 120.0)   # v2.16.2: between in-process rebuilds while the gateway stays down (capped at the last)
+
+
+def supervised(environ=None) -> bool:
+    """AUREON_SUPERVISED=1 is set by the launcher loop (scripts/aureon_service.ps1) / the logon task."""
+    return str((os.environ if environ is None else environ).get("AUREON_SUPERVISED", "")).strip() == "1"
+
+
+def self_restart_mode(environ=None) -> str:
+    return "exit75" if supervised(environ) else "in-process"
 SNAPSHOT_STALE_S = 300.0          # an agent that has not refreshed its snapshot for 5 min is frozen (stuck MT5 call)
 
 
@@ -74,7 +84,7 @@ def read_heartbeat(log_dir: str) -> str | None:
 class HealthGuard:
     def __init__(self, *, monitor, agents: dict, log_dir: str, journal=None, notify=None, deadman_url: str | None = None,
                  stale_bar_s: float = 900.0, ping=http_ping, exit_hook=None, clock=_time.monotonic, wall=_time.time,
-                 period: float = 2.0, bot_expected: bool = True):
+                 period: float = 2.0, bot_expected: bool = True, is_supervised: bool | None = None, rebuild_hook=None):
         self.monitor, self.agents, self.log_dir = monitor, agents, log_dir
         self.journal, self.notify, self.deadman_url = journal, notify, deadman_url
         self.stale_bar_s, self.ping, self.exit_hook = stale_bar_s, ping, exit_hook
@@ -91,6 +101,12 @@ class HealthGuard:
         self.last_failures: list[str] = []
         self._thread: threading.Thread | None = None
         self.detector = None                        # v2.10.0: repair.Detector, ticked here (no extra thread)
+        # v2.16.2: no supervisor → never exit on a lost gateway; tear the Discord client down and start it again in-process
+        self.supervised = supervised() if is_supervised is None else bool(is_supervised)
+        self.rebuild_hook = rebuild_hook if rebuild_hook is not None else getattr(monitor, "rebuild", None)
+        self.rebuilds = 0                           # in-process rebuilds in the current outage
+        self.next_rebuild_at: float | None = None
+        self.outage_t0: float | None = None
 
     # -------------------------------------------------------------- health conditions
     def _gateway_up(self) -> bool:
@@ -195,8 +211,8 @@ class HealthGuard:
         why = None
         if self.monitor.last_beat is not None and lag > RESTART_LAG_S:
             why = f"event loop lag {lag:.0f} s (> {RESTART_LAG_S:.0f} s)"
-        # v2.11.2: a disconnected gateway is NEVER a reason to exit (2026-10-15: DNS loss → exit 75 with no service to
-        # restart us). It is network state (netguard.degraded); the Discord supervisor reconnects forever.
+        if why is None:
+            why = self._gateway(now)                # v2.16.2: in-process rebuild (returns None) or, supervised, exit 75
         if why is None:
             return False
         self.restarting = True
@@ -220,6 +236,56 @@ class HealthGuard:
         if self.exit_hook is not None:
             self.exit_hook(EXIT_RESTART)
         return True
+
+    # -------------------------------------------------------------- v2.16.2 gateway loss
+    def _gateway(self, now: float) -> str | None:
+        """Gateway down > RESTART_GATEWAY_S. Supervised (AUREON_SUPERVISED=1): returns the exit-75 reason. Not supervised:
+        never exits — calls rebuild_hook() (close the Discord client; the bot thread's supervisor starts a fresh one)
+        at 300 s, then every 5 s → 30 s → 2 min while it stays down, and posts BACK ONLINE when it returns. The MT5
+        loop and the agents are never touched."""
+        m = self.monitor
+        down = m.gateway_down_for(now) if hasattr(m, "gateway_down_for") else 0.0
+        if not down:
+            if self.outage_t0 is not None:
+                took = now - self.outage_t0; n = self.rebuilds
+                self.outage_t0 = None; self.rebuilds = 0; self.next_rebuild_at = None
+                telemetry.info(f"gateway back after {took:.0f} s ({n} in-process rebuild(s))")
+                if self.journal is not None:
+                    try:
+                        self.journal.log("gateway_rebuilt", seconds=round(took), rebuilds=n, mode="in-process")
+                    except Exception:
+                        pass
+                if self.notify is not None:
+                    try:
+                        self.notify.card("AUREON · MT5 · BACK ONLINE", f"Discord gateway back after {took / 60:.1f} min · "
+                                         f"{n} in-process rebuild(s) · the MT5 loop kept running (no supervisor: self_restart_mode=in-process)",
+                                         footer="Aureon MT5 · self-heal")
+                    except Exception:
+                        pass
+            return None
+        if down <= RESTART_GATEWAY_S:
+            return None
+        if self.supervised:
+            return f"Discord gateway down {down:.0f} s (> {RESTART_GATEWAY_S:.0f} s) — supervised, restarting"
+        if self.outage_t0 is None:
+            self.outage_t0 = now - down
+        if self.next_rebuild_at is not None and now < self.next_rebuild_at:
+            return None
+        self.rebuilds += 1
+        delay = REBUILD_BACKOFF_S[min(self.rebuilds - 1, len(REBUILD_BACKOFF_S) - 1)]
+        self.next_rebuild_at = now + delay
+        telemetry.info(f"gateway down {down:.0f} s — in-process Discord rebuild #{self.rebuilds} (next in {delay:.0f} s)")
+        if self.journal is not None:
+            try:
+                self.journal.log("gateway_rebuild", attempt=self.rebuilds, down_s=round(down), next_s=delay)
+            except Exception:
+                pass
+        if self.rebuild_hook is not None:
+            try:
+                self.rebuild_hook()
+            except Exception as e:
+                telemetry.info(f"gateway rebuild failed: {e!r}")
+        return None
 
     # -------------------------------------------------------------- thread
     def start(self):

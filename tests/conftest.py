@@ -42,3 +42,12 @@ def _exec_tf_reset():
     tf_synth.set_exec_tf("M5")
     yield
     tf_synth.set_exec_tf("M5")
+
+
+@_pytest.fixture(autouse=True)
+def _broker_reset():
+    """v2.16.2: the 10016 cooldown, the stops sink and the filling type are process-wide — every test starts clean."""
+    from aureon_mt5 import broker
+    broker._SL_COOLDOWN.clear(); broker.SINK.update(log=None, alert=None); broker.configure_filling("ioc")
+    yield
+    broker._SL_COOLDOWN.clear(); broker.SINK.update(log=None, alert=None); broker.configure_filling("ioc")

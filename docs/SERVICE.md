@@ -174,3 +174,14 @@ to `logs/aureon.log` as `preflight: …`):
 
 Check it: `Restart-Computer`, then within about 2 min Discord shows BACK ONLINE after restart, `logs/aureon.log` has the
 `preflight:` lines, and `.\scripts\aureon_service.ps1 -Action status` shows a fresh heartbeat.
+
+## v2.16.2 — without a supervisor
+
+`AUREON_SUPERVISED=1` is set by `aureon_service.ps1 -Action run`, which the `Aureon` logon task runs.
+- **Without it** (a console run, a task that calls `python main.py` directly): a Discord gateway down for more than 300 s
+  never ends the process. The Discord client is torn down and started again in-process (5 s → 30 s → 2 min, capped), the
+  MT5 loop and the guardian keep running, and **BACK ONLINE** is posted when the gateway returns.
+- **With it:** the process exits 75 and the launcher restarts it.
+
+The boot card shows `self_restart_mode=in-process|exit75`. A frozen event loop (lag > 30 s) still exits 75 in both modes: it
+can't be repaired from inside the frozen thread.

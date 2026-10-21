@@ -805,6 +805,12 @@ def execute_entry(cfg, agents, journal, item: dict, side: str, user, notify=None
     lots_chosen = min(float(lots), cfg.max_lots) if lots is not None else min(float(lots_suggested or cfg.max_lots), cfg.max_lots)
     sugg_txt = f" (suggested {lots_suggested:g}★)" if lots_suggested is not None else ""
     half_size = bool(m.get("half_size") or m.get("chop"))
+    # v2.16.2: one open position per symbol, every mode, before anything else
+    from . import position_cap
+    capped_why = position_cap.block(sym, side, journal=journal, source=f"execute_entry:{lots_source}:{aid}", by=str(user))
+    if capped_why:
+        return {"line": f"⛔ BLOCKED · position cap · {capped_why}", "text": f"⛔ {capped_why}",
+                "ok": False, "ticket": None, "placed": False, "lots": lots_chosen}
     # v2.3.12: governor check BEFORE any order
     gov = Governor(cfg)
     ctx = _governor_context(cfg, agents, sym)
@@ -2315,10 +2321,20 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             monitor.gateway_down(f"client exited: {why}")
             netguard.update()
 
+        from .selfheal import REBUILD_BACKOFF_S, supervised as _supervised
+        sched = None if _supervised() else REBUILD_BACKOFF_S            # v2.16.2: no supervisor → 5 s → 30 s → 2 min
+
+        def rebuild():
+            """v2.16.2 (HealthGuard, gateway down > 300 s, no supervisor): close the client from outside its loop; the
+            supervisor below sees start() return and starts a fresh session (new HTTP connector, new gateway)."""
+            if not client.is_closed():
+                asyncio.run_coroutine_threadsafe(client.close(), loop)
+        monitor.rebuild = rebuild
+
         while not _ops.STOP.is_set():
             try:
                 loop.run_until_complete(netguard.supervise_client(start, stop_requested=_ops.STOP.is_set, close=close,
-                                                                  on_exit=on_exit))
+                                                                  on_exit=on_exit, schedule=sched))
             except BaseException as e:                         # never let the bot thread die
                 netguard.rlog("bot-thread", f"discord supervisor error: {e!r} — restarting it")
                 _time.sleep(2)
