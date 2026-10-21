@@ -443,6 +443,12 @@ def place_market(symbol: str, side: str, lots: float, sl: float | None = None, c
                 req["sl"] = c_sl
             if c_tp is not None:                                 # v2.16.0: broker-side take-profit (ema921 cap)
                 req["tp"] = c_tp
+            held = m.positions_get(symbol=symbol) or []      # v2.16.2: the position cap, under the lock (no racing taps)
+            if held:
+                _emit("entry_blocked_position_cap", symbol=symbol, side="LONG" if is_buy else "SHORT", source=f"broker:{comment}",
+                      open=[getattr(x, "ticket", None) for x in held])
+                return BrokerResult(False, "POSITION_CAP", comment=f"{symbol} already has {len(held)} open position(s)",
+                                    bid=t.bid, ask=t.ask)
             r, used = _send_filled(m, req)                 # v2.16.1: AUREON_FILLING first, the others only on INVALID_FILL
         if r is not None and r.retcode == m.TRADE_RETCODE_DONE:
             break

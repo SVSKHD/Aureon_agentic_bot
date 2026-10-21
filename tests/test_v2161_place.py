@@ -220,6 +220,7 @@ class FillMT5(FakeMT5):
 
     def __init__(self, accept, **k):
         super().__init__(**k); self.accept = accept; self.tried = []
+        self.closed = True                                   # flat: v2.16.2's position cap would refuse the order otherwise
 
     def symbol_select(self, *a):
         return True

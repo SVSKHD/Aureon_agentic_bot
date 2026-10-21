@@ -805,6 +805,12 @@ def execute_entry(cfg, agents, journal, item: dict, side: str, user, notify=None
     lots_chosen = min(float(lots), cfg.max_lots) if lots is not None else min(float(lots_suggested or cfg.max_lots), cfg.max_lots)
     sugg_txt = f" (suggested {lots_suggested:g}★)" if lots_suggested is not None else ""
     half_size = bool(m.get("half_size") or m.get("chop"))
+    # v2.16.2: one open position per symbol, every mode, before anything else
+    from . import position_cap
+    capped_why = position_cap.block(sym, side, journal=journal, source=f"execute_entry:{lots_source}:{aid}", by=str(user))
+    if capped_why:
+        return {"line": f"⛔ BLOCKED · position cap · {capped_why}", "text": f"⛔ {capped_why}",
+                "ok": False, "ticket": None, "placed": False, "lots": lots_chosen}
     # v2.3.12: governor check BEFORE any order
     gov = Governor(cfg)
     ctx = _governor_context(cfg, agents, sym)

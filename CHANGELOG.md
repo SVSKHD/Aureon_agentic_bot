@@ -16,6 +16,14 @@ Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are a
   - The clamped SL still never loosens a live one.
   - A 10016 after clamping pauses `set_sl` on that ticket for 5 min (status `COOLDOWN`, no request sent; the guardian stays
     quiet) and posts one red **GUARDIAN FAILURE** card with bid / ask / stops_level / freeze_level / side.
+- **Position cap: one open position per symbol, every mode** (`aureon_mt5/position_cap.py`).
+  - Checked before any placement: auto (ema921), TAKE / alert buttons / console / phone / `/override` (`execute_entry`),
+    `/place`. Each block journals `entry_blocked_position_cap`.
+  - `broker.place_market` re-checks under its lock (status `POSITION_CAP`), so racing taps can't both fill. Paper positions
+    count in paper mode.
+  - 15 Oct 15:23 (five tickets in seconds): `/take` or a phone TAKE without an ask key takes the newest *undecided* ask
+    (`Actions.latest_open`), so each tap opened a position on the next-older open ask. `tools/order_burst.py` classifies a
+    journal window (walk-back / same-card / console-push / rejected-but-filled).
 
 ## v2.16.1 — 2026-10-21  (PATCH: manual commands, filling type; strategy rules unchanged)
 - **`AUREON_FILLING=ioc|fok|return`**: `broker.place_market` / `close` use the configured type first, and fall back (ioc → fok →

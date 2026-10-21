@@ -119,7 +119,12 @@ def place(cfg, agents: dict, journal, agent, side: str, *, lots=None, sl_raw=Non
         return _refused(str(e))
     stop_dist = abs(entry - sl) if sl else None
     want = float(lots) if lots else float(((agent._suggested(stop_dist) or {}).get("lots") if stop_dist else None) or cfg.max_lots)
-    lots_ = min(want, float(cfg.max_lots)); capped = want > cfg.max_lots
+    lots_ = min(want, float(cfg.max_lots)); over_cap = want > cfg.max_lots
+    from . import position_cap                                           # v2.16.2: max one open position per symbol
+    capped = position_cap.block(sym, side, journal=journal, source="/place", by=str(user),
+                                paper_positions=(agent._paper_open() if paper and S.name == "ema921" else ()))
+    if capped:
+        return _refused(capped)
     if governor_ctx is None:
         from .bot import _governor_context
         governor_ctx = _governor_context(cfg, agents, sym)
@@ -140,7 +145,7 @@ def place(cfg, agents: dict, journal, agent, side: str, *, lots=None, sl_raw=Non
         pos["id"] = f"P{bar}m"; st["paper"] = list(st.get("paper") or []) + [pos]; agent._save921()
         journal.decision("paper_fill", actor="human", rationale="/place", symbol=sym, mode=S.name, side=side, lots=lots_, price=entry,
                          sl=sl, tp=tp, bar=bar, by=str(user))
-        return _placed(agent, side, lots_, entry, sl, tp, ticket=pos["id"], status="PAPER", paper=True, capped=capped, cfg=cfg)
+        return _placed(agent, side, lots_, entry, sl, tp, ticket=pos["id"], status="PAPER", paper=True, capped=over_cap, cfg=cfg)
     if not cfg.execution_enabled:
         return _refused("execution off (AUREON_EXECUTION=0)")
     demo = broker.is_demo()
@@ -154,7 +159,7 @@ def place(cfg, agents: dict, journal, agent, side: str, *, lots=None, sl_raw=Non
     if hasattr(agent, "closed_by_aureon") and r.ticket:
         agent.closed_by_aureon.discard(r.ticket)
     return _placed(agent, side, lots_, r.price or entry, sl, tp, ticket=r.ticket, status=f"{r.status} · {r.fill_mode}", paper=False,
-                   capped=capped, cfg=cfg)
+                   capped=over_cap, cfg=cfg)
 
 
 def _refused(why: str) -> dict:
