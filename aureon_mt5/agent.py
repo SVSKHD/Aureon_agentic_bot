@@ -1647,6 +1647,8 @@ class SymbolAgent(threading.Thread):
             self.health["last_broker_action"] = f"{action} DRY {datetime.now(IST):%H:%M:%S}"; return True
         r = broker.set_sl(p["ticket"], self.symbol, sl)
         self.health["last_broker_action"] = f"{action} {r.status} {datetime.now(IST):%H:%M:%S}"
+        if r.status == "COOLDOWN":                       # v2.16.2: 10016 cooldown — the broker posted the one red card
+            return False
         if r.status in ("SL_CHANGED", "ALREADY_BETTER"):
             if r.status == "SL_CHANGED":
                 self.note_action(self.state.get(p["ticket"]), "sl_move", f"{action} → {sl:.2f}" if sl is not None else action)

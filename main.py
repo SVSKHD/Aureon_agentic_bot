@@ -327,6 +327,8 @@ def main():
     from aureon_mt5.common import tf_synth                             # v2.14.0: the execution timeframe, process-wide
     tf_synth.set_exec_tf(cfg.exec_tf, cfg)                             # after the overrides: /decide-timeframe writes exec_tf there
     broker.configure_filling(cfg.filling)                             # v2.16.1: AUREON_FILLING
+    broker.SINK["log"] = journal.log                                  # v2.16.2: sl_clamped / guardian_failure rows
+    broker.SINK["alert"] = lambda title, body: health_notify.card(title, body, color=0xE74C3C, footer="Aureon MT5 · broker")
     journal.log("process_start", version=VERSION, mode=cfg.mode, exec_tf=tf_synth.exec_tf(), htf_align=cfg.htf_align,
                 symbols=list(cfg.symbols), self_restart_mode=_selfheal_mode())
     health_notify = Notifier(cfg.health_webhook) if cfg.health_webhook else notify

@@ -175,25 +175,103 @@ def digits(symbol: str) -> int:
 
 
 # ----------------------------------------------------------------------------- orders
+# ----------------------------------------------------------------------------- v2.16.2 stops validation
+SINK = {"log": None, "alert": None}   # main wires journal.log and a red health card; broker itself never needs Discord
+INVALID_STOPS = 10016                 # TRADE_RETCODE_INVALID_STOPS
+STOPS_COOLDOWN_S = 300.0
+_SL_COOLDOWN: dict = {}               # ticket → monotonic time until which set_sl is not retried after a 10016
+
+
+def _emit(kind: str, **kw):
+    fn = SINK.get("log")
+    if fn is not None:
+        try:
+            fn(kind, **kw)
+        except Exception:
+            pass
+
+
+def _alert(title: str, body: str):
+    fn = SINK.get("alert")
+    if fn is not None:
+        try:
+            fn(title, body)
+        except Exception:
+            pass
+
+
+def stops_info(m, symbol: str) -> dict:
+    """{dist, stops_level, freeze_level, point}: dist = max(stops_level, freeze_level) × point. MT5's rule is inclusive
+    (a buy: Bid − SL ≥ StopsLevel × point), so with both levels 0 an SL at the bid is legal and nothing is clamped."""
+    info = m.symbol_info(symbol)
+    d = int(getattr(info, "digits", 2) or 2)
+    point = float(getattr(info, "point", 0.0) or 10 ** -d)
+    lv = int(getattr(info, "trade_stops_level", 0) or 0); fz = int(getattr(info, "freeze_level", 0) or 0)
+    return {"dist": max(lv, fz) * point, "stops_level": lv, "freeze_level": fz, "point": point, "digits": d}
+
+
+def clamp_stops(is_long: bool, bid: float, ask: float, sl: float | None, tp: float | None, dist: float, d: int = 2):
+    """The nearest allowed SL / TP on the correct side. A long is priced at the bid: SL ≤ bid − dist, TP ≥ bid + dist.
+    A short at the ask: SL ≥ ask + dist, TP ≤ ask − dist. None / 0 stays as it is (= none)."""
+    def r(x):
+        return round(float(x), d)
+    if is_long:
+        sl2 = r(min(sl, bid - dist)) if sl else sl
+        tp2 = r(max(tp, bid + dist)) if tp else tp
+    else:
+        sl2 = r(max(sl, ask + dist)) if sl else sl
+        tp2 = r(min(tp, ask - dist)) if tp else tp
+    return sl2, tp2
+
+
+def _invalid_stops(m, symbol, ticket, side, requested, sent, tick, si, *, cooldown: bool):
+    if cooldown and ticket is not None:
+        _SL_COOLDOWN[ticket] = _time.monotonic() + STOPS_COOLDOWN_S
+    bid, ask = (tick.bid, tick.ask) if tick else (None, None)
+    _emit("guardian_failure", symbol=symbol, ticket=ticket, side=side, retcode=INVALID_STOPS, requested=requested, sent=sent, bid=bid,
+          ask=ask, stops_level=si["stops_level"], freeze_level=si["freeze_level"], cooldown_s=STOPS_COOLDOWN_S if cooldown else 0)
+    _alert("🔴 AUREON · MT5 · GUARDIAN FAILURE · INVALID STOPS",
+           f"{symbol} {'#' + str(ticket) if ticket else 'new order'} · {side} · retcode 10016 after clamping\n"
+           f"requested {requested} · sent {sent} · bid {bid} · ask {ask} · stops_level {si['stops_level']} · freeze_level "
+           f"{si['freeze_level']} pts" + (f"\nSL changes on this ticket paused {STOPS_COOLDOWN_S / 60:.0f} min — the broker SL "
+                                          "already on the position stays" if cooldown else ""))
+
+
 def set_sl(ticket: int, symbol: str, sl: float, *, allow_loosen: bool = False) -> BrokerResult:
-    """Modify SL. Never loosens: if the live SL is already at least as good, returns ok=True/ALREADY_BETTER without touching it."""
+    """Modify SL. Never loosens: if the live SL is already at least as good, returns ok=True/ALREADY_BETTER without touching it.
+    v2.16.2: the SL (and the TP sent with it) is clamped to the broker's stops / freeze level on the correct side
+    (sl_clamped row); a 10016 after clamping pauses this ticket for 5 min (status COOLDOWN) with one red card."""
     m = mt5()
     if not m:
         return BrokerResult(False, "NO_CONNECTION", comment="no MT5")
+    until = _SL_COOLDOWN.get(ticket)
+    if until is not None:
+        if _time.monotonic() < until:
+            return BrokerResult(False, "COOLDOWN", comment="10016 invalid stops — retries paused", requested_sl=sl)
+        _SL_COOLDOWN.pop(ticket, None)
     with _lock:
         pos = m.positions_get(ticket=ticket)
         if not pos:
             return BrokerResult(False, "POSITION_NOT_FOUND", comment="position not found")
         p = pos[0]; tick = m.symbol_info_tick(symbol)
-        sl = round(sl, digits(symbol))
-        is_long = p.type == m.POSITION_TYPE_BUY
+        is_long = p.type == m.POSITION_TYPE_BUY; side = "LONG" if is_long else "SHORT"
+        si = stops_info(m, symbol)
+        requested = round(sl, si["digits"])
+        sl, tp = (clamp_stops(is_long, tick.bid, tick.ask, requested, p.tp or None, si["dist"], si["digits"]) if tick
+                  else (requested, p.tp or None))
+        if sl != requested or (tp or 0.0) != (p.tp or 0.0):
+            _emit("sl_clamped", symbol=symbol, ticket=ticket, side=side, requested=requested, sent=sl, tp_requested=p.tp or None,
+                  tp_sent=tp, bid=tick.bid if tick else None, ask=tick.ask if tick else None, stops_level=si["stops_level"],
+                  freeze_level=si["freeze_level"])
         if p.sl and not allow_loosen and ((is_long and sl <= p.sl + 1e-9) or ((not is_long) and sl >= p.sl - 1e-9)):
             return BrokerResult(True, "ALREADY_BETTER", changed=False, existing_sl=p.sl, requested_sl=sl)
-        r = m.order_send({"action": m.TRADE_ACTION_SLTP, "position": ticket, "symbol": symbol, "sl": sl, "tp": p.tp})
+        r = m.order_send({"action": m.TRADE_ACTION_SLTP, "position": ticket, "symbol": symbol, "sl": sl, "tp": tp or 0.0})
     bid, ask = (tick.bid, tick.ask) if tick else (None, None)
     if r is None:
         return BrokerResult(False, "BROKER_REJECTED", comment="order_send returned None", last_error=_err(), existing_sl=p.sl, requested_sl=sl, bid=bid, ask=ask)
     ok = r.retcode == m.TRADE_RETCODE_DONE
+    if r.retcode == INVALID_STOPS:
+        _invalid_stops(m, symbol, ticket, side, requested, sl, tick, si, cooldown=True)
     return BrokerResult(ok, "SL_CHANGED" if ok else "BROKER_REJECTED", changed=ok, retcode=r.retcode, comment=getattr(r, "comment", ""),
                         last_error="" if ok else _err(), existing_sl=p.sl, requested_sl=sl, bid=bid, ask=ask)
 
@@ -354,10 +432,17 @@ def place_market(symbol: str, side: str, lots: float, sl: float | None = None, c
             req = {"action": m.TRADE_ACTION_DEAL, "symbol": symbol, "volume": float(lots),
                    "type": m.ORDER_TYPE_BUY if is_buy else m.ORDER_TYPE_SELL, "price": t.ask if is_buy else t.bid,
                    "deviation": 30, "comment": comment[:31]}
-            if sl is not None:
-                req["sl"] = round(float(sl), digits(symbol))
-            if tp is not None:                                   # v2.16.0: broker-side take-profit (ema921 cap)
-                req["tp"] = round(float(tp), digits(symbol))
+            si = stops_info(m, symbol)                       # v2.16.2: clamp to the stops / freeze level, correct side
+            req_sl = round(float(sl), si["digits"]) if sl is not None else None
+            req_tp = round(float(tp), si["digits"]) if tp is not None else None
+            c_sl, c_tp = clamp_stops(is_buy, t.bid, t.ask, req_sl, req_tp, si["dist"], si["digits"])
+            if c_sl != req_sl or c_tp != req_tp:
+                _emit("sl_clamped", symbol=symbol, ticket=None, side="LONG" if is_buy else "SHORT", requested=req_sl, sent=c_sl,
+                      tp_requested=req_tp, tp_sent=c_tp, bid=t.bid, ask=t.ask, stops_level=si["stops_level"], freeze_level=si["freeze_level"])
+            if c_sl is not None:
+                req["sl"] = c_sl
+            if c_tp is not None:                                 # v2.16.0: broker-side take-profit (ema921 cap)
+                req["tp"] = c_tp
             r, used = _send_filled(m, req)                 # v2.16.1: AUREON_FILLING first, the others only on INVALID_FILL
         if r is not None and r.retcode == m.TRADE_RETCODE_DONE:
             break
@@ -367,10 +452,12 @@ def place_market(symbol: str, side: str, lots: float, sl: float | None = None, c
     if r is None:
         return BrokerResult(False, "BROKER_REJECTED", comment="order_send returned None", last_error=_err(), bid=t.bid, ask=t.ask)
     ok = r.retcode == m.TRADE_RETCODE_DONE
+    if r.retcode == INVALID_STOPS:
+        _invalid_stops(m, symbol, None, "LONG" if is_buy else "SHORT", req_sl, req.get("sl"), t, si, cooldown=False)
     ticket = getattr(r, "order", None) or getattr(r, "deal", None)
     price = getattr(r, "price", None)
     return BrokerResult(ok, "PLACED" if ok else "BROKER_REJECTED", changed=ok, retcode=r.retcode, comment=getattr(r, "comment", ""),
-                        last_error="" if ok else _err(), requested_sl=sl, bid=t.bid, ask=t.ask,
+                        last_error="" if ok else _err(), requested_sl=req.get("sl", sl), bid=t.bid, ask=t.ask,
                         ticket=int(ticket) if ticket else None, price=float(price) if price else None, volume=float(getattr(r, "volume", lots) or lots),
                         fill_mode=used)
 

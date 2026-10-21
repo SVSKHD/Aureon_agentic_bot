@@ -10,6 +10,12 @@ Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are a
     `gateway_rebuilt` row.
   - **Supervised:** exit 75 as before.
   - The boot card and `process_start` carry `self_restart_mode=in-process|exit75`.
+- **Stops validation** (`broker.set_sl`, `broker.place_market`):
+  - The SL / TP is clamped to the nearest allowed price on the correct side: `max(trade_stops_level, freeze_level)` points
+    from the bid (long) or the ask (short), MT5's inclusive rule. A `sl_clamped` row records requested / sent.
+  - The clamped SL still never loosens a live one.
+  - A 10016 after clamping pauses `set_sl` on that ticket for 5 min (status `COOLDOWN`, no request sent; the guardian stays
+    quiet) and posts one red **GUARDIAN FAILURE** card with bid / ask / stops_level / freeze_level / side.
 
 ## v2.16.1 — 2026-10-21  (PATCH: manual commands, filling type; strategy rules unchanged)
 - **`AUREON_FILLING=ioc|fok|return`**: `broker.place_market` / `close` use the configured type first, and fall back (ioc → fok →
