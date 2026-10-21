@@ -2,6 +2,21 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.16.1 — 2026-10-21  (PATCH: manual commands, filling type; strategy rules unchanged)
+- **`AUREON_FILLING=ioc|fok|return`**: `broker.place_market` / `close` use the configured type first, and fall back (ioc → fok →
+  return) only on `TRADE_RETCODE_INVALID_FILL` (10030). `fill_mode` is on `order_placed` rows and the result. The boot card
+  reads `symbol_info.filling_mode` and warns. Before, any non-requote rejection was retried with FOK
+  (`test_requote_retried_once_then_rejected` updated).
+- **`/place long|short [lots] [sl] [tp]`** (`aureon_mt5/manual.py`, every mode): the mode's SL/TP defaults; pts ≤ 200 vs a
+  price. Same gate as an auto entry (governor, max lots, drawdown guard, execution, demo / allow-live); paper → the ema921
+  tracker. Journals `order_placed` `actor=human` `rationale=/place`; replies with the `PLACED <side>` ENTER card.
+- **`/sl`, `/tp`**: one `TRADE_ACTION_SLTP` carrying both values (`broker.modify_sltp`); loosening a locked SL needs `force`;
+  `/tp off`; `sltp_modified` before / after.
+- `_guard_921`'s lock keeps a tighter manual SL (no "SL moved" card for an `ALREADY_BETTER`). The paper tracker honours a
+  position's own SL / TP.
+- Tests: `tests/test_v2161_place.py` (36).
+- Strategy rules changed: NO
+
 ## v2.16.0 follow-up — 2026-10-21  (ema921 only)
 - **Network loss:** no automatic ema921 entry while the network is degraded (netguard / server) or MT5 isn't connected.
   After a reconnect, a cross on a bar older than the current closed bar is journaled `cross_skipped`

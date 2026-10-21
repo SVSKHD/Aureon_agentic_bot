@@ -1552,7 +1552,8 @@ class SymbolAgent(threading.Thread):
                 elif self.cfg.execution_enabled and (broker.is_demo() or self.cfg.allow_live):
                     placed = broker.place_market(self.symbol, side, lots, sl, comment="aureon 921", tp=tp)
                     self.journal.decision("order_placed", actor="agent", rationale="ema921 cross", symbol=self.symbol, mode=self.S.name, side=side,
-                                          lots=lots, sl=sl, tp=tp, ok=bool(placed.ok), status=placed.status, retcode=placed.retcode, ticket=placed.ticket, fill=placed.price)
+                                          lots=lots, sl=sl, tp=tp, ok=bool(placed.ok), status=placed.status, retcode=placed.retcode, ticket=placed.ticket, fill=placed.price,
+                                          fill_mode=placed.fill_mode)
                     if placed.ok:
                         self.closed_by_aureon.discard(placed.ticket)
                 else:
@@ -1596,11 +1597,14 @@ class SymbolAgent(threading.Thread):
                                                     friday_last=friday_last_bar(int(bar_t), r))
         if lock and not why:
             rr = broker.set_sl(p["ticket"], self.symbol, lock_px) if not self.dry else broker.BrokerResult(True, "DRY", changed=True)
-            if rr.ok:
-                st["locked"] = True; st["secured"] = r.lock_to
-                self.journal.log("locked", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], sl=lock_px, peak=st["peak"])
+            if rr.ok:                                                        # set_sl never loosens: a tighter manual SL is kept
+                kept = rr.status == "ALREADY_BETTER"
+                st["locked"] = True; st["secured"] = max(float(st.get("secured", 0.0)), r.lock_to)
+                self.journal.log("locked", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], sl=(rr.existing_sl if kept else lock_px),
+                                 peak=st["peak"], kept_manual_sl=kept)
                 self.notify.send(self.key("LOCK", p["ticket"]), ctitle(self.symbol, f"🔒 +{r.lock_at:g} seen → floor +{r.lock_to:g}", p["direction"]),
-                                 [f"SL moved to {lock_px:.2f} · peak +{st['peak']:.1f} · armed at the bar close"], color=EVENT_COLOURS["info"],
+                                 [(f"your SL {rr.existing_sl:.2f} is already tighter — kept" if kept else f"SL moved to {lock_px:.2f}")
+                                  + f" · peak +{st['peak']:.1f} · armed at the bar close"], color=EVENT_COLOURS["info"],
                                  footer=cfooter(self.S.display_name, f"#{p['ticket']}"), event="LOCK")
         if why:
             label = {"lock_close": f"+{r.lock_at:g} seen, closed below +{r.lock_to:g}", "friday_flat": "Friday flat",

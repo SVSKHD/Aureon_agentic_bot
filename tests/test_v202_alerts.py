@@ -162,7 +162,8 @@ def test_requote_retried_once_then_rejected(tmp_path, monkeypatch):
     assert r.ok and fake.attempts == 2 and sleeps == [2.0] and r.ticket == 1234567
     fake2 = ReqMT5(price=4000.5, requotes=1, final_ok=False); monkeypatch.setattr(broker, "_m", fake2)
     r2 = broker.place_market("XAUUSD", "LONG", 0.1, 3988.0, sleep=lambda s: None)
-    assert not r2.ok and fake2.attempts == 3 and r2.retcode == 10019            # requote → retry → IOC then FOK fallback, both refused
+    assert not r2.ok and fake2.attempts == 2 and r2.retcode == 10019            # requote → retry → refused (v2.16.1: the filling
+    #                                                                             fallback is only for 10030 INVALID_FILL, not "no money")
     fake3 = ReqMT5(price=4000.5, requotes=5); monkeypatch.setattr(broker, "_m", fake3)
     r3 = broker.place_market("XAUUSD", "LONG", 0.1, 3988.0, sleep=lambda s: None)
     assert not r3.ok and fake3.attempts == 2                                     # one retry only

@@ -144,6 +144,7 @@ def greet(notify, cfg, S, why, news_line):
             {"name": "Mode", "value": S.display_name, "inline": True},
             {"name": "Symbols", "value": ", ".join(cfg.symbols), "inline": True},
             {"name": "Timeframe", "value": timeframe_line(cfg), "inline": True},
+            {"name": "Filling", "value": filling_line(cfg), "inline": False},
             {"name": "Guardian", "value": "🟢 ON" if guardian_on else "⚪ OFF", "inline": True},
             {"name": "MT5", "value": ("🟢 " if mt5_state in ("CONNECTED", "DRY") else "🔴 ") + mt5_state, "inline": True},
             {"name": "Server", "value": f"{srv:%a %d %b %H:%M} · UTC{cfg.server_utc_offset:+g}", "inline": True},
@@ -154,6 +155,22 @@ def greet(notify, cfg, S, why, news_line):
         ],
         footer=f"{S.display_name} · {datetime.now(IST):%H:%M} IST",
     )
+
+
+def filling_line(cfg, supported_fn=None) -> str:
+    """v2.16.1 boot card: AUREON_FILLING and whether each symbol accepts it (symbol_info.filling_mode)."""
+    mode = broker.FILLING["mode"]
+    if cfg.dry:
+        return f"{mode} (dry)"
+    out = []
+    for s in cfg.symbols:
+        sup = (supported_fn or broker.filling_supported)(s)
+        if sup is None:
+            out.append(f"{s} ?")
+        elif not sup.get(mode):
+            ok = ", ".join(k for k in broker.FILL_ORDER if sup.get(k)) or "none"
+            out.append(f"⚠️ {s} does not accept {mode} (accepts {ok}) — orders fall back on 10030")
+    return mode + ("" if not out else " · " + " · ".join(out))
 
 
 def features_field(cfg) -> str:
@@ -302,6 +319,7 @@ def main():
         print("feature overrides (Discord): " + ", ".join(f"{k}={v}" for k, v in feature_overrides.items()))
     from aureon_mt5.common import tf_synth                             # v2.14.0: the execution timeframe, process-wide
     tf_synth.set_exec_tf(cfg.exec_tf, cfg)                             # after the overrides: /decide-timeframe writes exec_tf there
+    broker.configure_filling(cfg.filling)                             # v2.16.1: AUREON_FILLING
     journal.log("process_start", version=VERSION, mode=cfg.mode, exec_tf=tf_synth.exec_tf(), htf_align=cfg.htf_align,
                 symbols=list(cfg.symbols))
     health_notify = Notifier(cfg.health_webhook) if cfg.health_webhook else notify
