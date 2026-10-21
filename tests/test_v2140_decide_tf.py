@@ -79,7 +79,7 @@ def test_rescale(avg, step, secure):
 def test_plan_text():
     p = D.plan(SimpleNamespace(follow_stop=30.0), "M30", 9.6, days=30)
     t = D.plan_text(p)
-    assert t.startswith("exec M30 · confirm M45*, H1 · hold 2 bars · gap 0.25× range · window 6 bars")
+    assert t.startswith("exec M30 (current: M5) · confirm M45*, H1 · hold 2 bars · gap 0.25× range · window 6 bars")
     assert "follow stop = max(FOLLOW_STOP 30, 1.5× avg range of M30 over 30 d = 14.4) = 30" in t
     assert "step 15" in t and "secure at +5" in t and "regime windows 4/2 bars" in t
 

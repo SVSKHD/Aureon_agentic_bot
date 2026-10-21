@@ -108,8 +108,8 @@ def simulate(bars: pd.DataFrame, entry_i: int, direction: str, entry: float | No
                 pts = round((c - entry) * s, 2)
                 out["worst_close"] = min(out["worst_close"], pts); out["peak_close"] = max(out["peak_close"], pts)
                 if fake.closed:
-                    ex = [r for r in ag.journal.read(0) if r["event"] == "exit"][-1]
-                    out["exit"] = {"i": i, "time": hhmm(t), "price": c, "points": pts, "reason": ex["reason"]}
+                    ex = [r for r in ag.journal.read(0) if r["event"] in ("exit", "closed_by_rule")]   # v2.16.2: ema921 logs closed_by_rule
+                    out["exit"] = {"i": i, "time": hhmm(t), "price": c, "points": pts, "reason": ex[-1]["reason"] if ex else "closed"}
                     break
             out["journal"] = ag.journal.read(0)
             out["last_sl"] = round(fake.pos.sl, 2)

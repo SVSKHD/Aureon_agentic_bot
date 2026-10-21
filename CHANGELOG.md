@@ -2,6 +2,20 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.16.2 follow-up — /decide-timeframe for every mode
+- **Column contract:** `replay_guardian.run_combo` takes the mode and passes it (and the strategy's `ema_cols`) to
+  `simulate`, `p_signals`, `regime.replay_states` and the HTF gate. It used ema5080's `ema_fast` / `ema_slow` on any
+  frame: the 22 Oct 01:02 `KeyError('ema_fast')`. `guardian_sim.simulate` also reads ema921's `closed_by_rule` exit rows.
+- **Default TF:** `/decide-timeframe` with no `tf` runs for `cfg.exec_tf`, not M5. The ladder line and the plan say which
+  TF is current. `tools/replay_guardian.py` without `--set exec_tf` uses `AUREON_EXEC_TF`.
+- **ema921 / ema9200:** `/decide-timeframe` runs the mode's own replay (`strategies/<mode>/journeys` via `S.analyse`) on
+  `days` of MT5 bars per TF:
+  - one row per TF in {M15, M30, H1} + the requested one: trades, win %, net pts, max DD, weeks + / −;
+  - M30 is marked as the research TF;
+  - `apply:true` writes `AUREON_EXEC_TF` only (no follow-knob rescaling), and is refused with an open position.
+- The cache is per (mode, tf, days, date). The command still acks first and posts the table as the followup.
+- Tests: `tests/test_v2162_decide_tf.py` (18).
+
 ## v2.16.2 — 2026-10-21  (PATCH: resilience; strategy rules unchanged)
 - **Self-restart without a supervisor:** `AUREON_SUPERVISED=1` (set by the launcher / logon task) marks a supervised
   process.
