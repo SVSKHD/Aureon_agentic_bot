@@ -145,6 +145,7 @@ def greet(notify, cfg, S, why, news_line):
             {"name": "Symbols", "value": ", ".join(cfg.symbols), "inline": True},
             {"name": "Timeframe", "value": timeframe_line(cfg), "inline": True},
             {"name": "Filling", "value": filling_line(cfg), "inline": False},
+            {"name": "Self-restart", "value": f"self_restart_mode={_selfheal_mode()}", "inline": True},
             {"name": "Guardian", "value": "🟢 ON" if guardian_on else "⚪ OFF", "inline": True},
             {"name": "MT5", "value": ("🟢 " if mt5_state in ("CONNECTED", "DRY") else "🔴 ") + mt5_state, "inline": True},
             {"name": "Server", "value": f"{srv:%a %d %b %H:%M} · UTC{cfg.server_utc_offset:+g}", "inline": True},
@@ -155,6 +156,12 @@ def greet(notify, cfg, S, why, news_line):
         ],
         footer=f"{S.display_name} · {datetime.now(IST):%H:%M} IST",
     )
+
+
+def _selfheal_mode() -> str:
+    """v2.16.2: exit75 under the launcher / logon task (AUREON_SUPERVISED=1), else in-process gateway rebuilds."""
+    from aureon_mt5.selfheal import self_restart_mode
+    return self_restart_mode()
 
 
 def filling_line(cfg, supported_fn=None) -> str:
@@ -321,7 +328,7 @@ def main():
     tf_synth.set_exec_tf(cfg.exec_tf, cfg)                             # after the overrides: /decide-timeframe writes exec_tf there
     broker.configure_filling(cfg.filling)                             # v2.16.1: AUREON_FILLING
     journal.log("process_start", version=VERSION, mode=cfg.mode, exec_tf=tf_synth.exec_tf(), htf_align=cfg.htf_align,
-                symbols=list(cfg.symbols))
+                symbols=list(cfg.symbols), self_restart_mode=_selfheal_mode())
     health_notify = Notifier(cfg.health_webhook) if cfg.health_webhook else notify
     # v2.10.1 BOOT CHECK: unparsable / out-of-range / contradictory settings fall back to the safe default, loudly
     from aureon_mt5.config import apply_fallbacks, validate as validate_cfg

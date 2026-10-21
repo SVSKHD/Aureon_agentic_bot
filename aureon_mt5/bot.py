@@ -2315,10 +2315,20 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             monitor.gateway_down(f"client exited: {why}")
             netguard.update()
 
+        from .selfheal import REBUILD_BACKOFF_S, supervised as _supervised
+        sched = None if _supervised() else REBUILD_BACKOFF_S            # v2.16.2: no supervisor → 5 s → 30 s → 2 min
+
+        def rebuild():
+            """v2.16.2 (HealthGuard, gateway down > 300 s, no supervisor): close the client from outside its loop; the
+            supervisor below sees start() return and starts a fresh session (new HTTP connector, new gateway)."""
+            if not client.is_closed():
+                asyncio.run_coroutine_threadsafe(client.close(), loop)
+        monitor.rebuild = rebuild
+
         while not _ops.STOP.is_set():
             try:
                 loop.run_until_complete(netguard.supervise_client(start, stop_requested=_ops.STOP.is_set, close=close,
-                                                                  on_exit=on_exit))
+                                                                  on_exit=on_exit, schedule=sched))
             except BaseException as e:                         # never let the bot thread die
                 netguard.rlog("bot-thread", f"discord supervisor error: {e!r} — restarting it")
                 _time.sleep(2)

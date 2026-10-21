@@ -2,6 +2,15 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.16.2 — 2026-10-21  (PATCH: resilience; strategy rules unchanged)
+- **Self-restart without a supervisor:** `AUREON_SUPERVISED=1` (set by the launcher / logon task) marks a supervised
+  process.
+  - **Not supervised:** a Discord gateway down > 300 s never exits. The client is closed and started again in-process
+    (5 s → 30 s → 2 min, capped); the MT5 loop keeps running. When the gateway returns: **BACK ONLINE** card and a
+    `gateway_rebuilt` row.
+  - **Supervised:** exit 75 as before.
+  - The boot card and `process_start` carry `self_restart_mode=in-process|exit75`.
+
 ## v2.16.1 — 2026-10-21  (PATCH: manual commands, filling type; strategy rules unchanged)
 - **`AUREON_FILLING=ioc|fok|return`**: `broker.place_market` / `close` use the configured type first, and fall back (ioc → fok →
   return) only on `TRADE_RETCODE_INVALID_FILL` (10030). `fill_mode` is on `order_placed` rows and the result. The boot card

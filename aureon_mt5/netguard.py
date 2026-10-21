@@ -230,11 +230,12 @@ def dns_line(res: dict | None = None) -> str:
 
 # ----------------------------------------------------------------------------- the Discord client supervisor
 async def supervise_client(start, *, stop_requested, close=None, on_exit=None, sleep=None, clock=_time.monotonic,
-                           backoff=None) -> int:
+                           backoff=None, schedule=None) -> int:
     """Run `await start()` forever. Any exit — exception or clean return — → on_exit(why), close(), back off
     (2 s → 60 s, reset after 2 min of running) and start again. Returns (the number of starts) only when stop_requested()."""
     lo, hi = backoff or GATEWAY_BACKOFF
     delay, runs = lo, 0
+    fails = 0                                                    # v2.16.2: schedule = explicit delays (5 → 30 → 120, capped)
     sleep = sleep or asyncio.sleep
     while not stop_requested():
         t0 = clock(); runs += 1
@@ -259,13 +260,17 @@ async def supervise_client(start, *, stop_requested, close=None, on_exit=None, s
         if stop_requested():
             break
         if clock() - t0 > 120:
-            delay = lo
+            delay = lo; fails = 0
+        if schedule:
+            delay = schedule[min(fails, len(schedule) - 1)]
+        fails += 1
         rlog("gateway-supervisor", f"discord client exited ({why}) — reconnecting in {delay:.0f} s (forever)")
         try:
             await sleep(delay)
         except asyncio.CancelledError:
             pass
-        delay = min(hi, delay * 2)
+        if not schedule:
+            delay = min(hi, delay * 2)
     return runs
 
 
