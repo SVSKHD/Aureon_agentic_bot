@@ -18,6 +18,7 @@ from tests.test_v181 import harness  # noqa: F401
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 R = J.Rules()
+T0 = 1_760_918_400                                                          # Mon 2025-10-20 00:00 server
 
 
 # ----------------------------------------------------------------------------- registry + enumerations
@@ -53,7 +54,7 @@ def agent921(harness, monkeypatch, **cfg):
         setattr(ag0.cfg, k, v)
     from aureon_mt5.agent import SymbolAgent
     ag = SymbolAgent("XAUUSD", ag0.cfg, get_strategy("ema921"), ag0.notify, ag0.journal, ())
-    ag.dry = False
+    ag.dry = False; ag.bar_s = 1800                                         # AUREON_EXEC_TF=M30
     sent, calls = [], {"place": [], "set_sl": [], "close": []}
     ag.notify.send = lambda key, title, lines=None, png=None, **kw: sent.append((key, title, lines, kw)) or True
     ag.notify.card = lambda title, body, **kw: sent.append(("card", title, body, kw)) or True
@@ -68,6 +69,8 @@ def agent921(harness, monkeypatch, **cfg):
     monkeypatch.setattr(broker, "set_sl", lambda *a, **k: calls["set_sl"].append(a) or broker.BrokerResult(True, "SL_CHANGED", changed=True))
     monkeypatch.setattr(broker, "close", lambda *a, **k: calls["close"].append(a) or broker.BrokerResult(True, "CLOSED", changed=True))
     monkeypatch.setattr("aureon_mt5.agent.context_chart", lambda *a, **k: None)
+    monkeypatch.setattr(broker, "connected", lambda: True)
+    monkeypatch.setattr(broker, "now_server", lambda off=0: T0 + 260 * 1800 + 60)    # frame()'s last bar just closed
     return ag, sent, calls
 
 
@@ -282,3 +285,60 @@ def test_replay_tool_runs(tmp_path):
                          text=True, timeout=120, cwd=ROOT)
     assert out.returncode == 0, out.stderr
     assert "crosses" in out.stdout and "max DD" in out.stdout and (tmp_path / "m30_921.png").exists()
+
+
+# ----------------------------------------------------------------------------- network loss + stale crosses
+def test_no_automatic_entry_while_the_network_or_feed_is_down(harness, monkeypatch):
+    from aureon_mt5 import netguard
+    ag, sent, calls = agent921(harness, monkeypatch)
+    monkeypatch.setattr(netguard, "degraded", lambda: True)
+    df = frame(); ag._detect_921(cross_res(df), df, int(df["time"].iloc[-1]), float(df["close"].iloc[-1]), 0, 0)
+    assert not calls["place"] and any("network degraded" in str(kw.get("fields")) for *_, kw in sent)
+    monkeypatch.setattr(netguard, "degraded", lambda: False); monkeypatch.setattr(broker, "connected", lambda: False)
+    ag.notify.sent = set()
+    ag._detect_921(cross_res(df), df, int(df["time"].iloc[-1]), float(df["close"].iloc[-1]), 0, 0)
+    assert not calls["place"] and any("MT5 feed down" in str(kw.get("fields")) for *_, kw in sent)
+
+
+def test_cross_on_a_bar_older_than_the_current_closed_bar_is_not_taken(harness, monkeypatch):
+    """The feed returns two bars after the cross bar closed: the cross is journaled cross_skipped, never ordered."""
+    ag, sent, calls = agent921(harness, monkeypatch)
+    df = frame(); bt = int(df["time"].iloc[-1])
+    monkeypatch.setattr(broker, "now_server", lambda off=0: bt + 3 * 1800 + 60)     # the current closed bar is bt + 2 bars
+    ag._detect_921(cross_res(df), df, bt, float(df["close"].iloc[-1]), 0, 0)
+    assert not calls["place"] and not [k for k, *_ in sent if "ENTER_" in str(k)]
+    row = [r for r in ag.journal.read(0) if r["event"] == "cross_skipped"][-1]
+    assert row["why"] == "stale after reconnect" and row["bar"] == bt
+    assert not [r for r in ag.journal.read(0) if r["event"] == "signal"]
+    monkeypatch.setattr(broker, "now_server", lambda off=0: bt + 1800 + 60)         # on time → taken
+    ag._detect_921(cross_res(df), df, bt, float(df["close"].iloc[-1]), 0, 0)
+    assert calls["place"]
+
+
+# ----------------------------------------------------------------------------- Friday flat: replay == live
+def friday_frame():
+    """Mon–Fri, Friday running to 23:30; an up-move all Friday so a long opened Friday morning is still open at 22:00."""
+    ts = []
+    for d in range(5):
+        day = T0 + d * 86400
+        ts += list(range(day, day + 23 * 3600 + 1801, 1800))
+    n = len(ts); close = 3300 + np.arange(n) * 0.0
+    i_fri = ts.index(T0 + 4 * 86400 + 8 * 3600)
+    close[:i_fri] = 3300 + np.sin(np.arange(i_fri) / 3.0) * 6
+    close[i_fri:] = close[i_fri - 1] + np.arange(1, n - i_fri + 1) * 0.6
+    op = np.r_[close[0], close[:-1]]
+    return add_emas(pd.DataFrame({"time": ts, "open": op, "high": np.maximum(op, close) + 0.5, "low": np.minimum(op, close) - 0.5,
+                                  "close": close}))
+
+
+def test_friday_flat_hour_is_the_same_bar_in_replay_and_live():
+    assert R.friday_flat_hour == 22.0
+    df = friday_frame(); res = J.build(df, R, 3.0)
+    fri = [j for j in res["journeys"] if j.exit_reason == "friday_flat"]
+    assert fri, [(j.entry_time, j.exit_reason) for j in res["journeys"]]
+    t = fri[-1].exit_time
+    assert J.server_weekday(t) == 4 and J.server_hour(t) == 22.0                 # not the 23:30 bar at the end of the data
+    assert J.friday_last_bar(t, R) and not J.friday_last_bar(t - 1800, R)
+    import dataclasses
+    late = J.build(df, dataclasses.replace(R, friday_flat_hour=23.0), 3.0)
+    assert [j for j in late["journeys"] if j.exit_reason == "friday_flat"][-1].exit_time == T0 + 4 * 86400 + 23 * 3600

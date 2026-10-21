@@ -2,6 +2,15 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.16.0 follow-up — 2026-10-21  (ema921 only)
+- **Network loss:** no automatic ema921 entry while the network is degraded (netguard / server) or MT5 isn't connected.
+  After a reconnect, a cross on a bar older than the current closed bar is journaled `cross_skipped`
+  `why="stale after reconnect"` and not taken.
+- **Friday flat = live in the replay:** `Rules.friday_flat_hour` (22.0). `run_exit` closes at the first Friday bar opening at
+  or after it; before, it closed at the last Friday bar in the data. Same bar as `_guard_921` and the paper tracker.
+- Tests: network / feed gate, stale cross after reconnect, Friday flat hour (`tests/test_v2160_ema921.py`, 30).
+- Strategy rules changed: ema921 replay only (Friday exit bar) — live unchanged
+
 ## v2.16.0 — 2026-10-21  (MINOR: new mode ema921; defaults unchanged)
 - **`ema921` mode** (the supplied patch): EMA 9/21 on M30, mechanical.
   - Every cross is a market order at the bar close, with broker SL −30.

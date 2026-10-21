@@ -87,9 +87,16 @@ the current equity. In paper mode the equity is the account equity when paper tr
 the traded lots, best / worst, the drawdown used vs `AUREON_MAX_DD_USD`, and the backtest reference (+11 pts / week, 58% of
 weeks positive).
 
+**Network loss:** no automatic entry while netguard reports the network degraded, or MT5 isn't connected (the
+`AUREON_NETWORK_DEGRADED_ENTRIES` override applies). When the feed comes back, a cross on a bar older than the current
+closed bar is not taken; it is journaled `cross_skipped` with `why="stale after reconnect"`. Open positions keep their
+broker SL, and the guardian resumes on the next closed bar.
+
+**Friday flat** is `Rules.friday_flat_hour` (22.0 server): out at the close of the first Friday bar opening at or after it.
+A trade still open after that bar closes on the next bar close. The replay, the paper tracker and the live guardian use the
+same rule.
+
 **Live vs the replay:**
-- **Friday flat:** live flattens at the close of the first Friday bar opening at or after 22:00 server. The replay uses the
-  last Friday bar in the data, which can be later; live can't trade after the market closes.
 - **Exit bar:** when the broker SL fills intrabar, live sees no position at that bar's close and can take a cross on the
   same bar. The replay counts that bar as "in position".
 

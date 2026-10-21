@@ -1405,6 +1405,27 @@ class SymbolAgent(threading.Thread):
             self._save921()
         return why
 
+    def _stale_cross(self, bar_t) -> bool:
+        """A cross on a bar older than the bar that should be the latest closed one by the server clock — the feed / gateway
+        was down when it closed. Never taken late: journaled cross_skipped "stale after reconnect"."""
+        if self.dry:
+            return False
+        try:
+            now = int(broker.now_server(self.off))
+        except Exception:
+            return False
+        return int(bar_t) < (now // self.bar_s - 1) * self.bar_s
+
+    def _feed_or_network_down(self) -> str | None:
+        """v2.11.2's no-new-entries rule for the automatic entries too: netguard / server network degraded, or the MT5 feed down.
+        Open positions keep their broker SL; the guardian resumes on the next closed bar."""
+        from . import netguard as _ng, server as _server
+        if (_ng.degraded() or _server.network_degraded()) and not getattr(self.cfg, "network_degraded_entries", False):
+            return "network degraded — no automatic entries (AUREON_NETWORK_DEGRADED_ENTRIES=0)"
+        if not self.dry and not broker.connected():
+            return "MT5 feed down — no automatic entries"
+        return None
+
     def _paper_open(self) -> list:
         return list(self._state921().get("paper") or [])
 
@@ -1501,6 +1522,10 @@ class SymbolAgent(threading.Thread):
                 continue
             if ev.label not in ("EB", "ES"):
                 continue
+            if self._stale_cross(bar_t):                                    # v2.16.0: the feed came back after this bar closed
+                self.journal.log("cross_skipped", symbol=self.symbol, mode=self.S.name, side=side, bar=bar_t, price=close,
+                                 why="stale after reconnect")
+                continue
             sl = close - s * r.stop; tp = (close + s * r.tp) if r.tp else None
             self.latest_signal = {"bar_time": bar_t, "symbol": self.symbol, "strategy": self.S.name, "kind": "cross", "direction": side, "consumed": False}
             self.health["last_signal"] = f"{side} 9/21 cross @ {ist(bar_t, off)}"
@@ -1512,6 +1537,8 @@ class SymbolAgent(threading.Thread):
                 why = "already in a position" + (" (paper)" if not broker.positions(self.symbol) else "")
             elif not self.cfg.auto_mode:
                 why = "AUREON_AUTO is off — signal only"
+            elif self._feed_or_network_down():
+                why = self._feed_or_network_down()
             else:
                 why = self._equity_dd_block()
             placed = None

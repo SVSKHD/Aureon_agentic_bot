@@ -14,7 +14,8 @@ Exits (the GUARDIAN profile, one object for replay and live):
   once +lock_at (20) has printed → broker SL moved to entry + lock_to (15)
   exit_mode "e9"      first M30 close through EMA 9 against the trade → market close
   exit_mode "e9>e200" the EMA 9 rule until +lock_at has printed, then the first close through EMA 200
-  Friday: flat at the last bar (friday_flat)
+  Friday: flat at the close of the first Friday bar opening at or after friday_flat_hour server (default 22:00) —
+          the same bar in the replay, the paper tracker and the live guardian
 Everything in price points; on gold $1 of price = $1 per ounce = $100 per lot.
 """
 from __future__ import annotations
@@ -58,6 +59,7 @@ class Rules:
     exit_mode: str = "e9"                  # "e9" | "e9>e200"
     n_close: int = 1                       # closes through the exit line needed
     friday_flat: bool = True
+    friday_flat_hour: float = 22.0         # server hour: the first Friday bar opening at or after it is the flat bar (replay = live)
     # ---- news (common/news.py)
     news_times: tuple = ()
     news_entry_block_min: int = 60
@@ -126,11 +128,10 @@ def exit_line(rules: Rules, peak: float) -> str:
     return "ema200" if (rules.exit_mode == "e9>e200" and peak >= rules.lock_at) else "ema9"
 
 
-FRIDAY_FLAT_FROM = 22.0      # live / paper: the first Friday bar opening at or after this server hour is the flat bar
-
-
 def friday_last_bar(ts: int, rules: Rules) -> bool:
-    return bool(rules.friday_flat and server_weekday(int(ts)) == 4 and server_hour(int(ts)) >= FRIDAY_FLAT_FROM)
+    """The Friday flat bar: a Friday bar opening at or after rules.friday_flat_hour (server). The first such bar closes the
+    trade; any later one closes a trade that is somehow still open (the next bar close)."""
+    return bool(rules.friday_flat and server_weekday(int(ts)) == 4 and server_hour(int(ts)) >= rules.friday_flat_hour)
 
 
 def on_bar_close(rules: Rules, *, peak: float, locked: bool, close_pts: float, against: bool, run: int,
@@ -196,7 +197,7 @@ def build(df: pd.DataFrame, rules: Rules, server_offset_h: float = 3.0, trade_fr
             if run >= rules.n_close:
                 jn.exit_index, jn.exit_time, jn.exit_price = k, int(time[k]), close[k]
                 jn.exit_reason = "ema_close"; jn.exit_rule = exit_line(rules, peak); jn.result = (close[k] - e) * s; break
-            if rules.friday_flat and server_weekday(int(time[k])) == 4 and (k == end or server_weekday(int(time[k + 1])) != 4):
+            if friday_last_bar(int(time[k]), rules):                  # v2.16.0: the live rule (was: the last Friday bar in the data)
                 jn.exit_index, jn.exit_time, jn.exit_price = k, int(time[k]), close[k]
                 jn.exit_reason = "friday_flat"; jn.exit_rule = "friday"; jn.result = (close[k] - e) * s; break
         else:
