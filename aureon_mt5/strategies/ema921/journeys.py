@@ -126,6 +126,33 @@ def exit_line(rules: Rules, peak: float) -> str:
     return "ema200" if (rules.exit_mode == "e9>e200" and peak >= rules.lock_at) else "ema9"
 
 
+FRIDAY_FLAT_FROM = 22.0      # live / paper: the first Friday bar opening at or after this server hour is the flat bar
+
+
+def friday_last_bar(ts: int, rules: Rules) -> bool:
+    return bool(rules.friday_flat and server_weekday(int(ts)) == 4 and server_hour(int(ts)) >= FRIDAY_FLAT_FROM)
+
+
+def on_bar_close(rules: Rules, *, peak: float, locked: bool, close_pts: float, against: bool, run: int,
+                 friday_last: bool) -> tuple[bool, str | None, int]:
+    """v2.16.0 — the bar-close decision, shared by the live guardian and the paper tracker (same order as build()'s
+    run_exit): (lock now?, close reason | None, the new against-run).
+        lock_close   +lock_at has printed but this bar CLOSED below +lock_to → out at the close (the lock never arms intrabar)
+        ema_close    n_close closes through the exit line (EMA 9, or EMA 200 after the lock in e9>e200)
+        friday_flat  the Friday flat bar"""
+    lock = False
+    if peak >= rules.lock_at and not locked:
+        if close_pts < rules.lock_to:
+            return False, "lock_close", run
+        lock = True
+    run = run + 1 if against else 0
+    if run >= rules.n_close:
+        return lock, "ema_close", run
+    if friday_last:
+        return lock, "friday_flat", run
+    return lock, None, run
+
+
 def build(df: pd.DataFrame, rules: Rules, server_offset_h: float = 3.0, trade_from: int | None = None, day_end: int | None = None, **_ignored) -> dict:
     close = df["close"].to_numpy(); opn = df["open"].to_numpy(); high = df["high"].to_numpy(); low = df["low"].to_numpy()
     e9 = df["ema9"].to_numpy(); e21 = df["ema21"].to_numpy(); e200 = df["ema200"].to_numpy(); time = df["time"].to_numpy()

@@ -21,7 +21,7 @@ def positions_block_mode_change(agents):
     return False
 
 def write_mode(env_path, mode, symbols=None):
-    if mode not in ("ema2050", "ema5080", "ema9200"): raise ValueError("unsupported mode")
+    if mode not in ("ema2050", "ema5080", "ema9200", "ema921"): raise ValueError("unsupported mode")
     path = Path(env_path).resolve()
     if not path.is_file(): raise FileNotFoundError("existing .env file required")
     set_key(str(path), "AUREON_MODE", mode, quote_mode="never")

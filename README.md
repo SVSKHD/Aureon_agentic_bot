@@ -11,7 +11,7 @@ protect → secure +10 → ride in +5 steps → close on the fast-EMA turn → n
 | `ema921` | ACTIVE (v2.16.0) | EMA 9/21 on **M30**, **mechanical**: every cross taken at the bar close · broker SL −30 · +20 → SL +15 · exit on the first close through EMA 9 (or EMA 200 after +20) · Friday flat · drawdown guard |
 | `ema9200` | ACTIVE (v2.15.0) | EMA 9/200 on **M30**: candidates only (pullback to EMA9 with the bias / momentum bar) → TAKE / SKIP, own Gold guardian profile (−30 / +40→+30 / ride +10 / EMA9 turn / Friday flat) |
 
-Nothing is ported between them. Resolution: `--mode` → `AUREON_MODE` → `ema5080`. Aliases `5080`, `2050`, `9200`.
+Nothing is ported between them. Resolution: `--mode` → `AUREON_MODE` → `ema5080`. Aliases `5080`, `2050`, `9200`, `921`.
 The mode is fixed for the life of the process; a change needs a restart. Positions managed under another mode are kept
 protected (SL never loosened) but receive no strategy rules; a `⚠️ MODE MISMATCH` warning is posted.
 
@@ -55,6 +55,46 @@ Jan–Oct (your server run, `backtest.py`) **+$54k**, Jan–Apr unseen +$1.4k, *
     python tools/replay_921.py --csv ... --set exit_mode=e9>e200 --set stop=30
 
 Journal rows: `pre_cross`, `signal`, `cross_skipped` (why), `order_placed` / `paper_fill`, `locked`, `closed_by_rule`.
+
+**The order gate.** An order is sent only when every condition holds; anything else posts a SIGNAL card saying which one
+failed:
+- `AUREON_EXECUTION=1` and `AUREON_AUTO=1`;
+- a demo account, or `AUREON_ALLOW_LIVE=1` (an account type that can't be read fails closed);
+- not `AUREON_PAPER=1`;
+- no position on the symbol (a paper position counts in paper mode);
+- the drawdown guard is clear.
+
+**The lock is armed at the bar close, never intrabar.** This is the research assumption. On each M30 close, if +20 has
+printed:
+- the close is ≥ +15 → the broker SL goes to entry +15;
+- the close is below +15 → out at the close (`lock_close`).
+
+After a restart the lock is rebuilt from the live SL, and nothing is re-sent. A broker SL or lock exit posts a CLOSED card,
+never "CLOSED BY YOU".
+
+**Paper mode** (`AUREON_PAPER=1`): `paper_fill` rows carry `side lots price sl tp bar`. No `order_send` is reached. The paper
+tracker (`aureon_mt5/ema921_live.py`) runs the same guardian on paper positions, one closed bar at a time:
+- order: SL on the bar's low/high, TP, peak, then the bar-close lock / exit line / Friday flat;
+- output: the same 🔒 LOCK and CLOSED cards and `closed_by_rule` rows as live, with `paper: true`;
+- a test checks it matches the replay trade for trade.
+
+Paper positions persist in `logs/state_<SYMBOL>.json`, and block a new cross while open.
+
+**Drawdown guard** (`AUREON_MAX_DD_USD`): the equity peak is kept in `logs/state_<SYMBOL>.json`, so a restart never resets it to
+the current equity. In paper mode the equity is the account equity when paper trading started plus the paper P&L.
+
+**The week card** is posted after the Friday flat bar, once per week, and on `/week`. It shows trades, won, net points, $ at
+the traded lots, best / worst, the drawdown used vs `AUREON_MAX_DD_USD`, and the backtest reference (+11 pts / week, 58% of
+weeks positive).
+
+**Live vs the replay:**
+- **Friday flat:** live flattens at the close of the first Friday bar opening at or after 22:00 server. The replay uses the
+  last Friday bar in the data, which can be later; live can't trade after the market closes.
+- **Exit bar:** when the broker SL fills intrabar, live sees no position at that bar's close and can take a cross on the
+  same bar. The replay counts that bar as "in position".
+
+**First-class mode:** `/mode ema921`, `ops.write_mode`, the Claude snapshot EMA names (`ema9` / `ema21`), the alias docs. The
+`/alert` context uses the ema921 day / Friday / news rule; it raised `AttributeError` the same way ema9200 did.
 
 ## v2.15.0 — `ema9200`: you decide, Aureon executes
 

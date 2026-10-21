@@ -47,7 +47,7 @@ def _bar_s() -> int:
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 from .common.rules import RULES_PATH, read_rules   # v2.3.0: prompts/advisor_rules.md, shared with Codex
 KIND_TO_EVENT = {"P": "P", "cross": "CROSS", "reentry": "RE", "enter": "ENTER", "pullback": "ENTER", "no-pullback": "ENTER"}
-EMA_NAMES = {"ema5080": ("EMA 50", "EMA 80"), "ema2050": ("EMA 20", "EMA 50"), "ema9200": ("EMA 9", "EMA 200")}
+EMA_NAMES = {"ema5080": ("EMA 50", "EMA 80"), "ema2050": ("EMA 20", "EMA 50"), "ema9200": ("EMA 9", "EMA 200"), "ema921": ("EMA 9", "EMA 21")}
 TREND_PULLBACK = ("PULLBACK", "WEAKENING", "CHALLENGED")
 
 READ_RULES = ("OPERATOR READ (/claude-read): the operator asks what to do RIGHT NOW on the latest closed bar. Nothing you say is "
@@ -182,6 +182,8 @@ def build_snapshot(agent, event: str, side: str, bar_t: int, df, *, position: di
         snap["ema50"], snap["ema80"] = snap["ema_fast"], snap["ema_slow"]        # v1.10 names kept for the 50/80 prompt
     elif agent.S.name == "ema9200":
         snap["ema9"], snap["ema200"] = snap["ema_fast"], snap["ema_slow"]         # v2.15.0 (not EMA 20/50 labels)
+    elif agent.S.name == "ema921":
+        snap["ema9"], snap["ema21"] = snap["ema_fast"], snap["ema_slow"]          # v2.16.0
     else:
         snap["ema20"], snap["ema50"] = snap["ema_fast"], snap["ema_slow"]
     if position is not None:

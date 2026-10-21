@@ -244,6 +244,9 @@ class SymbolAgent(threading.Thread):
                 self._track_leg(df, bar_t, new_bar, sgn)
                 if self.g is not None:
                     self._guard(new_bar, bar_t, df, close, ef, es, sgn)
+                if self.S.name == "ema921" and new_bar:                        # v2.16.0: paper positions + the Friday week card
+                    self._paper_tick(bar_t, df)
+                    self._week_card_921(bar_t)
                 self._refresh_snapshot(True)
                 self._check_alerts(closed, df, bar_t)
                 self._check_misses()
@@ -1355,18 +1358,122 @@ class SymbolAgent(threading.Thread):
 
 
     # ------------------------------------------------------------------ EMA 9/21 (v2.16.0): the cross is the order
-    def _equity_dd_block(self) -> str | None:
-        """AUREON_MAX_DD_USD: once equity is that far below its running peak, no new auto entries (the funded-account rule, enforced here)."""
-        if not self.cfg.max_dd_usd or self.dry:
-            return None
+    def _state921(self) -> dict:
+        """logs/state_<symbol>.json — equity peak, paper positions, paper P&L (survives restarts)."""
+        if getattr(self, "_st921", None) is None:
+            from . import ema921_live as L
+            self._st921 = L.load_state(self.cfg.log_dir, self.symbol)
+            self._st921.setdefault("paper", [])
+        return self._st921
+
+    def _save921(self):
+        from . import ema921_live as L
         try:
-            a = broker.account(); eq = float(a["equity"])
+            L.save_state(self.cfg.log_dir, self.symbol, self._state921())
+        except OSError as e:
+            telemetry.info(f"{self.symbol} state_{self.symbol}.json write failed: {e!r}")
+
+    def _equity_921(self) -> float | None:
+        """Live: the account equity. Paper: the account equity when paper trading started + the paper P&L."""
+        st = self._state921()
+        if self.cfg.paper or self.dry:
+            if "paper_base_equity" not in st:
+                try:
+                    st["paper_base_equity"] = float(broker.account()["equity"])
+                except Exception:
+                    st["paper_base_equity"] = 0.0
+                self._save921()
+            return float(st["paper_base_equity"]) + float(st.get("paper_realized_usd", 0.0))
+        try:
+            return float(broker.account()["equity"])
         except Exception:
             return None
-        peak = max(float(self.health.get("equity_peak") or 0.0), eq); self.health["equity_peak"] = peak
-        if peak - eq >= self.cfg.max_dd_usd:
-            return f"drawdown guard: equity {eq:,.0f} is {peak - eq:,.0f} below peak {peak:,.0f} (limit {self.cfg.max_dd_usd:,.0f})"
-        return None
+
+    def _equity_dd_block(self) -> str | None:
+        """AUREON_MAX_DD_USD: once equity is that far below its running peak, no new auto entries (the funded-account rule, enforced here).
+        v2.16.0: the peak is persisted in logs/state_<symbol>.json, so a restart never resets it to the current equity."""
+        if not self.cfg.max_dd_usd or self.dry:
+            return None
+        eq = self._equity_921()
+        if eq is None:
+            return None
+        from . import ema921_live as L
+        st = self._state921(); before = st.get("equity_peak")
+        why, peak, _dd = L.dd_check(st, eq, self.cfg.max_dd_usd)
+        self.health["equity_peak"] = peak
+        if peak != before:
+            self._save921()
+        return why
+
+    def _paper_open(self) -> list:
+        return list(self._state921().get("paper") or [])
+
+    def _paper_tick(self, bar_t, df):
+        """v2.16.0 AUREON_PAPER=1: the same guardian on paper positions, one closed bar at a time (ema921_live.paper_step) — LOCK /
+        CLOSED cards and closed_by_rule rows like live, no broker calls."""
+        from . import ema921_live as L
+        st = self._state921(); open_ = st.get("paper") or []
+        if not open_:
+            return
+        r = self.S.rules_for(self.symbol); row = df.iloc[-1]
+        bar = {"time": int(row["time"]), "high": float(row["high"]), "low": float(row["low"]), "close": float(row["close"]),
+               "ema9": float(row["ema9"]), "ema200": float(row["ema200"]) if row["ema200"] == row["ema200"] else float(row["ema9"])}
+        keep = []
+        for pos in open_:
+            if int(pos["bar"]) >= int(bar_t):                     # entered at this bar's close: managed from the next bar
+                keep.append(pos); continue
+            out = L.paper_step(pos, bar, r)
+            s = 1 if pos["side"] == "LONG" else -1; side = pos["side"].lower(); tag = f"paper {pos['id']}"
+            if out and (out["event"] == "lock" or out.get("locked_now")):
+                lock_px = pos["entry"] + s * r.lock_to
+                self.journal.log("locked", symbol=self.symbol, mode=self.S.name, ticket=pos["id"], sl=lock_px, peak=pos["peak"], paper=True)
+                self.notify.send(self.key("LOCK", pos["id"]), ctitle(self.symbol, f"🔒 +{r.lock_at:g} seen → floor +{r.lock_to:g} · PAPER", side),
+                                 [f"paper SL → {lock_px:.2f} · peak +{pos['peak']:.1f}"], color=EVENT_COLOURS["info"],
+                                 footer=cfooter(self.S.display_name, tag), event="LOCK")
+            if not out or out["event"] != "close":
+                keep.append(pos); continue
+            pts = round(float(out["points"]), 2); usd = pts * pos["lots"] * L.USD_PER_POINT_PER_LOT
+            st["paper_realized_usd"] = round(float(st.get("paper_realized_usd", 0.0)) + usd, 2)
+            why = {"stop": f"stop −{r.stop:g}", "locked": f"lock +{r.lock_to:g} hit", "tp": f"TP +{r.tp:g}",
+                   "lock_close": f"+{r.lock_at:g} seen, closed below +{r.lock_to:g}", "friday_flat": "Friday flat",
+                   "ema_close": f"close through {str(out.get('line', 'ema9')).upper()}"}.get(out["reason"], out["reason"])
+            self.journal.log("closed_by_rule", symbol=self.symbol, mode=self.S.name, ticket=pos["id"], reason=out["reason"], points=pts,
+                             peak=pos["peak"], lots=pos["lots"], price=out["price"], paper=True)
+            self.notify.send(self.key("CLOSED", f"{pos['id']}-paper"), ctitle(self.symbol, f"CLOSED {pos['side']} {pts:+.1f} · {why} · PAPER", side),
+                             [f"entry {pos['entry']:.2f} → {out['price']:.2f} · peak +{pos['peak']:.1f} · worst −{pos.get('mae', 0.0):.1f} · "
+                              f"${usd:+,.0f} at {pos['lots']:g} lots"],
+                             color=EVENT_COLOURS["closed_win" if pts > 0 else "closed_loss"], footer=cfooter(self.S.display_name, tag),
+                             event="CLOSED" if pts > 0 else "STOP", points=pts)
+        st["paper"] = keep
+        self._save921()
+
+    def week_921(self, now=None, *, post: bool = False) -> list[str]:
+        """The ema921 week: trades, won, net pts, $, best / worst, drawdown used vs AUREON_MAX_DD_USD, the backtest reference."""
+        from . import ema921_live as L
+        now = now or datetime.now(timezone.utc); paper = bool(self.cfg.paper or self.dry)
+        since = L.week_start(now).timestamp()
+        trades = L.closed_trades(self.journal.read(int(since)), self.symbol, since=since, paper=paper, default_lots=self.cfg.max_lots)
+        st = self._state921(); eq = self._equity_921()
+        dd = (max(0.0, float(st.get("equity_peak") or eq) - eq)) if eq is not None else None
+        lines = L.week_text(L.week_summary(trades), dd=dd, limit=float(self.cfg.max_dd_usd or 0), paper=paper)
+        if post:
+            self.notify.card(f"AUREON · MT5 · {self.symbol} · WEEK · {self.S.display_name}{' · PAPER' if paper else ''}", "\n".join(lines),
+                             footer=f"{self.S.display_name} · week of {L.week_start(now):%d %b}")
+        return lines
+
+    def _week_card_921(self, bar_t):
+        """Friday, after the flat bar: the week card once per ISO week (logged in state_<symbol>.json)."""
+        from .strategies.ema921.journeys import friday_last_bar
+        if not friday_last_bar(int(bar_t), self.S.rules_for(self.symbol)):
+            return
+        wk = datetime.now(timezone.utc).strftime("%G-W%V"); st = self._state921()
+        if st.get("week_sent") == wk:
+            return
+        st["week_sent"] = wk; self._save921()
+        try:
+            self.week_921(post=True)
+        except Exception as e:
+            telemetry.info(f"{self.symbol} week card failed: {e!r}")
 
     def _detect_921(self, res, df, bar_t, close, ef, es):
         last = len(df) - 1; off = self.off; g = self.g; r = res.get("rules"); bk = bar_key(bar_t, off)
@@ -1401,8 +1508,8 @@ class SymbolAgent(threading.Thread):
                              gap=info["gap"], dist200=info["dist200"], last3=info["last3"], spread_pts=self._spread_pts())
             lots = (self._suggested(r.stop) or {}).get("lots") or self.cfg.max_lots
             why = None
-            if broker.positions(self.symbol):
-                why = "already in a position"
+            if broker.positions(self.symbol) or ((self.cfg.paper or self.dry) and self._paper_open()):
+                why = "already in a position" + (" (paper)" if not broker.positions(self.symbol) else "")
             elif not self.cfg.auto_mode:
                 why = "AUREON_AUTO is off — signal only"
             else:
@@ -1412,7 +1519,9 @@ class SymbolAgent(threading.Thread):
                 if self.cfg.paper or self.dry:
                     placed = broker.BrokerResult(True, "PAPER", changed=False, price=close, ticket=None, volume=lots)
                     self.journal.log("paper_fill", symbol=self.symbol, mode=self.S.name, side=side, lots=lots, price=close, sl=sl, tp=tp, bar=bar_t)
-                    self._paper = getattr(self, "_paper", []) + [{"side": side, "entry": close, "lots": lots, "sl": sl, "tp": tp, "bar": bar_t, "peak": 0.0}]
+                    from . import ema921_live as _L
+                    st921 = self._state921(); st921["paper"] = list(st921.get("paper") or []) + [_L.new_paper(side, close, lots, sl, tp, bar_t)]
+                    self._save921()
                 elif self.cfg.execution_enabled and (broker.is_demo() or self.cfg.allow_live):
                     placed = broker.place_market(self.symbol, side, lots, sl, comment="aureon 921", tp=tp)
                     self.journal.decision("order_placed", actor="agent", rationale="ema921 cross", symbol=self.symbol, mode=self.S.name, side=side,
@@ -1442,35 +1551,41 @@ class SymbolAgent(threading.Thread):
                 adv.request_entry(self, "enter", side, bar_t, df, card_key=self.key(f"ENTER_{side}", bk), png=png)
 
     def _guard_921(self, p, st, s, new_bar, bar_t, df, close):
-        """Lock at +lock_at → broker SL to entry + lock_to · exit on the first bar CLOSING through the exit line (EMA 9, or EMA 200
-        after the lock in e9>e200 mode) · Friday flat. The broker SL/TP placed at entry handle everything else."""
+        """Broker SL −stop / TP from the order handle the intrabar exits. At each bar CLOSE (journeys.on_bar_close, the replay's
+        order): +lock_at printed → SL to entry + lock_to, or out at the close if the bar closed below it (never intrabar) · the
+        first close through the exit line (EMA 9, or EMA 200 after the lock in e9>e200) · the Friday flat bar."""
+        from .strategies.ema921.journeys import exit_line, friday_last_bar, on_bar_close
         r = self.S.rules_for(self.symbol); e = p["price_open"]; pts = p["points"]; st["peak"] = max(st.get("peak", 0.0), pts)
-        st["last_points"] = pts; st.setdefault("entry", e); st.setdefault("direction", p["direction"])
+        st["last_points"] = pts; st.setdefault("entry", e); st.setdefault("direction", p["direction"]); st["lots"] = p.get("volume")
+        if not st.get("locked") and float(st.get("secured", 0.0)) >= r.lock_to - 1e-6:
+            st["locked"] = True                                              # after a restart: the live SL is already at the lock
+        if not new_bar:
+            return
         lock_px = e + s * r.lock_to
-        if st["peak"] >= r.lock_at and not st.get("locked"):
+        line = exit_line(r, st["peak"]); lv = float(df[line].iloc[-1]); c = float(df["close"].iloc[-1])
+        against = (c < lv) if s > 0 else (c > lv)
+        lock, why, st["against_run"] = on_bar_close(r, peak=st["peak"], locked=bool(st.get("locked")), close_pts=(c - e) * s,
+                                                    against=against, run=int(st.get("against_run", 0)),
+                                                    friday_last=friday_last_bar(int(bar_t), r))
+        if lock and not why:
             rr = broker.set_sl(p["ticket"], self.symbol, lock_px) if not self.dry else broker.BrokerResult(True, "DRY", changed=True)
             if rr.ok:
                 st["locked"] = True; st["secured"] = r.lock_to
                 self.journal.log("locked", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], sl=lock_px, peak=st["peak"])
                 self.notify.send(self.key("LOCK", p["ticket"]), ctitle(self.symbol, f"🔒 +{r.lock_at:g} seen → floor +{r.lock_to:g}", p["direction"]),
-                                 [f"SL moved to {lock_px:.2f} · peak +{st['peak']:.1f}"], color=EVENT_COLOURS["info"],
+                                 [f"SL moved to {lock_px:.2f} · peak +{st['peak']:.1f} · armed at the bar close"], color=EVENT_COLOURS["info"],
                                  footer=cfooter(self.S.display_name, f"#{p['ticket']}"), event="LOCK")
-        if not new_bar:
-            return
-        from .strategies.ema921.journeys import exit_line, server_weekday
-        line = exit_line(r, st["peak"]); lv = float(df[line].iloc[-1]); c = float(df["close"].iloc[-1])
-        against = (c < lv) if s > 0 else (c > lv)
-        st["against_run"] = st.get("against_run", 0) + 1 if against else 0
-        friday_last = r.friday_flat and server_weekday(int(bar_t)) == 4 and (bar_t % 86400) / 3600 >= 22.0
-        if st["against_run"] >= r.n_close or friday_last:
-            why = f"close through {line.upper()}" if not friday_last else "Friday flat"
+        if why:
+            label = {"lock_close": f"+{r.lock_at:g} seen, closed below +{r.lock_to:g}", "friday_flat": "Friday flat",
+                     "ema_close": f"close through {line.upper()}"}[why]
             rr = broker.close(p["ticket"], self.symbol, "aureon 921") if not self.dry else broker.BrokerResult(True, "DRY", changed=True)
             if rr.ok:
                 self.closed_by_aureon.add(p["ticket"])
-                self.journal.log("closed_by_rule", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], reason=why, points=pts, peak=st["peak"])
-                self.notify.send(self.key("CLOSED", f"{p['ticket']}-rule"), ctitle(self.symbol, f"CLOSED {p['direction'].upper()} {pts:+.1f} · {why}", p["direction"]),
+                self.journal.log("closed_by_rule", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], reason=why, points=pts,
+                                 peak=st["peak"], lots=p.get("volume"))
+                self.notify.send(self.key("CLOSED", f"{p['ticket']}-rule"), ctitle(self.symbol, f"CLOSED {p['direction'].upper()} {pts:+.1f} · {label}", p["direction"]),
                                  [f"entry {e:.2f} → {c:.2f} · peak +{st['peak']:.1f} · worst −{max(0.0, -min(st.get('mae', 0.0), 0.0)):.1f}"],
-                                 color=EVENT_COLOURS["closed_win" if pts > 0 else "closed_loss"], footer=cfooter(self.S.display_name, why),
+                                 color=EVENT_COLOURS["closed_win" if pts > 0 else "closed_loss"], footer=cfooter(self.S.display_name, label),
                                  event="CLOSED" if pts > 0 else "STOP", points=pts)
 
     # ------------------------------------------------------------------ guardian helpers
@@ -2245,10 +2360,20 @@ class SymbolAgent(threading.Thread):
                 final, approx = self._final_points(t, st)             # v1.11.0: for the weekly compare (measurement only)
                 follow_stop = (st.get("guardian_profile") == "follow" and t not in self.closed_by_aureon
                                and self._follow_stopped(st, final))
+                sl921 = st.get("guardian_profile") == "ema921" and t not in self.closed_by_aureon     # v2.16.0: broker SL / lock
+                why921 = ("locked" if (st.get("locked") or float(st.get("secured") or 0) > 0) else "stop") if sl921 else None
                 self.journal.log("closed", symbol=self.symbol, mode=self.S.name, ticket=t, direction=st.get("direction"),
                                  entry=st.get("entry"), secured=st.get("secured"), peak=st.get("peak"),
                                  final_points=final, final_approx=approx, alert_id=st.get("alert_id"),
-                                 **({"reason": "stop", "profile": "follow", "lock_level": st.get("secured", 0.0)} if follow_stop else {}))
+                                 **({"reason": "stop", "profile": "follow", "lock_level": st.get("secured", 0.0)} if follow_stop else {}),
+                                 **({"reason": why921, "profile": "ema921", "lots": st.get("lots")} if sl921 else {}))
+                if sl921:
+                    self.notify.send(self.key("CLOSED", f"{t}-sl"), ctitle(self.symbol, f"CLOSED {(st.get('direction') or '').upper()} {(final or 0):+.1f} · "
+                                                                             f"{'lock' if why921 == 'locked' else 'stop'} (broker SL)", st.get("direction")),
+                                     [f"entry {st.get('entry', 0):.2f} · peak +{st.get('peak', 0):.1f}"],
+                                     color=EVENT_COLOURS["closed_win" if (final or 0) > 0 else "closed_loss"],
+                                     footer=cfooter(self.S.display_name, "broker SL"), event="CLOSED" if (final or 0) > 0 else "STOP", points=final)
+                    self.closed_by_aureon.add(t)
                 if follow_stop:                                # v2.13.0: the follow profile's only exit — no "why?" ask
                     self.notify.send(self.key("CLOSED", f"{t}-stop"), ctitle(self.symbol, f"STOPPED {'+' if (final or 0) >= 0 else ''}{(final or 0):.1f}",
                                                                               st.get("direction")),

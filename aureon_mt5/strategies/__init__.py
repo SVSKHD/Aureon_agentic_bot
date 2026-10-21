@@ -2,7 +2,7 @@
 
     get_strategy("ema5080")   -> Strategy
     available()               -> ["ema5080", "ema2050", "ema9200"] (installed ones)
-Aliases: 5080 -> ema5080, 2050 -> ema2050, 9200 -> ema9200.
+Aliases: 5080 -> ema5080, 2050 -> ema2050, 9200 -> ema9200, 921 -> ema921.
 """
 from __future__ import annotations
 

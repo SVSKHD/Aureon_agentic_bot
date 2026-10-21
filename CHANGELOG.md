@@ -2,6 +2,26 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.16.0 — 2026-10-21  (MINOR: new mode ema921; defaults unchanged)
+- **`ema921` mode** (the supplied patch): EMA 9/21 on M30, mechanical.
+  - Every cross is a market order at the bar close, with broker SL −30.
+  - +20 → SL +15; exit on the first close through EMA 9 (`e9>e200`: EMA 200 after +20); Friday flat.
+  - Drawdown guard (`AUREON_MAX_DD_USD`) and paper mode (`AUREON_PAPER`).
+  - `tools/replay_921.py`; `broker.place_market(tp=)`.
+- **Review fixes:**
+  - **The lock arms at the bar close only.** `_guard_921` moved the SL as soon as a live tick showed +20. It now uses
+    `journeys.on_bar_close`, the replay's order: lock at the close, or out at the close below +15.
+  - **The lock is rebuilt from the live SL after a restart.**
+  - **A broker SL or lock exit posts a CLOSED card**, not "CLOSED BY YOU — why?".
+- **Paper tracker** (`aureon_mt5/ema921_live.py`): the same guardian on paper positions, with LOCK / CLOSED cards and
+  `closed_by_rule` rows. A paper position blocks new crosses. The tracker matches the replay trade for trade.
+- **Drawdown guard:** the equity peak persists in `logs/state_<SYMBOL>.json`; paper mode uses the paper equity.
+- **Week card** after the Friday flat bar, and **`/week`**.
+- **Mode enumerations:** `/mode`, `ops.write_mode`, `EMA_NAMES` / snapshot keys, `/alert` guardian context (was an
+  `AttributeError`), aliases.
+- Tests: `tests/test_v2160_ema921.py` (27).
+- Strategy rules changed: NO for ema5080 / ema2050 / ema9200 — new rules only under AUREON_MODE=ema921
+
 ## v2.15.0 — 2026-10-20  (MINOR: new mode ema9200; restart pre-flight; defaults unchanged)
 - **`ema9200` mode** (EMA 9/200 on M30, `aureon_mt5/strategies/ema9200/`):
   - candidates (pullback to EMA 9 with the bias, or a momentum bar) are offered as TAKE / SKIP and never auto-taken;

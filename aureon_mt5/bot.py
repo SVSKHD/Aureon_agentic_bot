@@ -268,6 +268,7 @@ HELP = {
     },
     "Reports": {
         "report": "Weekly trade summary — automatic",
+        "week": "ema921 week so far: trades, won, net, $, best / worst, drawdown used — read-only",
         "compare": "Detector, Claude, Codex, trader outcomes — automatic",
         "advisor-report": "Claude and Codex performance, head-to-head — historical, read-only",
         "compare-breakdown": "Compare by signal/session — automatic",
@@ -1594,6 +1595,16 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             return Reply(content="✅ unhalted — entries allowed again")
         await run(inter, "unhalt", work)
 
+    @tree.command(name="week", description="ema921: this week's trades, net, $, best / worst, drawdown used vs the limit")
+    async def week_cmd(inter: discord.Interaction):
+        def work():
+            out = []
+            for sym, ag in agents.items():
+                if getattr(ag.S, "name", "") == "ema921" and hasattr(ag, "week_921"):
+                    out.append(f"**{sym} · {ag.S.display_name}**\n" + "\n".join(ag.week_921()))
+            return Reply(content="\n\n".join(out) if out else "/week is the ema921 week card — this process runs another mode")
+        await run(inter, "week", work)
+
     @tree.command(name="governor", description="Show risk governor rules and current values")
     async def governor_cmd(inter: discord.Interaction):
         def work():
@@ -2086,13 +2097,13 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
         await run(inter, "restart", work)
 
     @tree.command(name="mode", description="Admin: change EMA process mode and restart; rejects open positions")
-    @app_commands.describe(mode="ema2050, ema5080 or ema9200", symbols="Comma-separated symbols; blank preserves existing", force="Override open-position gate (unsafe)")
+    @app_commands.describe(mode="ema2050, ema5080, ema9200 or ema921", symbols="Comma-separated symbols; blank preserves existing", force="Override open-position gate (unsafe)")
     async def mode_cmd(inter: discord.Interaction, mode: str, symbols: str = "", force: bool = False):
         def work():
             if not ops.admin_allowed(inter.user, os.environ.get("AUREON_ADMIN_ROLE_ID", "")):
                 return Reply(content="Denied: configured administrator role required")
-            if mode not in ("ema2050", "ema5080", "ema9200"):
-                return Reply(content="Unsupported mode; use ema2050, ema5080 or ema9200")
+            if mode not in ("ema2050", "ema5080", "ema9200", "ema921"):
+                return Reply(content="Unsupported mode; use ema2050, ema5080, ema9200 or ema921")
             if not force and ops.positions_block_mode_change(agents):
                 return Reply(content="position open or position status unverified — /mode after it closes or pass force:true\n"
                                      + profile_warning(cfg, agents))
