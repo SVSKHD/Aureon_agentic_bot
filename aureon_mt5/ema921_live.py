@@ -56,8 +56,11 @@ def dd_check(st: dict, equity: float, limit: float) -> tuple[str | None, float, 
 
 # ----------------------------------------------------------------------------- paper tracker
 def new_paper(side: str, entry: float, lots: float, sl: float, tp: float | None, bar: int) -> dict:
-    return {"id": f"P{int(bar)}", "side": side, "entry": float(entry), "lots": float(lots), "sl": float(sl),
-            "tp": (float(tp) if tp else None), "bar": int(bar), "peak": 0.0, "mae": 0.0, "locked": False, "run": 0}
+    s = 1 if side == "LONG" else -1
+    return {"id": f"P{int(bar)}", "side": side, "entry": float(entry), "lots": float(lots), "sl": float(sl or 0.0),
+            "tp": (float(tp) if tp else None), "bar": int(bar), "peak": 0.0, "mae": 0.0, "locked": False, "run": 0,
+            # v2.16.1: the position's own SL / TP in points (a /place with sl= / tp=); None = the mode's rule
+            "sl_pts": ((float(sl) - float(entry)) * s) if sl else None, "tp_pts": ((float(tp) - float(entry)) * s) if tp else None}
 
 
 def paper_step(pos: dict, bar: dict, rules) -> dict | None:
@@ -67,11 +70,13 @@ def paper_step(pos: dict, bar: dict, rules) -> dict | None:
     s = 1 if pos["side"] == "LONG" else -1; e = pos["entry"]
     hi = (bar["high"] - e) if s > 0 else (e - bar["low"]); lo = (bar["low"] - e) if s > 0 else (e - bar["high"])
     pos["mae"] = max(pos.get("mae", 0.0), -lo)
-    sl_pts = rules.lock_to if pos.get("locked") else -rules.stop
+    base = pos.get("sl_pts") if pos.get("sl_pts") is not None else -rules.stop
+    sl_pts = max(base, rules.lock_to) if pos.get("locked") else base          # the lock only ever tightens a manual SL
     if lo <= sl_pts:
-        return {"event": "close", "reason": "locked" if pos.get("locked") else "stop", "points": sl_pts, "price": e + s * sl_pts}
-    if rules.tp and hi >= rules.tp:
-        return {"event": "close", "reason": "tp", "points": rules.tp, "price": e + s * rules.tp}
+        return {"event": "close", "reason": "locked" if sl_pts > 0 else "stop", "points": sl_pts, "price": e + s * sl_pts}
+    tp_pts = pos.get("tp_pts") if pos.get("tp_pts") is not None else (rules.tp or None)
+    if tp_pts and hi >= tp_pts:
+        return {"event": "close", "reason": "tp", "points": tp_pts, "price": e + s * tp_pts}
     pos["peak"] = max(pos.get("peak", 0.0), hi)
     c = float(bar["close"]); cpts = (c - e) * s
     line = J.exit_line(rules, pos["peak"]); lv = float(bar[line])

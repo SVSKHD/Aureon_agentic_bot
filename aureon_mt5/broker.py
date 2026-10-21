@@ -34,6 +34,8 @@ class BrokerResult:
     ticket: int | None = None        # v2.0.2 place_market: the position / order ticket
     price: float | None = None       # v2.0.2 place_market: the fill price
     volume: float | None = None
+    fill_mode: str | None = None     # v2.16.1: the filling type the order went through (ioc | fok | return)
+    tp: float | None = None          # v2.16.1 modify_sltp: the TP as sent
 
     def __bool__(self):
         return self.ok
@@ -196,6 +198,78 @@ def set_sl(ticket: int, symbol: str, sl: float, *, allow_loosen: bool = False) -
                         last_error="" if ok else _err(), existing_sl=p.sl, requested_sl=sl, bid=bid, ask=ask)
 
 
+# ----------------------------------------------------------------------------- v2.16.1 filling type (AUREON_FILLING)
+FILL_ORDER = ("ioc", "fok", "return")
+FILLING = {"mode": "ioc"}
+INVALID_FILL = 10030                  # TRADE_RETCODE_INVALID_FILL: the symbol does not accept this filling type
+
+
+def configure_filling(mode: str | None) -> str:
+    mode = str(mode or "ioc").strip().lower()
+    FILLING["mode"] = mode if mode in FILL_ORDER else "ioc"
+    return FILLING["mode"]
+
+
+def fill_sequence(first: str | None = None) -> list[str]:
+    """The configured type first, then the other two in FILL_ORDER (ioc → fok → return)."""
+    first = first if first in FILL_ORDER else FILLING["mode"]
+    return [first] + [x for x in FILL_ORDER if x != first]
+
+
+def _fill_const(m, name: str) -> int:
+    return {"fok": getattr(m, "ORDER_FILLING_FOK", 0), "ioc": getattr(m, "ORDER_FILLING_IOC", 1),
+            "return": getattr(m, "ORDER_FILLING_RETURN", 2)}[name]
+
+
+def _send_filled(m, req: dict) -> tuple:
+    """order_send with the configured filling type; on TRADE_RETCODE_INVALID_FILL only, the next type. (result, type used)."""
+    bad = getattr(m, "TRADE_RETCODE_INVALID_FILL", INVALID_FILL); r = None; used = None
+    for name in fill_sequence():
+        req["type_filling"] = _fill_const(m, name); used = name
+        r = m.order_send(req)
+        if r is None or getattr(r, "retcode", None) != bad:
+            break
+    return r, used
+
+
+def filling_supported(symbol: str) -> dict | None:
+    """{ioc, fok, return} from symbol_info.filling_mode (bit 1 = FOK, bit 2 = IOC); RETURN is refused on market execution.
+    None without MT5."""
+    m = mt5()
+    if not m:
+        return None
+    try:
+        with _lock:
+            info = m.symbol_info(symbol)
+        flags = int(getattr(info, "filling_mode", 0) or 0)
+        exe = getattr(info, "trade_exemode", None)
+        market = exe is not None and exe == getattr(m, "SYMBOL_TRADE_EXECUTION_MARKET", 2)
+        return {"fok": bool(flags & 1), "ioc": bool(flags & 2), "return": not market}
+    except Exception:
+        return None
+
+
+def modify_sltp(ticket: int, symbol: str, sl: float | None, tp: float | None) -> BrokerResult:
+    """v2.16.1 /sl /tp: ONE TRADE_ACTION_SLTP carrying BOTH values — MT5 overwrites both, so the caller passes the current
+    value of the one it is not changing. sl / tp None or 0 = none. No loosen check here: the caller decides (/sl force)."""
+    m = mt5()
+    if not m:
+        return BrokerResult(False, "NO_CONNECTION", comment="no MT5")
+    with _lock:
+        pos = m.positions_get(ticket=ticket)
+        if not pos:
+            return BrokerResult(False, "POSITION_NOT_FOUND", comment="position not found")
+        p = pos[0]; d = digits(symbol)
+        req = {"action": m.TRADE_ACTION_SLTP, "position": ticket, "symbol": symbol,
+               "sl": round(float(sl), d) if sl else 0.0, "tp": round(float(tp), d) if tp else 0.0}
+        r = m.order_send(req)
+    if r is None:
+        return BrokerResult(False, "BROKER_REJECTED", comment="order_send returned None", last_error=_err(), existing_sl=p.sl)
+    ok = r.retcode == m.TRADE_RETCODE_DONE
+    return BrokerResult(ok, "SLTP_CHANGED" if ok else "BROKER_REJECTED", changed=ok, retcode=r.retcode, comment=getattr(r, "comment", ""),
+                        last_error="" if ok else _err(), existing_sl=p.sl, requested_sl=req["sl"], tp=req["tp"])
+
+
 def close(ticket: int, symbol: str, comment: str = "aureon") -> BrokerResult:
     m = mt5()
     if not m:
@@ -208,15 +282,13 @@ def close(ticket: int, symbol: str, comment: str = "aureon") -> BrokerResult:
         is_buy = p.type == m.POSITION_TYPE_BUY
         req = {"action": m.TRADE_ACTION_DEAL, "position": ticket, "symbol": symbol, "volume": p.volume,
                "type": m.ORDER_TYPE_SELL if is_buy else m.ORDER_TYPE_BUY, "price": tick.bid if is_buy else tick.ask,
-               "deviation": 30, "comment": comment[:31], "type_filling": m.ORDER_FILLING_IOC}
-        r = m.order_send(req)
-        if r is not None and r.retcode != m.TRADE_RETCODE_DONE:
-            req["type_filling"] = m.ORDER_FILLING_FOK; r = m.order_send(req)
+               "deviation": 30, "comment": comment[:31]}
+        r, used = _send_filled(m, req)                     # v2.16.1: AUREON_FILLING, fallback on INVALID_FILL only
     if r is None:
         return BrokerResult(False, "BROKER_REJECTED", comment="order_send returned None", last_error=_err())
     ok = r.retcode == m.TRADE_RETCODE_DONE
     return BrokerResult(ok, "CLOSED" if ok else "BROKER_REJECTED", changed=ok, retcode=r.retcode, comment=getattr(r, "comment", ""),
-                        last_error="" if ok else _err(), bid=tick.bid if tick else None, ask=tick.ask if tick else None)
+                        last_error="" if ok else _err(), bid=tick.bid if tick else None, ask=tick.ask if tick else None, fill_mode=used)
 
 
 def tick(symbol: str) -> dict | None:
@@ -271,7 +343,7 @@ def place_market(symbol: str, side: str, lots: float, sl: float | None = None, c
     if not m:
         return BrokerResult(False, "NO_CONNECTION", comment="no MT5")
     is_buy = side.upper() in ("LONG", "BUY")
-    attempts = 0; r = None; t = None
+    attempts = 0; r = None; t = None; used = None
     while attempts < 2:
         attempts += 1
         with _lock:
@@ -281,14 +353,12 @@ def place_market(symbol: str, side: str, lots: float, sl: float | None = None, c
                 return BrokerResult(False, "BROKER_REJECTED", comment="no tick", last_error=_err())
             req = {"action": m.TRADE_ACTION_DEAL, "symbol": symbol, "volume": float(lots),
                    "type": m.ORDER_TYPE_BUY if is_buy else m.ORDER_TYPE_SELL, "price": t.ask if is_buy else t.bid,
-                   "deviation": 30, "comment": comment[:31], "type_filling": m.ORDER_FILLING_IOC}
+                   "deviation": 30, "comment": comment[:31]}
             if sl is not None:
                 req["sl"] = round(float(sl), digits(symbol))
             if tp is not None:                                   # v2.16.0: broker-side take-profit (ema921 cap)
                 req["tp"] = round(float(tp), digits(symbol))
-            r = m.order_send(req)
-            if r is not None and r.retcode != m.TRADE_RETCODE_DONE and not _is_requote(r):
-                req["type_filling"] = m.ORDER_FILLING_FOK; r = m.order_send(req)
+            r, used = _send_filled(m, req)                 # v2.16.1: AUREON_FILLING first, the others only on INVALID_FILL
         if r is not None and r.retcode == m.TRADE_RETCODE_DONE:
             break
         if _is_requote(r) and attempts < 2:
@@ -301,7 +371,8 @@ def place_market(symbol: str, side: str, lots: float, sl: float | None = None, c
     price = getattr(r, "price", None)
     return BrokerResult(ok, "PLACED" if ok else "BROKER_REJECTED", changed=ok, retcode=r.retcode, comment=getattr(r, "comment", ""),
                         last_error="" if ok else _err(), requested_sl=sl, bid=t.bid, ask=t.ask,
-                        ticket=int(ticket) if ticket else None, price=float(price) if price else None, volume=float(getattr(r, "volume", lots) or lots))
+                        ticket=int(ticket) if ticket else None, price=float(price) if price else None, volume=float(getattr(r, "volume", lots) or lots),
+                        fill_mode=used)
 
 
 def spread(symbol: str) -> float | None:

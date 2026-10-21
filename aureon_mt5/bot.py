@@ -207,6 +207,9 @@ HELP = {
         "take": "Accept pending ask — user places order unless AUREON_EXECUTION=1",
         "skip": "Reject pending ask — user action",
         "close": "Close the open position on a symbol now — same path as the phone's CLOSE (execution on)",
+        "place": "Manual order with the mode's SL/TP: /place long|short [lots] [sl] [tp] — same gate as auto entries",
+        "sl": "Move the open position's SL: /sl -20 · /sl +15 · /sl 2450.5 (pts from entry ≤ 200, else a price)",
+        "tp": "Set / remove the TP: /tp +60 · /tp 2500 · /tp off",
         "alert": "Arm price watch — user chooses price; bot monitors",
         "alerts": "Show armed watches — automatic",
         "alert-cancel": "Cancel one alert — user action",
@@ -820,7 +823,7 @@ def execute_entry(cfg, agents, journal, item: dict, side: str, user, notify=None
         _actor = "agent" if str(user) == "agent" else "human"
         journal.decision("order_placed", actor=_actor, rationale="agent entry" if _actor == "agent" else "button press",
                          symbol=sym, mode=m.get("mode"), alert_id=aid, side=side, lots=lots_chosen, sl=sl, ok=bool(r.ok),
-                         status=r.status, retcode=r.retcode, ticket=r.ticket, fill=r.price, by=str(user),
+                         status=r.status, retcode=r.retcode, ticket=r.ticket, fill=r.price, by=str(user), fill_mode=r.fill_mode,
                          lots_chosen=lots_chosen, lots_suggested=lots_suggested, lots_source=lots_source, half_size=half_size,
                          slippage_pts=round(slip, 2) if slip is not None else None, spread_pts=spread_at_fill, card_price=card_px)
         if ag is not None: ag.attach_alert(aid, side, card_key=card_key)
@@ -1354,6 +1357,53 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
                 notify.card("✋ CLOSED BY COMMAND", r["text"], footer=f"by {user} · {datetime.now(IST):%H:%M} IST")
             return Reply(content=("✅ " if r["ok"] else "⛔ ") + r["text"])
         await run(inter, "close", work)
+
+    # ------------------------------------------------------------------ v2.16.1 manual orders (every mode)
+    from . import manual as _manual
+
+    def _agent_for(symbol: str):
+        sym = (symbol or "").strip().upper() or cfg.symbols[0]
+        return sym, agents.get(sym)
+
+    @tree.command(name="place", description="Manual order with the mode's SL/TP (pts ≤ 200 from entry, else a price) — same gate as auto")
+    @app_commands.describe(side="long or short", lots="lots (default: the mode's risk size, capped at AUREON_MAX_LOTS)",
+                           sl="SL: points from entry (≤ 200) or a price; default the mode's stop",
+                           tp="TP: points or a price; default the mode's (ema921: none); 'off' = none", symbol="default: primary")
+    async def place_cmd(inter: discord.Interaction, side: str, lots: float | None = None, sl: str = "", tp: str = "", symbol: str = ""):
+        user = inter.user
+        def work():
+            if side.strip().lower() not in ("long", "short", "buy", "sell"):
+                return Reply(content="⛔ side must be long or short")
+            sym, ag = _agent_for(symbol)
+            if ag is None:
+                return Reply(content=f"⛔ no agent for {sym}")
+            res = _manual.place(cfg, agents, journal, ag, "LONG" if side.strip().lower() in ("long", "buy") else "SHORT",
+                                lots=lots, sl_raw=(sl or None), tp_raw=(tp or None), user=user)
+            return Reply(content=res["text"], card=res["card"])
+        await run(inter, "place", work)
+
+    @tree.command(name="sl", description="Move the SL: -20 / +15 (pts from entry, trade's side) or a price; force to loosen a lock")
+    @app_commands.describe(value="-20 · +15 · 2450.5", ticket="when more than one position is open", force="allow loosening a locked SL",
+                           symbol="default: primary")
+    async def sl_cmd(inter: discord.Interaction, value: str, ticket: int = 0, force: bool = False, symbol: str = ""):
+        user = inter.user
+        def work():
+            sym, ag = _agent_for(symbol)
+            if ag is None:
+                return Reply(content=f"⛔ no agent for {sym}")
+            return Reply(content=_manual.modify(cfg, journal, ag, "sl", value, ticket=ticket or None, force=force, user=user)["text"])
+        await run(inter, "sl", work)
+
+    @tree.command(name="tp", description="Set the TP: +60 (pts from entry) or a price · off removes it")
+    @app_commands.describe(value="+60 · 2500 · off", ticket="when more than one position is open", symbol="default: primary")
+    async def tp_cmd(inter: discord.Interaction, value: str, ticket: int = 0, symbol: str = ""):
+        user = inter.user
+        def work():
+            sym, ag = _agent_for(symbol)
+            if ag is None:
+                return Reply(content=f"⛔ no agent for {sym}")
+            return Reply(content=_manual.modify(cfg, journal, ag, "tp", value, ticket=ticket or None, user=user)["text"])
+        await run(inter, "tp", work)
 
     @tree.command(name="override", description="Override a missed setup — places the order at the current price")
     @app_commands.describe(symbol="Symbol (default: first)", lots="Lot size")

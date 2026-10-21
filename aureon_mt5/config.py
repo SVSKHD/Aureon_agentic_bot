@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from dotenv import load_dotenv
 load_dotenv()   # load .env if present
 
-VERSION = "2.16.0"
+VERSION = "2.16.1"
 
 
 def _parse_lot_buttons(raw: str) -> list[float]:
@@ -80,6 +80,7 @@ class Config:
     paper: bool = os.environ.get("AUREON_PAPER", "0") == "1"                    # v2.16.0: real feed, real cards, fills only journaled
     max_dd_usd: float = _num("AUREON_MAX_DD_USD", "0", float)                   # v2.16.0: no new auto entries once equity is this far below its peak (0 = off)
     allow_live: bool = os.environ.get("AUREON_ALLOW_LIVE", "0") == "1"
+    filling: str = os.environ.get("AUREON_FILLING", "ioc").strip().lower()      # v2.16.1: ioc | fok | return (fallback on 10030)
     max_lots: float = _num("AUREON_MAX_LOTS", "1.0", float)
     lot_buttons: list[float] = field(default_factory=lambda: _parse_lot_buttons(os.environ.get("AUREON_LOT_BUTTONS", "0.5,1.0,1.5")))
     # AUREON-012 partial close at secure (0 = off)

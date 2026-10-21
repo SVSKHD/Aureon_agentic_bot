@@ -1,4 +1,4 @@
-# Aureon MT5 v2.16.0
+# Aureon MT5 v2.16.1
 
 You place the trade. Aureon detects (per selected EMA mode), fires a Discord gunshot, then manages what you placed:
 protect → secure +10 → ride in +5 steps → close on the fast-EMA turn → news safeguard. Reports and slash commands.
@@ -25,6 +25,26 @@ protected (SL never loosened) but receive no strategy rules; a `⚠️ MODE MISM
 Production: run it under the supervisor (auto-restart, hang kill, boot start) — **[docs/SERVICE.md](docs/SERVICE.md)**:
 
     powershell -ExecutionPolicy Bypass -File .\scripts\aureon_service.ps1 -Action install
+
+## v2.16.1 — manual commands and the filling type (every mode)
+
+| command | what it does |
+|---|---|
+| `/place long\|short [lots] [sl] [tp]` | A market order with the active mode's SL / TP. `ema921`: sl 30, no tp; `ema9200`: sl 30; `ema2050` / `ema5080`: their guardian `pre_stop`. A bare number ≤ 200 is points from entry (a distance); larger is a price; `off` = none. Same gate as an auto entry: governor, `AUREON_MAX_LOTS` cap, drawdown guard, `AUREON_EXECUTION=1`, demo or `AUREON_ALLOW_LIVE=1`. With `AUREON_PAPER=1` it opens a paper position in the ema921 tracker. No cross needed. The mode's guardian then manages it like an auto entry. Journal: `order_placed` `actor=human` `rationale=/place`. The reply is the ENTER card, titled `PLACED <side>`. |
+| `/sl <pts\|price> [ticket] [force]` | Moves the SL. Points are from entry, signed from the trade's side (`/sl -20`, `/sl +15`). Loosening an in-profit (locked) SL needs `force`. |
+| `/tp <pts\|price\|off> [ticket]` | Sets or removes the TP (`/tp +60`, `/tp off`). |
+| `/close [symbol]` | Closes the open position now (unchanged). |
+
+`/sl` and `/tp` send ONE `TRADE_ACTION_SLTP` with BOTH current values; MT5 overwrites both, so sending one would clear the
+other. Journal: `sltp_modified` with before / after. The guardians only ever tighten: `broker.set_sl` never loosens, and when
+a manual SL is already tighter than the ema921 lock, the LOCK card says "kept".
+
+**`AUREON_FILLING=ioc|fok|return`** (default `ioc`):
+- The configured type goes first. On `TRADE_RETCODE_INVALID_FILL` (10030) only, the order falls back through the other two
+  (ioc → fok → return).
+- `order_placed` rows carry `fill_mode`.
+- At boot, the boot card reads each symbol's `symbol_info.filling_mode` and warns if the configured type isn't accepted.
+- Before v2.16.1, any non-requote rejection was retried with FOK. Now only 10030 is.
 
 ## v2.16.0 — `ema921`: the cross is the order
 
