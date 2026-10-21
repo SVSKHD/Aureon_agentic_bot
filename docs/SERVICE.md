@@ -143,6 +143,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install_logon_tasks.ps1     #
 # once: Sysinternals Autologon for this user, and never sleep:
 powercfg -change -standby-timeout-ac 0
 powercfg -change -hibernate-timeout-ac 0
+reg add "HKCU\Control Panel\Desktop" /v ScreenSaveActive /t REG_SZ /d 0 /f     # screensaver off
 ```
 
 The sequence after a Windows reboot (or a Windows Update restart):

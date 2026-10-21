@@ -163,6 +163,7 @@ def test_logon_task_script():
     ps = open(os.path.join(ROOT, "scripts", "install_logon_tasks.ps1"), encoding="utf-8").read()
     assert "Aureon-MT5" in ps and '"Aureon"' in ps and "AtLogOn" in ps and "PT30S" in ps
     assert "RestartInterval (New-TimeSpan -Minutes 1)" in ps and "Autologon" in ps and "standby-timeout-ac 0" in ps
+    assert "ScreenSaveActive /t REG_SZ /d 0" in ps
     assert "& $nssm" not in ps and "nssm install" not in ps.lower() and "New-Service" not in ps   # interactive session only
 
 
