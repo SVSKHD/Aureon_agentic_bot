@@ -1096,6 +1096,8 @@ class SymbolAgent(threading.Thread):
         last = len(df) - 1
         if self.S.name == "ema2050":
             return self._detect_2050(res, df, bar_t, close, ef, es)
+        if self.S.name == "ema9200":
+            return self._detect_9200(res, df, bar_t, close, ef, es)
         for ev in res["events"]:
             if ev.index != last or not ev.label.startswith(("EB", "ES")):
                 continue
@@ -1296,6 +1298,58 @@ class SymbolAgent(threading.Thread):
                 self.track_ask(ask_key, side, kind, close, bar_t, self._suggested(g.pre_stop).get("lots") if g else None, stop)
                 for adv in self.advisors():                                    # the ENTER bar only — never raw CROSS / MULTI
                     adv.request_entry(self, "enter", side, bar_t, df, card_key=ask_key, png=png)
+
+
+    # ------------------------------------------------------------------ detection, EMA 9/200 (v2.15.0) — candidates only, you decide
+    def _detect_9200(self, res, df, bar_t, close, ef, es):
+        """EB / ES = a candidate offered with TAKE / SKIP; F = matched but not offered (journaled quietly, no card).
+        The card carries exactly what the research widget showed: bias, EMA 9/200, distance to both, the last three candles."""
+        last = len(df) - 1; off = self.off; g = self.g; bk = bar_key(bar_t, off)
+        names = {"asia": "Asia", "london": "London", "ny": "New York", "off": "off-hours"}
+        for ev in res["events"]:
+            if ev.index != last:
+                continue
+            side = "LONG" if ev.direction == "bull" else "SHORT"; s = 1 if side == "LONG" else -1
+            info = dict(ev.info)
+            if ev.label == "F":
+                self.journal.log("candidate_skipped", symbol=self.symbol, mode=self.S.name, side=side, bar=bar_t, price=close, why=ev.reason)
+                continue
+            if ev.label not in ("EB", "ES"):
+                continue
+            kind = ev.reason                                      # pullback | momentum
+            self.latest_signal = {"bar_time": bar_t, "symbol": self.symbol, "strategy": self.S.name, "kind": kind, "direction": side, "consumed": False}
+            if self.leg and self.leg["side"] != side:
+                self._end_leg(df, bar_t, f"opposite candidate {side}")
+            if not self.leg or self.leg["side"] != side:
+                self.leg = {"side": side, "kind": kind, "start_t": bar_t, "start_i_time": bar_t, "start_px": close,
+                            "best": 0.0, "best_px": close, "best_t": bar_t, "against": 0.0, "steps_sent": 0}
+            self.health["last_signal"] = f"{side} candidate ({kind}) @ {ist(bar_t, off)}"
+            _spread = self._spread_pts()
+            self.journal.log("signal", symbol=self.symbol, mode=self.S.name, side=side, signal_kind=kind, price=close, bar=bar_t,
+                             dist9=info.get("dist9"), dist200=info.get("dist200"), last3=info.get("last3"), spread_pts=_spread)
+            stop = (close - s * g.pre_stop) if g else None
+            colour = EVENT_COLOURS["signal_long" if side == "LONG" else "signal_short"]
+            fields = [field("Side", f"**{side}**"), field("Setup", f"{kind} · bias {info.get('bias', '?')}"), field("Price", f"**{close:.2f}**"),
+                      field("EMA 9", f"{info['ema9']:.2f} ({info['dist9']:+.1f})"), field("EMA 200", f"{info['ema200']:.2f} ({info['dist200']:+.1f})"),
+                      field("Last 3 bars", " ".join(info.get("last3", []))), field("Session", names.get(info.get("session", ""), "—"))]
+            if g:
+                fields += [field("Stop", f"{stop:.2f} (−{g.pre_stop:g})", inline=False),
+                           field("Manage", f"+{g.secure_at:g} seen → SL +{g.secure_level:g} · then +{g.ride_step:g} steps · close on an EMA 9 turn once secured · Friday flat", inline=False)]
+            note = "your call — TAKE and I manage it, SKIP and it's logged" if g else "signal only — no guardian profile for this symbol"
+            png = context_chart(df, self.symbol, self.S.display_name, self.S.fast, self.S.slow, self.S.ema_cols, off, self.chart_dir,
+                                marker={"index": last, "side": side, "label": kind.upper(), "stop": stop,
+                                        "secure": (close + s * g.secure_at) if g else None})
+            fields = fields + (self._lot_field(g.pre_stop) if g else []) + self._context_fields(df)
+            ask_key = self.key(f"ENTER_{side}", bk)
+            asked = self._entry_ask(ask_key, ctitle(self.symbol, f"CANDIDATE {side} ({kind})"), [note, f"**Trade {side} now?** (expires at the next M30 close)"], png=png,
+                                    meta={"symbol": self.symbol, "side": side, "kind": kind, "price": close, "bar": bar_t, "mode": self.S.name,
+                                          "sl": stop, "chop": False, "chop_crosses": 0, **(self._suggested(g.pre_stop) if g else {})},
+                                    fields=fields, color=colour, footer=cfooter(self.S.display_name, f"bar {ist(bar_t, off)} · M30"))
+            if not asked:
+                return
+            self.track_ask(ask_key, side, kind, close, bar_t, self._suggested(g.pre_stop).get("lots") if g else None, stop)
+            for adv in self.advisors():
+                adv.request_entry(self, "enter", side, bar_t, df, card_key=ask_key, png=png)
 
     # ------------------------------------------------------------------ guardian helpers
     def _locked(self, p: dict) -> float:

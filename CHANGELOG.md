@@ -2,7 +2,25 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
-## Unreleased — restart: pre-flight + reboot recovery
+## v2.15.0 — 2026-10-20  (MINOR: new mode ema9200; restart pre-flight; defaults unchanged)
+- **`ema9200` mode** (EMA 9/200 on M30, `aureon_mt5/strategies/ema9200/`):
+  - candidates (pullback to EMA 9 with the bias, or a momentum bar) are offered as TAKE / SKIP and never auto-taken;
+  - one ask per cluster (4 bars / $10);
+  - quiet 21:00–24:00 server, Friday from 17:00, news 60/30;
+  - Gold guardian −30 / +40→+30 / ride +10 / close on an EMA 9 turn once secured.
+  `SymbolAgent._detect_9200` posts the card. The journal gets `signal` (with `dist9`, `dist200`, `last3`, `spread_pts`) and
+  `candidate_skipped`. `tools/replay_9200.py` is the offline replay (take-all baseline, or `--decisions`).
+- **`tools/export_decisions_9200.py`**: journal → `logs/decisions_9200.json` (`{bar_time: true|false}`).
+- **Mode enumerations:** `/mode`, `ops.write_mode`, the advisor `EMA_NAMES`, the snapshot EMA keys and the alias docs.
+  `test_every_entry_site_returns_before_tracking_and_claude` now counts 4 `_entry_ask` sites.
+- **`AUREON_ASK_TTL_MIN`** is read from the environment (it was hard-coded to 20).
+- **`/alert` guardian context in ema9200** uses the mode's hour / Friday / news rule. It read the ema5080-only
+  `entry_hours_ist` and raised `AttributeError`.
+- Not live yet for ema9200: Friday flat (replay only), Claude / Codex entry reads, an ema9200-specific `/alert` candidate read.
+- Tests: `tests/test_v2150_ema9200.py`, `tests/test_v2150_preflight.py`.
+- Strategy rules changed: NO for ema5080 / ema2050 — new rules only under AUREON_MODE=ema9200
+
+### restart: pre-flight + reboot recovery
 - **Pre-flight** (`aureon_mt5/preflight.py`, `main.py` before any agent):
   1. start `terminal64.exe` when it is not running (`AUREON_MT5_PATH`, else the cached path; else a warning);
   2. wait for `initialize()` + `account_info()` every 5 s, up to 90 s, touching `logs/heartbeat.txt` on every attempt; still

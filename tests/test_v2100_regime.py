@@ -123,7 +123,7 @@ def test_block_cards_not_tradeable(harness):
 def test_every_entry_site_returns_before_tracking_and_claude():
     src = open(os.path.join(ROOT, "aureon_mt5", "agent.py"), encoding="utf-8").read()
     sites = [m.start() for m in re.finditer(r"asked = self\._entry_ask\(", src)]
-    assert len(sites) == 3
+    assert len(sites) == 4                     # P / cross / RE (ema5080 + ema2050) + the v2.15.0 ema9200 candidate
     for pos in sites:
         tail = src[pos:pos + 2500]
         guard = tail.index("if not asked:")
