@@ -297,6 +297,13 @@ def guardian_context(agent, bar_t: int) -> tuple[list[dict], dict]:
         why = _ehb9(bar_t, rules)
         window = "open" if why is None else f"closed ({why})"
         news = _nb9(bar_t, rules, off)
+    elif S.name == "ema921":                                          # v2.16.0: its day / Friday rule (no entry_hours_ist)
+        import dataclasses as _dc
+        from .strategies.ema921.journeys import entry_block as _eb21, news_block as _nb21
+        rules = _dc.replace(S.rules_for(agent.symbol), news_times=tuple(agent.news))
+        why = _eb21(bar_t, rules)
+        window = "open" if why is None else f"closed ({why})"
+        news = _nb21(bar_t, rules, off)
     else:
         rules = S.rules_for(agent.symbol)
         ist_h = (((bar_t - off * 3600 + 5.5 * 3600) % 86400) / 3600); lo, hi = rules.entry_hours_ist

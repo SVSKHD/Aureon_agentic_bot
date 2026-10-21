@@ -2,7 +2,7 @@
 
     get_strategy("ema5080")   -> Strategy
     available()               -> ["ema5080", "ema2050", "ema9200"] (installed ones)
-Aliases: 5080 -> ema5080, 2050 -> ema2050, 9200 -> ema9200.
+Aliases: 5080 -> ema5080, 2050 -> ema2050, 9200 -> ema9200, 921 -> ema921.
 """
 from __future__ import annotations
 
@@ -12,7 +12,8 @@ from typing import Callable
 
 ALIASES = {"5080": "ema5080", "ema5080": "ema5080", "ema50/80": "ema5080",
            "2050": "ema2050", "ema2050": "ema2050", "ema20/50": "ema2050",
-           "9200": "ema9200", "ema9200": "ema9200", "ema9/200": "ema9200"}
+           "9200": "ema9200", "ema9200": "ema9200", "ema9/200": "ema9200",
+           "921": "ema921", "ema921": "ema921", "ema9/21": "ema921"}
 DEFAULT_MODE = "ema5080"
 
 
@@ -64,7 +65,7 @@ def resolve_mode(cli: str | None) -> str:
 
 def installed() -> dict[str, bool]:
     out = {}
-    for name in ("ema5080", "ema2050", "ema9200"):
+    for name in ("ema5080", "ema2050", "ema9200", "ema921"):
         try:
             __import__(f"aureon_mt5.strategies.{name}.strategy")
             out[name] = True

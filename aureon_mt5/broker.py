@@ -262,7 +262,7 @@ def _is_requote(r) -> bool:
 
 
 def place_market(symbol: str, side: str, lots: float, sl: float | None = None, comment: str = "aureon-alert", *,
-                 retry_sleep: float = 2.0, sleep=_time.sleep) -> BrokerResult:
+                 retry_sleep: float = 2.0, sleep=_time.sleep, tp: float | None = None) -> BrokerResult:
     """v2.0.0 — the ONE order-placement path (used by the alert LONG/SHORT buttons when AUREON_EXECUTION=1).
     Callers decide the policy (execution_enabled, demo/allow_live, max_lots); this only sends the request and reports the retcode.
     v2.0.2: a requote / price-changed rejection is retried ONCE after `retry_sleep` s with a fresh tick; the result carries
@@ -284,6 +284,8 @@ def place_market(symbol: str, side: str, lots: float, sl: float | None = None, c
                    "deviation": 30, "comment": comment[:31], "type_filling": m.ORDER_FILLING_IOC}
             if sl is not None:
                 req["sl"] = round(float(sl), digits(symbol))
+            if tp is not None:                                   # v2.16.0: broker-side take-profit (ema921 cap)
+                req["tp"] = round(float(tp), digits(symbol))
             r = m.order_send(req)
             if r is not None and r.retcode != m.TRADE_RETCODE_DONE and not _is_requote(r):
                 req["type_filling"] = m.ORDER_FILLING_FOK; r = m.order_send(req)

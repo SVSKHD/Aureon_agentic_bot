@@ -34,7 +34,7 @@ def test_mode_command_and_write_mode_accept_it(tmp_path):
     with pytest.raises(ValueError):
         ops.write_mode(str(env), "ema1234")
     src = open(os.path.join(ROOT, "aureon_mt5", "bot.py"), encoding="utf-8").read()
-    assert 'if mode not in ("ema2050", "ema5080", "ema9200"):' in src
+    assert 'if mode not in ("ema2050", "ema5080", "ema9200", "ema921"):' in src
 
 
 def test_advisor_labels():

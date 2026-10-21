@@ -16,6 +16,8 @@
   The tasks only fire at log on, so the box also needs:
     * Windows auto-logon for this user — Sysinternals Autologon (https://learn.microsoft.com/sysinternals/downloads/autologon)
     * never sleep:  powercfg -change -standby-timeout-ac 0   (and -hibernate-timeout-ac 0)
+    * screensaver off (a locked screensaver can stall the terminal's UI thread):
+      reg add "HKCU\Control Panel\Desktop" /v ScreenSaveActive /t REG_SZ /d 0 /f
 #>
 param(
     [string]$Mt5Path = "",
@@ -107,4 +109,5 @@ Write-Host ""
 Write-Host "REMINDER — the tasks fire at LOG ON, so after a reboot this box must log in by itself and stay awake:"
 Write-Host "  * Windows auto-logon for $User : Sysinternals Autologon (Autologon.exe → user, domain, password → Enable)"
 Write-Host "  * never sleep:  powercfg -change -standby-timeout-ac 0 ; powercfg -change -hibernate-timeout-ac 0"
+Write-Host "  * screensaver off:  reg add `"HKCU\Control Panel\Desktop`" /v ScreenSaveActive /t REG_SZ /d 0 /f"
 Write-Host "Then test: restart Windows and wait for 'BACK ONLINE after restart' in Discord (docs/SERVICE.md, Reboot sequence)."
