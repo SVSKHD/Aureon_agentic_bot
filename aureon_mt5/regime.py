@@ -203,7 +203,7 @@ class RegimeTracker:
         return f"REGIME · {self.state or '—'} · {self.score:.2f}" + (f" · {why}" if why else "")
 
 
-def replay_states(bars, over: dict | None = None, cf: str = "ema_fast", cs: str = "ema_slow") -> tuple[dict, list]:
+def replay_states(bars, over: dict | None = None, cf: str = "ema_fast", cs: str = "ema_slow", mode: str = "ema5080") -> tuple[dict, list]:
     """For the backtest: {bar index: state} over the whole frame and the list of no-trade days (IST date strings).
     P signals come from the strategy's analysis of the same bars."""
     import types
@@ -214,7 +214,7 @@ def replay_states(bars, over: dict | None = None, cf: str = "ema_fast", cs: str 
     tr = RegimeTracker(cfg)
     try:
         from tools.guardian_sim import p_signals
-        ps = p_signals(bars)
+        ps = p_signals(bars, mode)
     except Exception:
         ps = {}
     states, days = {}, set()

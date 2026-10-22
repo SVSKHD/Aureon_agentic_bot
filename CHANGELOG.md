@@ -15,6 +15,17 @@ Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are a
   - Cards `AUTO-TRADE ON · ema921 · <lots> · paper|live` / `AUTO-TRADE OFF · signals only`; journal `auto_trade_changed`
     (by, from, to, reason) and `auto_trade_refused`. Shown on the boot card, `/status`, `/features`, `/env-check`;
     `/feature-set auto_trade` goes through the same refusals. Weekly card line `auto-trade: on 5/5 days` or the off periods.
+- **`/decide-timeframe` for every mode, default = the running exec TF.**
+  - **Column contract** (the 22 Oct 01:02 `KeyError('ema_fast')`): `replay_guardian.run_combo` takes the mode and passes it
+    (and the strategy's `ema_cols`) to `guardian_sim.simulate`, `p_signals`, `regime.replay_states` and the HTF gate; they
+    used ema5080's `ema_fast` / `ema_slow` on any frame. `simulate` also reads ema921's `closed_by_rule` exit rows.
+  - **Default TF:** no `tf` → `cfg.exec_tf` (not M5); the ladder line and the plan name the current TF.
+    `tools/replay_guardian.py` without `--set exec_tf` uses `AUREON_EXEC_TF`.
+  - **ema921 / ema9200:** the mode's own replay (`S.analyse` → `strategies/<mode>/journeys.build`, the `replay_921` /
+    `replay_9200` logic) on `days` of MT5 bars per TF: one row per TF in {M15, M30, H1} + the requested one — trades,
+    win %, net pts, max DD, weeks + / −; M30 marked as the research TF. `apply:true` writes `AUREON_EXEC_TF` only (the
+    per-bar ema921 constants never go through the follow-knob rescaling); refused with a position open.
+  - Cache per (mode, tf, days, date); the command acks first and posts the table as the followup.
 
 ## v2.16.2 — 2026-10-21  (PATCH: resilience; strategy rules unchanged)
 - **Self-restart without a supervisor:** `AUREON_SUPERVISED=1` (set by the launcher / logon task) marks a supervised
