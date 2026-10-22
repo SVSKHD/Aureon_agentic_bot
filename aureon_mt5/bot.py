@@ -212,6 +212,7 @@ HELP = {
         "take": "Accept pending ask — user places order unless AUREON_EXECUTION=1",
         "skip": "Reject pending ask — user action",
         "close": "Close the open position on a symbol now — same path as the phone's CLOSE (execution on)",
+        "update": "Check origin/master now and apply when flat (suite green → restart) · /update hold | resume — admin",
         "auto-trade": "ema921 automatic placement: /auto-trade on|off|status — off = signals only (/place by hand) — admin",
         "place": "Manual order with the mode's SL/TP: /place long|short [lots] [sl] [tp] — same gate as auto entries",
         "sl": "Move the open position's SL: /sl -20 · /sl +15 · /sl 2450.5 (pts from entry ≤ 200, else a price)",
@@ -358,6 +359,18 @@ def auto_trade_action(cfg, agents, journal, notify, user, action: str, force: bo
         return "Denied: configured administrator role required"
     return auto_trade.set_state(cfg, agents, journal, notify, user, act == "on", force=force, reason=reason, is_demo=is_demo,
                                 environ=environ)
+
+
+def update_action(cfg, user, action: str = "", admin_role: str | None = None, updater=None) -> str:
+    """v2.17.0 /update · /update hold · /update resume (admin)."""
+    from . import auto_update, ops
+    role = os.environ.get("AUREON_ADMIN_ROLE_ID", "") if admin_role is None else admin_role
+    if not ops.admin_allowed(user, role):
+        return "Denied: configured administrator role required"
+    up = updater or auto_update.CURRENT.get("updater")
+    if up is None:
+        return "⚠️ the auto-updater is not running in this process"
+    return up.command(action, user)
 
 
 def repair_action(kind: str, cfg, agents, claude, repairer, user, n: int, force: bool = False, admin_role: str | None = None) -> Reply:
@@ -2065,6 +2078,12 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
     async def auto_trade_cmd(inter: discord.Interaction, action: str = "status", force: bool = False, reason: str = ""):
         user = inter.user
         await run(inter, "auto-trade", lambda: Reply(content=auto_trade_action(cfg, agents, journal, notify, user, action, force, reason)))
+
+    @tree.command(name="update", description="Admin: check origin/master now and apply when flat · hold / resume the auto path")
+    @app_commands.describe(action="blank = check now · hold · resume")
+    async def update_cmd(inter: discord.Interaction, action: str = ""):
+        user = inter.user
+        await run(inter, "update", lambda: Reply(content=update_action(cfg, user, action)), timeout=1900)
 
     @tree.command(name="features", description="Every feature toggle with value and source (discord/env/default)")
     @app_commands.describe(group="claude | guardian | plan | repair | context | regime (default: all)")

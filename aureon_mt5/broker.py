@@ -165,6 +165,35 @@ def positions(symbol: str) -> list[dict]:
     return out
 
 
+PENDING_TYPES = {2: "buy_limit", 3: "sell_limit", 4: "buy_stop", 5: "sell_stop", 6: "buy_stop_limit", 7: "sell_stop_limit"}
+
+
+def pending_orders(symbol: str) -> list[dict] | None:
+    """v2.17.0: the symbol's pending orders (orders_get). [] without MT5; None when MT5 is there but the call fails."""
+    m = mt5()
+    if not m:
+        return []
+    if not hasattr(m, "orders_get"):
+        return []
+    try:
+        with _lock:
+            got = m.orders_get(symbol=symbol)
+    except Exception:
+        return None
+    if got is None:
+        return None if getattr(m, "last_error", lambda: (0, ""))()[0] not in (0, 1) else []
+    out = []
+    for o in got:
+        t = int(getattr(o, "type", -1))
+        out.append({"ticket": int(o.ticket), "symbol": symbol, "type": PENDING_TYPES.get(t, str(t)),
+                    "side": "LONG" if t in (2, 4, 6) else "SHORT", "price": float(getattr(o, "price_open", 0.0)),
+                    "sl": float(getattr(o, "sl", 0.0) or 0.0), "tp": float(getattr(o, "tp", 0.0) or 0.0),
+                    "volume": float(getattr(o, "volume_current", getattr(o, "volume_initial", 0.0)) or 0.0),
+                    "expiration": int(getattr(o, "time_expiration", 0) or 0), "comment": str(getattr(o, "comment", "") or ""),
+                    "magic": int(getattr(o, "magic", 0) or 0), "time_setup": int(getattr(o, "time_setup", 0) or 0)})
+    return out
+
+
 def digits(symbol: str) -> int:
     m = mt5()
     try:

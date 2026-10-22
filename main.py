@@ -148,6 +148,7 @@ def greet(notify, cfg, S, why, news_line):
             {"name": "Self-restart", "value": f"self_restart_mode={_selfheal_mode()}", "inline": True},
             {"name": "Guardian", "value": "🟢 ON" if guardian_on else "⚪ OFF", "inline": True},
             {"name": "Auto-trade", "value": auto_trade_line(cfg), "inline": False},
+            {"name": "Auto-update", "value": auto_update_line(cfg), "inline": False},
             {"name": "MT5", "value": ("🟢 " if mt5_state in ("CONNECTED", "DRY") else "🔴 ") + mt5_state, "inline": True},
             {"name": "Server", "value": f"{srv:%a %d %b %H:%M} · UTC{cfg.server_utc_offset:+g}", "inline": True},
             {"name": "IST", "value": f"{datetime.now(IST):%H:%M}", "inline": True},
@@ -164,6 +165,16 @@ def auto_trade_line(cfg) -> str:
     try:
         from aureon_mt5 import auto_trade
         return auto_trade.status_line(cfg)
+    except Exception as e:
+        return f"unavailable: {e!r}"[:200]
+
+
+def auto_update_line(cfg) -> str:
+    """v2.17.0 boot card: `auto-update on · last <sha> <when>`."""
+    try:
+        from aureon_mt5 import auto_update
+        up = auto_update.CURRENT.get("updater") or auto_update.AutoUpdater(cfg, None, None, {})
+        return up.boot_line()
     except Exception as e:
         return f"unavailable: {e!r}"[:200]
 
@@ -555,6 +566,10 @@ def main():
     from aureon_mt5.tuning_auto import TuningAuto
     maint = srv.Maintenance(cfg, journal, health_notify, agents, exit_hook=restart_exit)
     mt5_mgr = srv.Mt5Manager(cfg, journal, health_notify, broker)
+    from aureon_mt5 import auto_update as _au                          # v2.17.0: merges to master apply themselves when flat
+    updater = _au.AutoUpdater(cfg, journal, health_notify, agents,
+                              restart_fn=lambda: _au.restart(agents, exit_hook=restart_exit))
+    _au.CURRENT["updater"] = updater; maint.updater = updater
     netguard.MONITOR = monitor
 
     def on_net_flip(degraded_now):
@@ -579,6 +594,7 @@ def main():
             now = _time.time()
             # v2.10.1: code updates moved into the maintenance window (flat, outside the session, suite green)
             maint.tick(now)
+            updater.tick(now)
             mt5_mgr.tick(now)
             if now - last_clock >= 6 * 3600:
                 last_clock = now; srv.check_clock(journal, health_notify)

@@ -181,6 +181,8 @@ class Config:
     server_active_hours: str = os.environ.get("AUREON_SERVER_ACTIVE_HOURS", "")
     server_autologon: bool = os.environ.get("AUREON_SERVER_AUTOLOGON", "1") == "1"
     maint_force_after_h: float = _num("AUREON_SERVER_MAINT_FORCE_AFTER_H", "48", float)
+    auto_update: bool = os.environ.get("AUREON_AUTO_UPDATE", "1") == "1"         # v2.17.0: apply merges to master when flat
+    update_poll_min: float = _num("AUREON_UPDATE_POLL_MIN", "2", float)          # v2.17.0: origin/master poll interval
     log_keep_days: float = _num("AUREON_LOG_KEEP_DAYS", "30", float)
     tuning_auto: str = os.environ.get("AUREON_TUNING_AUTO", "off").strip().lower()
     tuning_replay_days: int = _num("AUREON_TUNING_REPLAY_DAYS", "30", int)

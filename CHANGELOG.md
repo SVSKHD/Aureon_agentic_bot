@@ -26,6 +26,20 @@ Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are a
     win %, net pts, max DD, weeks + / −; M30 marked as the research TF. `apply:true` writes `AUREON_EXEC_TF` only (the
     per-bar ema921 constants never go through the follow-knob rescaling); refused with a position open.
   - Cache per (mode, tf, days, date); the command acks first and posts the table as the followup.
+- **Auto-update on merge** (`aureon_mt5/auto_update.py`). origin/master is polled every `AUREON_UPDATE_POLL_MIN` (2) minutes
+  through the existing fetch path; `AUREON_AUTO_UPDATE=1|0` (default 1).
+  - **Flat** (no live / paper position, no pending order; an unreadable snapshot is not flat): the v2.2.2 git path
+    (`pull --ff-only`; local edits to tracked files → `logs/local_changes_<sha>_<ts>.patch`, then discarded; `.env`, `logs/`,
+    `out/`, `news_blackout.txt` never touched), then the suite, then a restart — exit 75 under `AUREON_SUPERVISED=1`,
+    in-process re-exec otherwise. Card `UPDATE APPLIED · <short sha> · <PR title from the merge commit>`.
+  - **A position or pending order open:** `update_pending`, card `UPDATE PENDING · will apply when flat`; applied at the
+    first flat moment (after the guardian's own close — nothing is closed for an update) or in the maintenance window
+    (which now goes through the same updater), whichever first.
+  - **Suite red:** back to the running commit, no restart, card `UPDATE HELD · tests failed · <first failure line>`; that
+    sha is not retried — the next merge is.
+  - `/update` (admin) forces the check; `/update hold` / `/update resume` pause the automatic path. Boot card:
+    `auto-update on · last <sha> <when>`. Journal `update_pending` / `update_applied` / `update_held` / `update_hold`.
+  - `broker.pending_orders(symbol)` (orders_get) for the flat check.
 
 ## v2.16.2 — 2026-10-21  (PATCH: resilience; strategy rules unchanged)
 - **Self-restart without a supervisor:** `AUREON_SUPERVISED=1` (set by the launcher / logon task) marks a supervised
