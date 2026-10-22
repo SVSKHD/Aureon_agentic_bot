@@ -50,7 +50,7 @@ def test_on_bar_close(kw, expect):
 # ----------------------------------------------------------------------------- the agent
 def agent921(harness, monkeypatch, **cfg):
     _, ag0, _ = harness(price=3300.0)
-    for k, v in {"auto_mode": True, "execution_enabled": True, "paper": False, "allow_live": False, "max_dd_usd": 0.0, **cfg}.items():
+    for k, v in {"auto_trade": True, "execution_enabled": True, "paper": False, "allow_live": False, "max_dd_usd": 0.0, **cfg}.items():
         setattr(ag0.cfg, k, v)
     from aureon_mt5.agent import SymbolAgent
     ag = SymbolAgent("XAUUSD", ag0.cfg, get_strategy("ema921"), ag0.notify, ag0.journal, ())
@@ -92,7 +92,7 @@ def cross_res(df, side="bull"):
 @pytest.mark.parametrize("cfg,demo,pos,dd,placed", [
     (dict(), True, False, False, True),                                     # everything on, demo → the order
     (dict(execution_enabled=False), True, False, False, False),            # AUREON_EXECUTION=0
-    (dict(auto_mode=False), True, False, False, False),                    # AUREON_AUTO=0
+    (dict(auto_trade=False), True, False, False, False),                   # auto-trade off
     (dict(), False, False, False, False),                                  # live account, no AUREON_ALLOW_LIVE
     (dict(allow_live=True), False, False, False, True),                    # live + AUREON_ALLOW_LIVE=1
     (dict(), None, False, False, False),                                   # account type unknown → fail closed

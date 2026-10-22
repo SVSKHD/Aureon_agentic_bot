@@ -147,6 +147,7 @@ def greet(notify, cfg, S, why, news_line):
             {"name": "Filling", "value": filling_line(cfg), "inline": False},
             {"name": "Self-restart", "value": f"self_restart_mode={_selfheal_mode()}", "inline": True},
             {"name": "Guardian", "value": "🟢 ON" if guardian_on else "⚪ OFF", "inline": True},
+            {"name": "Auto-trade", "value": auto_trade_line(cfg), "inline": False},
             {"name": "MT5", "value": ("🟢 " if mt5_state in ("CONNECTED", "DRY") else "🔴 ") + mt5_state, "inline": True},
             {"name": "Server", "value": f"{srv:%a %d %b %H:%M} · UTC{cfg.server_utc_offset:+g}", "inline": True},
             {"name": "IST", "value": f"{datetime.now(IST):%H:%M}", "inline": True},
@@ -156,6 +157,15 @@ def greet(notify, cfg, S, why, news_line):
         ],
         footer=f"{S.display_name} · {datetime.now(IST):%H:%M} IST",
     )
+
+
+def auto_trade_line(cfg) -> str:
+    """v2.17.0 boot card: /auto-trade state and where it came from (discord > env)."""
+    try:
+        from aureon_mt5 import auto_trade
+        return auto_trade.status_line(cfg)
+    except Exception as e:
+        return f"unavailable: {e!r}"[:200]
 
 
 def _selfheal_mode() -> str:

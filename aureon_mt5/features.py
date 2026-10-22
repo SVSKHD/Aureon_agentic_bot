@@ -137,6 +137,9 @@ def registry() -> list[Feature]:
                 "a stale same-direction cross (older than HTF_WITH_MAX_BARS) does not count as `with`"),
         Feature("htf_align_min", "AUREON_HTF_ALIGN_MIN", "enum", "all", "htf_align_min", "timeframe",
                 "all = every confirm TF with/pre · any = at least one with and none against", choices=("all", "any")),
+        # ---- trading (v2.17.0) — /auto-trade sets it (with its refusals); /feature-set auto_trade goes through the same path
+        Feature("auto_trade", "AUREON_AUTO", "bool", False, "auto_trade", "trading",
+                "ema921 places its own orders (market, or pending with AUREON_921_ENTRY=limit); off = signals only, /place by hand"),
         # ---- plan
         Feature("daily_plan", "AUREON_DAILY_PLAN", "bool", True, "daily_plan", "plan", "post the daily plan card"),
         # ---- repair

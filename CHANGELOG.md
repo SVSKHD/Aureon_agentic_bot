@@ -2,6 +2,20 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.17.0 — 2026-10-22  (MINOR: runtime auto-trade switch, /decide-timeframe for every mode, auto-update on merge, pending-order entry; ema5080 / ema2050 rules unchanged)
+- **`/auto-trade on|off|status`** (admin; status read-only). Boot default = `AUREON_AUTO`; the switch is persisted in
+  `logs/features.json` as `auto_trade` (source discord > env) and survives restarts. `cfg.auto_mode` is the boot default
+  only — `_detect_921`'s order gate reads the switch.
+  - **off:** no automatic placement at once. Crosses are still detected, journaled `cross_skipped why="auto-trade off"`,
+    and the SIGNAL card (no order line) is posted so `/place` can be used by hand. Nothing is closed.
+  - **on:** applies from the next bar close — a cross on a bar that closed before the switch is never taken. Refused with
+    the reason when `AUREON_EXECUTION=0` (not in paper), on a live account without `AUREON_ALLOW_LIVE=1` (or an unknown
+    account type), when `AUREON_MAX_LOTS` is unset or > 1.0 without `force`, or while the drawdown guard is tripped.
+    Never touches open positions.
+  - Cards `AUTO-TRADE ON · ema921 · <lots> · paper|live` / `AUTO-TRADE OFF · signals only`; journal `auto_trade_changed`
+    (by, from, to, reason) and `auto_trade_refused`. Shown on the boot card, `/status`, `/features`, `/env-check`;
+    `/feature-set auto_trade` goes through the same refusals. Weekly card line `auto-trade: on 5/5 days` or the off periods.
+
 ## v2.16.2 — 2026-10-21  (PATCH: resilience; strategy rules unchanged)
 - **Self-restart without a supervisor:** `AUREON_SUPERVISED=1` (set by the launcher / logon task) marks a supervised
   process.

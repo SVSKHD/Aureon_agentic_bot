@@ -1477,6 +1477,8 @@ class SymbolAgent(threading.Thread):
         st = self._state921(); eq = self._equity_921()
         dd = (max(0.0, float(st.get("equity_peak") or eq) - eq)) if eq is not None else None
         lines = L.week_text(L.week_summary(trades), dd=dd, limit=float(self.cfg.max_dd_usd or 0), paper=paper)
+        from . import auto_trade
+        lines.append(auto_trade.week_line(self.journal.read(int(since)), since, now.timestamp(), auto_trade.is_on(self.cfg)))
         if post:
             self.notify.card(f"AUREON · MT5 · {self.symbol} · WEEK · {self.S.display_name}{' · PAPER' if paper else ''}", "\n".join(lines),
                              footer=f"{self.S.display_name} · week of {L.week_start(now):%d %b}")
@@ -1533,13 +1535,14 @@ class SymbolAgent(threading.Thread):
                              gap=info["gap"], dist200=info["dist200"], last3=info["last3"], spread_pts=self._spread_pts())
             lots = (self._suggested(r.stop) or {}).get("lots") or self.cfg.max_lots
             why = None
-            from . import position_cap                                      # v2.16.2: max one open position per symbol
-            capped = position_cap.block(self.symbol, side, journal=self.journal, source="ema921 auto",
-                                        paper_positions=(self._paper_open() if (self.cfg.paper or self.dry) else ()))
-            if capped:
+            from . import auto_trade, position_cap                          # v2.16.2: max one open position per symbol
+            if not auto_trade.on_for_bar(self.cfg, bar_t, self.bar_s, self.off):     # v2.17.0: /auto-trade (never retroactive)
+                why = "auto-trade off — signal only · /place to take it by hand"
+                self.journal.log("cross_skipped", symbol=self.symbol, mode=self.S.name, side=side, bar=bar_t, price=close,
+                                 why="auto-trade off")
+            elif capped := position_cap.block(self.symbol, side, journal=self.journal, source="ema921 auto",
+                                              paper_positions=(self._paper_open() if (self.cfg.paper or self.dry) else ())):
                 why = "already in a position — " + capped
-            elif not self.cfg.auto_mode:
-                why = "AUREON_AUTO is off — signal only"
             elif self._feed_or_network_down():
                 why = self._feed_or_network_down()
             else:
