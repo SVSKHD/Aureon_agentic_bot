@@ -83,6 +83,9 @@ class Config:
     allow_live: bool = os.environ.get("AUREON_ALLOW_LIVE", "0") == "1"
     filling: str = os.environ.get("AUREON_FILLING", "ioc").strip().lower()      # v2.16.1: ioc | fok | return (fallback on 10030)
     max_lots: float = _num("AUREON_MAX_LOTS", "1.0", float)
+    entry_921: str = os.environ.get("AUREON_921_ENTRY", "market").strip().lower()       # v2.17.0: market | limit (behind /auto-trade)
+    limit_offset_921: float = _num("AUREON_921_LIMIT_OFFSET", "1.5", float)           # v2.17.0: points back from the cross close
+    limit_ttl_bars_921: int = _num("AUREON_921_LIMIT_TTL_BARS", "2", int)             # v2.17.0: bars a pending order may fill
     lot_buttons: list[float] = field(default_factory=lambda: _parse_lot_buttons(os.environ.get("AUREON_LOT_BUTTONS", "0.5,1.0,1.5")))
     # AUREON-012 partial close at secure (0 = off)
     partial_close_pct: float = _num("AUREON_PARTIAL_PCT", "0", float)
@@ -321,6 +324,9 @@ def validate(cfg, environ=None, pre_stop: float = 6.0) -> list[dict]:
         out.append({"name": "regime_thresholds", "env": "AUREON_REGIME_DEAD/CHOPPY/CLEAN",
                     "value": f"{cfg.regime_dead:g}/{cfg.regime_choppy:g}/{cfg.regime_clean:g}",
                     "issue": "need DEAD < CHOPPY <= CLEAN", "fallback": "0.25/0.45/0.55", "group": "regime"})
+    if str(getattr(cfg, "entry_921", "market")) not in ("market", "limit"):              # v2.17.0
+        out.append({"name": "entry_921", "env": "AUREON_921_ENTRY", "value": str(cfg.entry_921), "issue": "market | limit",
+                    "fallback": "market", "group": "trading"})
     out += _notify_problems(cfg, env)
     out += sync_folder_problems(cfg)
     return out
@@ -434,6 +440,8 @@ def apply_fallbacks(cfg, problems: list[dict]) -> list[str]:
             cfg.push = tuple(b for b in cfg.push if b.upper() != off); changed.append(f"push:{off.lower()}"); continue
         if p["name"] in ("console_public", "push_actions"):
             continue
+        if p["name"] == "entry_921":
+            cfg.entry_921 = "market"; changed.append(p["name"]); continue
         try:
             f = F.get(p["name"])
         except ValueError:

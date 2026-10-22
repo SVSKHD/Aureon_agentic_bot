@@ -1,4 +1,4 @@
-# Aureon MT5 v2.16.1
+# Aureon MT5 v2.17.0
 
 You place the trade. Aureon detects (per selected EMA mode), fires a Discord gunshot, then manages what you placed:
 protect → secure +10 → ride in +5 steps → close on the fast-EMA turn → news safeguard. Reports and slash commands.
@@ -25,6 +25,79 @@ protected (SL never loosened) but receive no strategy rules; a `⚠️ MODE MISM
 Production: run it under the supervisor (auto-restart, hang kill, boot start) — **[docs/SERVICE.md](docs/SERVICE.md)**:
 
     powershell -ExecutionPolicy Bypass -File .\scripts\aureon_service.ps1 -Action install
+
+## v2.17.0 — auto-trade switch, /decide-timeframe for every mode, auto-update on merge, pending-order entry
+
+> **Run the repo from `C:\Aureon`, not a OneDrive folder.** The 22 Oct log still shows a OneDrive path: OneDrive syncs
+> (and sometimes locks or rolls back) `logs/`, `.env` and the git checkout under a running bot, which breaks auto-update and
+> the journal. Move the checkout to `C:\Aureon` and point the launcher / logon task there (docs/SERVICE.md).
+
+**`/auto-trade on|off|status`** (admin; status is read-only) — ema921's automatic placement, switched at runtime.
+
+| | |
+|---|---|
+| boot default | `AUREON_AUTO`; a Discord change is kept in `logs/features.json` as `auto_trade` (source discord > env) and survives restarts |
+| `off` | every automatic placement stops at once (market orders, and an automatic pending order is cancelled — never a position). Crosses are still detected, journaled `cross_skipped why="auto-trade off"`, and posted as a SIGNAL card with no order line — `/place` takes it by hand |
+| `on` | applies from the next bar close: a cross that fired while off is never taken late. Never touches open positions |
+| refused when | `AUREON_EXECUTION=0` (not in paper) · a live account without `AUREON_ALLOW_LIVE=1` (or an unknown account type) · `AUREON_MAX_LOTS` unset or > 1.0 (unless `force:true`) · the drawdown guard is tripped |
+| cards | `AUTO-TRADE ON · ema921 · <lots> · paper\|live` · `AUTO-TRADE OFF · signals only` |
+| shown on | the boot card, `/status`, `/features`, `/env-check`; the weekly card says `auto-trade: on 5/5 days` or lists the off periods |
+| journal | `auto_trade_changed` (by, from, to, reason) · `auto_trade_refused` |
+
+`cfg.auto_mode` (`AUREON_AUTO`) is only the boot default — the order gate reads the switch. `/feature-set auto_trade` goes
+through the same refusals. `/place` works in both states.
+
+**`/decide-timeframe`** works in every mode and defaults to the running exec TF (`AUREON_EXEC_TF`, M30 on the server):
+- the replay tools take the strategy's EMA columns (`S.ema_cols`) — the 22 Oct 01:02 `KeyError('ema_fast')` on an ema921
+  frame; `tools/replay_guardian.py` without `--set exec_tf` uses `AUREON_EXEC_TF`;
+- ema921 / ema9200 run their own replay (`strategies/<mode>/journeys.build`, the `replay_921` / `replay_9200` logic) on
+  `days` of MT5 bars per TF: one row per TF in {M15, M30, H1} + the requested one — trades, win %, net pts, max DD,
+  weeks + / −; M30 is marked as the research TF. `apply:true` writes `AUREON_EXEC_TF` only (the per-bar ema921 constants
+  are never rescaled) and is refused with a position open;
+- cached per (mode, tf, days, date); the command acknowledges at once and posts the table as the followup.
+
+**Auto-update on merge** (`AUREON_AUTO_UPDATE=1`, default; poll every `AUREON_UPDATE_POLL_MIN`=2 minutes):
+
+| state when master moves | what happens | card |
+|---|---|---|
+| flat (no live / paper position, no pending order) | `git pull --ff-only` → the suite → restart (exit 75 under `AUREON_SUPERVISED=1`, in-process re-exec otherwise) | `UPDATE APPLIED · <short sha> · <PR title>` |
+| a position or pending order is open | `update_pending`; applied at the first flat moment (after the guardian's own close — nothing is closed for it) or in the maintenance window | `UPDATE PENDING · will apply when flat` |
+| the suite fails | back to the running commit, no restart; that sha is retried only when master moves again | `UPDATE HELD · tests failed · <first failure>` |
+
+Local edits to tracked files are saved to `logs/local_changes_<sha>_<ts>.patch`, then discarded (as since v2.2.2); `.env`,
+`logs/`, `out/`, `news_blackout.txt` are never touched. `/update` forces the check, `/update hold` / `/update resume` pause the
+automatic path. The boot card says `auto-update on · last <sha> <when>`.
+
+**Pending-order entry for ema921** (behind `/auto-trade`):
+
+    AUREON_921_ENTRY=market            # market (default) | limit
+    AUREON_921_LIMIT_OFFSET=1.5        # points back from the cross close: buy limit BELOW it for a long, sell limit ABOVE for a short
+    AUREON_921_LIMIT_TTL_BARS=2        # the order may fill in the next N bars, then it expires
+
+- On a cross with `limit` and auto-trade on: `BUY_LIMIT` / `SELL_LIMIT` at close ∓ offset with the SL (−30) and TP on the
+  order (`TRADE_ACTION_PENDING`, `ORDER_TIME_SPECIFIED`, expiration = the cross bar's close + N bars). Journal
+  `pending_placed`; card `PENDING SHORT · sell limit <level> · SL <sl> · TP <tp|—> · expires <time>`. If the price is
+  already through the level when the order goes out, it is sent at market (a limit fills at its level or better).
+- **Fill:** adopted exactly like a market entry (same guardian, lock, exit); `pending_filled` carries the fill and the points
+  saved vs the cross close. **Expiry:** cancelled if the broker hasn't, `pending_expired`, card `PENDING EXPIRED · no fill in N bars`.
+- A pending order counts as "in position" for the one-position cap; an opposite cross cancels it first (`pending_cancelled`).
+  On boot, Aureon's pending orders (`orders_get`, comment `aureon 921` / `aureon /place`) are adopted — never re-placed.
+- `/place long|short [lots] [sl] [tp] limit=<price|±pts>` places the same order by hand (works with auto-trade off). A number
+  ≤ 200 is a distance back from the market; larger is a price on the correct side.
+- Paper mode fills a paper pending order with the replay's rule.
+- Replay: `python tools/replay_921.py --csv … --set entry=limit --set limit_offset=1.5 --set limit_ttl_bars=2` fills on the
+  first later bar whose extreme reaches the level (never the signal bar) and prints the comparison against `entry=market`.
+
+| entry style (May–Oct 2026 backtest, 1 lot) | net | weeks + / − |
+|---|---|---|
+| market at the cross close (default) | **+$37.1k** | 13 / 13 |
+| limit, offset $1.5 | +$35.6k | 13 / 13 |
+| limit, offset $2 | +$16.4k | 10 / 16 |
+| limit, offset $3 | −$23k | — |
+
+The limit option never beat market in the backtest: a trade whose price never comes back to the level is missed, and the
+wider the offset the more are missed. $1.5 is close to market; wider offsets give most of the edge away. Market stays the
+default.
 
 ## v2.16.1 — manual commands and the filling type (every mode)
 
@@ -78,7 +151,7 @@ Journal rows: `pre_cross`, `signal`, `cross_skipped` (why), `order_placed` / `pa
 
 **The order gate.** An order is sent only when every condition holds; anything else posts a SIGNAL card saying which one
 failed:
-- `AUREON_EXECUTION=1` and `AUREON_AUTO=1`;
+- `AUREON_EXECUTION=1` and auto-trade on (`/auto-trade on`, boot default `AUREON_AUTO=1` — v2.17.0);
 - a demo account, or `AUREON_ALLOW_LIVE=1` (an account type that can't be read fails closed);
 - not `AUREON_PAPER=1`;
 - no position on the symbol (a paper position counts in paper mode);

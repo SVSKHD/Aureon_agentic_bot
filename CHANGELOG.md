@@ -40,6 +40,21 @@ Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are a
   - `/update` (admin) forces the check; `/update hold` / `/update resume` pause the automatic path. Boot card:
     `auto-update on · last <sha> <when>`. Journal `update_pending` / `update_applied` / `update_held` / `update_hold`.
   - `broker.pending_orders(symbol)` (orders_get) for the flat check.
+- **Pending-order entry for ema921** (`AUREON_921_ENTRY=market|limit`, default market; `AUREON_921_LIMIT_OFFSET=1.5`;
+  `AUREON_921_LIMIT_TTL_BARS=2`), behind `/auto-trade`. ema5080 / ema2050 unchanged; ema921 with the default `market` is
+  unchanged.
+  - A cross places `BUY_LIMIT` / `SELL_LIMIT` at close ∓ offset with SL / TP on the order (`TRADE_ACTION_PENDING`,
+    `ORDER_TIME_SPECIFIED`, expiration = cross bar close + TTL bars) — `broker.place_pending`, `broker.cancel_order`,
+    `broker.pending_orders`. Already through the level when sent → a market order. Journal `pending_placed`; card
+    `PENDING <side> · <buy|sell> limit <level> · SL · TP · expires`.
+  - Fill → adopted like a market entry, `pending_filled` (fill, points saved vs the cross close). Expiry → cancelled if the
+    broker hasn't, `pending_expired`, card `PENDING EXPIRED · no fill in N bars`. An opposite cross cancels it first
+    (`pending_cancelled`); `/auto-trade off` cancels an automatic one. Boot adopts Aureon's pending orders, never re-places.
+  - The one-position cap counts pending orders (also under the lock in `place_market` / `place_pending`).
+  - `/place … limit=<price|±pts>` places one by hand. Paper fills with the replay's rule.
+  - `journeys.Rules` gains `entry`, `limit_offset`, `limit_ttl_bars`; `tools/replay_921.py --set entry=limit …` fills on the
+    first later bar reaching the level and prints the comparison against `entry=market`.
+- README / `.env.example`: v2.17.0 section, the new keys, the entry-styles table, run from `C:\Aureon` (not OneDrive).
 
 ## v2.16.2 — 2026-10-21  (PATCH: resilience; strategy rules unchanged)
 - **Self-restart without a supervisor:** `AUREON_SUPERVISED=1` (set by the launcher / logon task) marks a supervised

@@ -214,7 +214,7 @@ HELP = {
         "close": "Close the open position on a symbol now — same path as the phone's CLOSE (execution on)",
         "update": "Check origin/master now and apply when flat (suite green → restart) · /update hold | resume — admin",
         "auto-trade": "ema921 automatic placement: /auto-trade on|off|status — off = signals only (/place by hand) — admin",
-        "place": "Manual order with the mode's SL/TP: /place long|short [lots] [sl] [tp] — same gate as auto entries",
+        "place": "Manual order with the mode's SL/TP: /place long|short [lots] [sl] [tp] [limit=<price|±pts>] — same gate as auto entries",
         "sl": "Move the open position's SL: /sl -20 · /sl +15 · /sl 2450.5 (pts from entry ≤ 200, else a price)",
         "tp": "Set / remove the TP: /tp +60 · /tp 2500 · /tp off",
         "alert": "Arm price watch — user chooses price; bot monitors",
@@ -1413,8 +1413,10 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
     @tree.command(name="place", description="Manual order with the mode's SL/TP (pts ≤ 200 from entry, else a price) — same gate as auto")
     @app_commands.describe(side="long or short", lots="lots (default: the mode's risk size, capped at AUREON_MAX_LOTS)",
                            sl="SL: points from entry (≤ 200) or a price; default the mode's stop",
-                           tp="TP: points or a price; default the mode's (ema921: none); 'off' = none", symbol="default: primary")
-    async def place_cmd(inter: discord.Interaction, side: str, lots: float | None = None, sl: str = "", tp: str = "", symbol: str = ""):
+                           tp="TP: points or a price; default the mode's (ema921: none); 'off' = none", symbol="default: primary",
+                           limit="pending limit order: a price, or points back from the market (buy below / sell above)")
+    async def place_cmd(inter: discord.Interaction, side: str, lots: float | None = None, sl: str = "", tp: str = "", symbol: str = "",
+                        limit: str = ""):
         user = inter.user
         def work():
             if side.strip().lower() not in ("long", "short", "buy", "sell"):
@@ -1423,7 +1425,7 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             if ag is None:
                 return Reply(content=f"⛔ no agent for {sym}")
             res = _manual.place(cfg, agents, journal, ag, "LONG" if side.strip().lower() in ("long", "buy") else "SHORT",
-                                lots=lots, sl_raw=(sl or None), tp_raw=(tp or None), user=user)
+                                lots=lots, sl_raw=(sl or None), tp_raw=(tp or None), user=user, limit_raw=(limit or None))
             return Reply(content=res["text"], card=res["card"])
         await run(inter, "place", work)
 

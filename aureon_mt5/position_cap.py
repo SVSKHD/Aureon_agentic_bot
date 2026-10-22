@@ -9,10 +9,15 @@ MAX_PER_SYMBOL = 1
 
 
 def open_tickets(symbol: str, paper_positions=()) -> list:
+    """Live positions + pending orders (v2.17.0: a pending order counts as "in position") + paper positions / pending."""
     try:
         live = [p["ticket"] for p in broker.positions(symbol)]
     except Exception:
         live = []
+    try:
+        live += [o["ticket"] for o in (broker.pending_orders(symbol) or [])]
+    except Exception:
+        pass
     return live + [p.get("id") for p in (paper_positions or [])]
 
 

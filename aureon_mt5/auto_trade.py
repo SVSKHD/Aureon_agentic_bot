@@ -108,9 +108,21 @@ def set_state(cfg, agents, journal, notify, user, want: bool, *, force: bool = F
             journal.log("auto_trade_refused", by=str(user), why=why)
             return f"⛔ auto-trade stays {'on' if old else 'off'} — {why}"
     features.set_override(cfg.log_dir, cfg, NAME, want, str(user))
+    cancelled = []
+    if not want:                                     # an automatic pending order must not fill after off (positions untouched)
+        for sym, ag in (agents or {}).items():
+            fn = getattr(ag, "_cancel_pending921", None)
+            if fn is not None:
+                try:
+                    if fn("auto-trade off", only_by="auto"):
+                        cancelled.append(sym)
+                except Exception:
+                    pass
     journal.log("auto_trade_changed", by=str(user), **{"from": "on" if old else "off"}, to="on" if want else "off",
                 reason=reason or "", force=bool(force))
     title, body = card(cfg, want, user)
+    if cancelled:
+        body += f"\nautomatic pending order cancelled: {', '.join(cancelled)}"
     try:
         notify.card(title, body, color=0x2ECC71 if want else 0x95A5A6, footer="Aureon MT5 · auto-trade")
     except Exception:
@@ -125,7 +137,7 @@ def card(cfg, on: bool, user="") -> tuple[str, str]:
                 + ("" if cfg.mode in AUTO_MODES else f"\n{cfg.mode} has no automatic placement — the switch only matters for ema921"))
     else:
         title = "AUTO-TRADE OFF · signals only"
-        body = f"by {user} · crosses still post a SIGNAL card (no order) — /place to take one by hand · nothing was closed"
+        body = f"by {user} · crosses still post a SIGNAL card (no order) — /place to take one by hand · no position was closed"
     return title, body
 
 

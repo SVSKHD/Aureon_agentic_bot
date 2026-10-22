@@ -48,6 +48,11 @@ class Rules:
     days: tuple = (0, 1, 2, 3, 4)          # weekday numbers allowed for NEW entries (0 = Monday). Research: all five; Tue–Thu was a fit.
     friday_no_entry_from: float = 16.0     # server hour
     no_entry_server_hours: tuple = ()      # none — every session paid in the research
+    # v2.17.0 entry style (AUREON_921_ENTRY): market = the cross bar's close · limit = a limit order `limit_offset` back from
+    # that close (buy below / sell above), filled on the first LATER bar whose extreme reaches it, else gone after ttl bars
+    entry: str = "market"
+    limit_offset: float = 1.5
+    limit_ttl_bars: int = 2
     # ---- pre-cross card
     pre_gap_atr: float = 0.35              # |EMA9 − EMA21| below this × ATR(14), narrowing 2 bars → PRE card
     pre_cooldown_bars: int = 6
@@ -160,7 +165,7 @@ def build(df: pd.DataFrame, rules: Rules, server_offset_h: float = 3.0, trade_fr
     atr = pd.Series(high - low).rolling(14).mean().to_numpy()
     n = len(df); sg = np.sign(e9 - e21)
     events: list[CrossEvent] = []; journeys: list[Journey] = []
-    busy_until = -1; last_pre = -999
+    busy_until = -1; last_pre = -999; unfilled = 0
     last_k = n - 1
     if day_end is not None:
         inside = np.nonzero(time < day_end)[0]; last_k = int(inside[-1]) if len(inside) else n - 1
@@ -171,10 +176,14 @@ def build(df: pd.DataFrame, rules: Rules, server_offset_h: float = 3.0, trade_fr
                 "gap": float(e9[k] - e21[k]), "dist9": float(close[k] - e9[k]), "dist200": float(close[k] - e200[k]), "last3": last3,
                 "session": session_of(int(time[k]), server_offset_h), "atr": float(atr[k]) if not np.isnan(atr[k]) else None}
 
-    def run_exit(jn: Journey, k0: int, s: int) -> int:
+    def run_exit(jn: Journey, k0: int, s: int, fill_bar: bool = False) -> int:
+        """fill_bar: k0 is the bar a limit filled on — its stop and its close count, its TP / peak only from the close (the
+        bar's favourable extreme may have printed before the fill)."""
         e = jn.entry_price; sl = -rules.stop; peak = 0.0; mae = 0.0; run = 0; end = last_k
-        for k in range(k0 + 1, end + 1):
+        for k in range(k0 if fill_bar else k0 + 1, end + 1):
             hi = (high[k] - e) if s > 0 else (e - low[k]); lo = (low[k] - e) if s > 0 else (e - high[k])
+            if fill_bar and k == k0:
+                hi = (close[k] - e) * s
             mae = max(mae, -lo)
             if lo <= sl:
                 jn.exit_index, jn.exit_time, jn.exit_price = k, int(time[k]), e + s * sl
@@ -223,6 +232,19 @@ def build(df: pd.DataFrame, rules: Rules, server_offset_h: float = 3.0, trade_fr
             events.append(CrossEvent(k, int(time[k]), info["direction"], "EB" if d > 0 else "ES", "cross", info))
             if not tradeable:
                 continue
+            if rules.entry == "limit":
+                lvl = float(close[k]) - d * float(rules.limit_offset); kf = None
+                for j in range(k + 1, min(k + int(rules.limit_ttl_bars), last_k) + 1):
+                    if (d > 0 and low[j] <= lvl) or (d < 0 and high[j] >= lvl):
+                        kf = j; break
+                    if sg[j] != d:                                    # an opposite cross cancels the pending order
+                        break
+                if kf is None:
+                    unfilled += 1; busy_until = k; continue
+                jn = Journey("long" if d > 0 else "short", k, kf, int(time[kf]), lvl, session=info["session"])
+                jn.notes = f"limit {lvl:.2f} filled bar +{kf - k} · {(float(close[k]) - lvl) * d:+.2f} vs the cross close"
+                busy_until = run_exit(jn, kf, d, fill_bar=True); journeys.append(jn)
+                continue
             jn = Journey("long" if d > 0 else "short", k, k, int(time[k]), float(close[k]), session=info["session"])
             busy_until = run_exit(jn, k, d); journeys.append(jn)
 
@@ -230,6 +252,7 @@ def build(df: pd.DataFrame, rules: Rules, server_offset_h: float = 3.0, trade_fr
     summary = {"crosses": sum(1 for e in events if e.label in ("EB", "ES")), "pre": sum(1 for e in events if e.label == "PRE"),
                "trades": len(done), "wins": len(wins), "win_rate": round(len(wins) / len(done), 3) if done else 0.0,
                "net": round(sum(j.result for j in done), 2), "avg": round(sum(j.result for j in done) / len(done), 2) if done else 0.0,
-               **{r: sum(1 for j in done if j.exit_reason == r) for r in ("stop", "locked", "tp", "ema_close", "friday_flat")}}
+               **{r: sum(1 for j in done if j.exit_reason == r) for r in ("stop", "locked", "tp", "ema_close", "friday_flat")},
+               "entry": rules.entry, "unfilled": unfilled}
     bar_states = ["bull" if sg[i] > 0 else "bear" if sg[i] < 0 else "n/a" for i in range(n)]
     return {"events": events, "journeys": journeys, "summary": summary, "bar_states": bar_states, "cross_infos": [], "pre": [e for e in events if e.label == "PRE"]}
