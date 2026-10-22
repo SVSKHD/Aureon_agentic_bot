@@ -379,6 +379,8 @@ class Maintenance:
         """git → origin/master, then the suite; green → exit 75 (the launcher restarts on the new code); red → back to the
         old commit and that sha is skipped until origin/master moves again."""
         from . import ops
+        if getattr(self, "updater", None) is not None:         # v2.17.0: one update path — the auto-updater (flat already holds here)
+            return self.updater.check(why="maintenance window")
         from .common.updater import update_to_origin
         res = update_to_origin(self.cfg.log_dir, run=self.sh, cwd=self.root)
         if res["status"] != "updated":

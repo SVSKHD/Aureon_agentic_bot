@@ -104,29 +104,34 @@ def extra_signals(bars, specs: list[str]) -> dict:
     return out
 
 
-def htf_at(frames: dict, t_close: int, direction: str, over: dict) -> tuple[bool, dict, list]:
+def htf_at(frames: dict, t_close: int, direction: str, over: dict, cf: str = "ema_fast", cs: str = "ema_slow") -> tuple[bool, dict, list]:
     """v2.14.0: the alignment gate at an exec bar that closed at t_close, on each confirm TF's bars closed by then."""
     from aureon_mt5 import htf_align as H
     from aureon_mt5.common.tf_synth import bar_s
     states = {}
     for tf, df in frames.items():
         d = df[df["time"] + bar_s(tf) <= t_close].reset_index(drop=True)
-        states[tf] = H.htf_state(d.tail(300), "LONG" if direction == "long" else "SHORT",
+        states[tf] = H.htf_state(d.tail(300), "LONG" if direction == "long" else "SHORT", cf=cf, cs=cs,
                                  pre_max_gap=float(over.get("htf_pre_max_gap", 0.35)), with_max_bars=int(over.get("htf_with_max_bars", 8)))
     ok, reasons = H.gate(states, mode_min=over.get("htf_align_min", "all"), require_fresh=bool(over.get("htf_require_fresh", False)))
     return ok, states, reasons
 
 
-def run_combo(bars, ents, over: dict, m15: str | None = "BULLISH", signals: dict | None = None, htf: dict | None = None) -> dict:
-    sig = {**p_signals(bars), **(signals or {})}
+def run_combo(bars, ents, over: dict, m15: str | None = "BULLISH", signals: dict | None = None, htf: dict | None = None,
+              mode: str = "ema5080") -> dict:
+    """v2.16.2: every column name comes from the ACTIVE strategy's ema_cols (ema5080 / ema2050 ema_fast · ema_slow, ema921
+    ema9 · ema21, ema9200 ema9 · ema200) — the frame was prepared with that strategy's add_emas."""
+    from aureon_mt5.strategies import get_strategy
+    cf, cs = get_strategy(mode).ema_cols
+    sig = {**p_signals(bars, mode), **(signals or {})}
     gate = over.get("regime_gate", "off")
     reg_by_i = {}
     if gate != "off":
         from aureon_mt5 import regime as R
-        reg_by_i, days = R.replay_states(bars, over)
+        reg_by_i, days = R.replay_states(bars, over, cf=cf, cs=cs, mode=mode)
     rows, blocked, htf_blocked = [], [], []
     for e in ents:
-        r = simulate(bars, e["i"], e["direction"], e["entry"], signals=sig, m15=m15, cfg_over=over)
+        r = simulate(bars, e["i"], e["direction"], e["entry"], signals=sig, m15=m15, cfg_over=over, mode=mode)
         ex = r["exit"] or {"i": len(bars) - 1, "time": r["last_time"], "points": round((r["last_close"] - r["entry"]) * (1 if e["direction"] == "long" else -1), 2),
                             "reason": "open_at_end"}
         follow = over.get("guardian_profile") == "follow"
@@ -140,7 +145,7 @@ def run_combo(bars, ents, over: dict, m15: str | None = "BULLISH", signals: dict
         hgate = over.get("htf_align", "off")
         if htf and hgate != "off":
             from aureon_mt5.common.tf_synth import bar_s
-            ok, hst, why = htf_at(htf, int(bars["time"].iloc[e["i"]]) + bar_s(), e["direction"], over)
+            ok, hst, why = htf_at(htf, int(bars["time"].iloc[e["i"]]) + bar_s(), e["direction"], over, cf, cs)
             row["htf"] = {tf: x["state"] for tf, x in hst.items()}
             row["htf_entry"] = "blocked" if not ok else ("pre" if any(x["state"] == "pre" for x in hst.values()) else "with")
             if hgate == "block" and not ok:
@@ -240,7 +245,8 @@ def main(argv=None) -> dict:
     over = parse_sets(a.sets)
     from types import SimpleNamespace
     from aureon_mt5.common import tf_synth
-    exec_tf = str(over.get("exec_tf", "m5")).upper()               # v2.14.0: the execution timeframe of the replay
+    from aureon_mt5.config import Config
+    exec_tf = str(over.get("exec_tf") or os.environ.get("AUREON_EXEC_TF") or Config().exec_tf or "m5").upper()   # v2.16.2: not M5
     base_tf = "M5" if (exec_tf == "M5" or tf_synth.tf_minutes(exec_tf) % 15) else "M15"
     raw = load_bars(a, base_tf)
     tf_synth.set_exec_tf(exec_tf, SimpleNamespace(**{k: over[k] for k in ("confirm_hold_bars", "confirm_gap_x_range",
@@ -262,13 +268,13 @@ def main(argv=None) -> dict:
         # the defaults on the same exec TF
         base_over = ({**over, "htf_align": "off"} if over.get("htf_align", "off") != "off"
                      else {"exec_tf": over["exec_tf"]} if "exec_tf" in over else {})
-        base = run_combo(bars, ents, base_over, m15, sig); new = run_combo(bars, ents, over, m15, sig, htf=htf)
+        base = run_combo(bars, ents, base_over, m15, sig, mode=a.mode); new = run_combo(bars, ents, over, m15, sig, htf=htf, mode=a.mode)
         result.update(defaults=base, combo=new,
                       delta={k: round(new[k] - base[k], 2) for k in ("trades", "win_rate", "total_points", "max_drawdown")})
         print(table("htf_align=off (same set)" if "htf_align" in over else "defaults", base)); print(table("set " + " ".join(a.sets), new))
         print("delta: " + " · ".join(f"{k} {v:+g}" for k, v in result["delta"].items()))
     else:
-        result["combo"] = run_combo(bars, ents, over, m15, sig, htf=htf)
+        result["combo"] = run_combo(bars, ents, over, m15, sig, htf=htf, mode=a.mode)
         print(table("set " + (" ".join(a.sets) or "(defaults)"), result["combo"]))
     os.makedirs(a.out, exist_ok=True)
     path = os.path.join(a.out, f"{datetime.now(timezone.utc):%Y-%m-%d}.json")

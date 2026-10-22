@@ -44,11 +44,13 @@ def parse_place(text: str) -> dict:
     """'short 0.24 sl=25 tp=2450' → {side, lots, sl, tp} (sl / tp raw strings or None). Positional order: side lots."""
     toks = text.split()
     if not toks or toks[0].lower() not in ("long", "short", "buy", "sell"):
-        raise ValueError("usage: /place long|short [lots] [sl=<pts|price>] [tp=<pts|price>]")
+        raise ValueError("usage: /place long|short [lots] [sl=<pts|price>] [tp=<pts|price>] [limit=<price|±pts>]")
     out = {"side": "LONG" if toks[0].lower() in ("long", "buy") else "SHORT", "lots": None, "sl": None, "tp": None}
     for t in toks[1:]:
         k = t.lower()
-        if k.startswith(("sl=", "sl:")):
+        if k.startswith(("limit=", "limit:")):
+            out["limit"] = t[6:]
+        elif k.startswith(("sl=", "sl:")):
             out["sl"] = t[3:]
         elif k.startswith(("tp=", "tp:")):
             out["tp"] = t[3:]
@@ -104,8 +106,9 @@ def _pts(p: dict, price: float | None) -> str:
 
 # ----------------------------------------------------------------------------- /place
 def place(cfg, agents: dict, journal, agent, side: str, *, lots=None, sl_raw=None, tp_raw=None, user="human",
-          governor_ctx=None) -> dict:
-    """→ {"ok", "text", "card", "placed", "paper", "ticket"}. Never raises on a refusal (ValueError → refused)."""
+          governor_ctx=None, limit_raw=None) -> dict:
+    """→ {"ok", "text", "card", "placed", "paper", "ticket"}. Never raises on a refusal (ValueError → refused).
+    v2.17.0 limit_raw: a pending limit order (price, or points back from the market) with SL / TP from its level."""
     from .governor import Governor
     S = agent.S; sym = agent.symbol; side = side.upper()
     paper = bool(cfg.paper or cfg.dry)
@@ -113,6 +116,15 @@ def place(cfg, agents: dict, journal, agent, side: str, *, lots=None, sl_raw=Non
     entry = (tk["ask"] if side == "LONG" else tk["bid"]) if tk else float(getattr(agent, "health", {}).get("close") or 0.0)
     if not entry:
         return _refused("no price (MT5 not connected)")
+    if limit_raw not in (None, ""):
+        from . import pending921 as P
+        if not hasattr(agent, "_submit_pending921"):
+            return _refused("limit= is the ema921 pending-order path — this agent has none")
+        try:
+            bid, ask = (tk["bid"], tk["ask"]) if tk else (entry, entry)
+            entry = P.parse_limit(limit_raw, side, bid, ask)
+        except ValueError as e:
+            return _refused(str(e))
     try:
         sl, tp = place_levels(side, entry, sl_raw, tp_raw, mode_defaults(S, sym))
     except ValueError as e:
@@ -136,6 +148,8 @@ def place(cfg, agents: dict, journal, agent, side: str, *, lots=None, sl_raw=Non
     dd = agent._equity_dd_block() if hasattr(agent, "_equity_dd_block") else None
     if dd:
         return _refused(dd)
+    if limit_raw not in (None, ""):
+        return _place_limit(cfg, journal, agent, side, lots_, entry, sl, tp, user=user, capped=over_cap)
     if paper:
         if S.name != "ema921":
             return _refused("AUREON_PAPER=1: the paper tracker is ema921's — /place needs AUREON_PAPER=0 in this mode")
@@ -160,6 +174,36 @@ def place(cfg, agents: dict, journal, agent, side: str, *, lots=None, sl_raw=Non
         agent.closed_by_aureon.discard(r.ticket)
     return _placed(agent, side, lots_, r.price or entry, sl, tp, ticket=r.ticket, status=f"{r.status} · {r.fill_mode}", paper=False,
                    capped=over_cap, cfg=cfg)
+
+
+def _place_limit(cfg, journal, agent, side, lots, level, sl, tp, *, user, capped) -> dict:
+    """v2.17.0 /place … limit=: the same pending order the ema921 limit entry places, by hand (works with auto-trade off).
+    Expires AUREON_921_LIMIT_TTL_BARS bars after the current bar closes."""
+    from . import pending921 as P
+    from .common.timeutil import ist_str
+    bar_s = int(getattr(agent, "bar_s", 1800)); now = broker.now_server(getattr(agent, "off", 3.0))
+    bar = (int(now) // bar_s) * bar_s
+    pend = {"side": side, "level": float(level), "sl": sl, "tp": tp, "lots": float(lots), "bar": bar,
+            "expires": P.expiry(bar, bar_s, cfg.limit_ttl_bars_921), "cross_close": None, "paper": bool(cfg.paper or cfg.dry),
+            "by": "/place"}
+    if not pend["paper"]:
+        if not cfg.execution_enabled:
+            return _refused("execution off (AUREON_EXECUTION=0)")
+        demo = broker.is_demo()
+        if not (demo or cfg.allow_live):
+            return _refused("live account — AUREON_ALLOW_LIVE=1 needed" if demo is False else "account type unknown — refused")
+    got, res, why = agent._submit_pending921(pend)
+    if why:
+        return _refused(why)
+    if got is None:                                                # the level was already reached: placed at market
+        return _placed(agent, side, lots, res.price or level, sl, tp, ticket=res.ticket, status=f"{res.status} · limit reached",
+                       paper=False, capped=capped, cfg=cfg)
+    ticket = got.get("ticket") or got.get("id")
+    journal.decision("pending_manual", actor="human", rationale="/place limit", symbol=agent.symbol, side=side, level=level, sl=sl, tp=tp,
+                     lots=lots, ticket=ticket, by=str(user), paper=got["paper"])
+    text = (P.title(got, lambda t: ist_str(t, getattr(agent, "off", 3.0), "%H:%M") + " IST") + f" · {lots:g} lots · #{ticket}"
+            + (f" (capped at max {cfg.max_lots:g})" if capped else ""))
+    return {"ok": True, "text": "✅ " + text, "card": None, "placed": not got["paper"], "paper": got["paper"], "ticket": ticket}
 
 
 def _refused(why: str) -> dict:

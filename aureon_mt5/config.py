@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from dotenv import load_dotenv
 load_dotenv()   # load .env if present
 
-VERSION = "2.16.1"
+VERSION = "2.17.0"
 
 
 def _parse_lot_buttons(raw: str) -> list[float]:
@@ -77,11 +77,15 @@ class Config:
     # AUREON-011 one-tap order placement (OFF unless explicitly enabled; demo accounts only unless AUREON_ALLOW_LIVE=1)
     execution_enabled: bool = os.environ.get("AUREON_EXECUTION", "0") == "1"
     auto_mode: bool = os.environ.get("AUREON_AUTO", "0") == "1"                 # v2.16.0: ema921 places orders itself (needs execution too)
+    auto_trade: bool = os.environ.get("AUREON_AUTO", "0") == "1"                # v2.17.0: the live switch (/auto-trade); auto_mode = the boot default
     paper: bool = os.environ.get("AUREON_PAPER", "0") == "1"                    # v2.16.0: real feed, real cards, fills only journaled
     max_dd_usd: float = _num("AUREON_MAX_DD_USD", "0", float)                   # v2.16.0: no new auto entries once equity is this far below its peak (0 = off)
     allow_live: bool = os.environ.get("AUREON_ALLOW_LIVE", "0") == "1"
     filling: str = os.environ.get("AUREON_FILLING", "ioc").strip().lower()      # v2.16.1: ioc | fok | return (fallback on 10030)
     max_lots: float = _num("AUREON_MAX_LOTS", "1.0", float)
+    entry_921: str = os.environ.get("AUREON_921_ENTRY", "market").strip().lower()       # v2.17.0: market | limit (behind /auto-trade)
+    limit_offset_921: float = _num("AUREON_921_LIMIT_OFFSET", "1.5", float)           # v2.17.0: points back from the cross close
+    limit_ttl_bars_921: int = _num("AUREON_921_LIMIT_TTL_BARS", "2", int)             # v2.17.0: bars a pending order may fill
     lot_buttons: list[float] = field(default_factory=lambda: _parse_lot_buttons(os.environ.get("AUREON_LOT_BUTTONS", "0.5,1.0,1.5")))
     # AUREON-012 partial close at secure (0 = off)
     partial_close_pct: float = _num("AUREON_PARTIAL_PCT", "0", float)
@@ -180,6 +184,8 @@ class Config:
     server_active_hours: str = os.environ.get("AUREON_SERVER_ACTIVE_HOURS", "")
     server_autologon: bool = os.environ.get("AUREON_SERVER_AUTOLOGON", "1") == "1"
     maint_force_after_h: float = _num("AUREON_SERVER_MAINT_FORCE_AFTER_H", "48", float)
+    auto_update: bool = os.environ.get("AUREON_AUTO_UPDATE", "1") == "1"         # v2.17.0: apply merges to master when flat
+    update_poll_min: float = _num("AUREON_UPDATE_POLL_MIN", "2", float)          # v2.17.0: origin/master poll interval
     log_keep_days: float = _num("AUREON_LOG_KEEP_DAYS", "30", float)
     tuning_auto: str = os.environ.get("AUREON_TUNING_AUTO", "off").strip().lower()
     tuning_replay_days: int = _num("AUREON_TUNING_REPLAY_DAYS", "30", int)
@@ -318,6 +324,9 @@ def validate(cfg, environ=None, pre_stop: float = 6.0) -> list[dict]:
         out.append({"name": "regime_thresholds", "env": "AUREON_REGIME_DEAD/CHOPPY/CLEAN",
                     "value": f"{cfg.regime_dead:g}/{cfg.regime_choppy:g}/{cfg.regime_clean:g}",
                     "issue": "need DEAD < CHOPPY <= CLEAN", "fallback": "0.25/0.45/0.55", "group": "regime"})
+    if str(getattr(cfg, "entry_921", "market")) not in ("market", "limit"):              # v2.17.0
+        out.append({"name": "entry_921", "env": "AUREON_921_ENTRY", "value": str(cfg.entry_921), "issue": "market | limit",
+                    "fallback": "market", "group": "trading"})
     out += _notify_problems(cfg, env)
     out += sync_folder_problems(cfg)
     return out
@@ -431,6 +440,8 @@ def apply_fallbacks(cfg, problems: list[dict]) -> list[str]:
             cfg.push = tuple(b for b in cfg.push if b.upper() != off); changed.append(f"push:{off.lower()}"); continue
         if p["name"] in ("console_public", "push_actions"):
             continue
+        if p["name"] == "entry_921":
+            cfg.entry_921 = "market"; changed.append(p["name"]); continue
         try:
             f = F.get(p["name"])
         except ValueError:

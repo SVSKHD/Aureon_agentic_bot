@@ -2,6 +2,60 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.17.0 — 2026-10-22  (MINOR: runtime auto-trade switch, /decide-timeframe for every mode, auto-update on merge, pending-order entry; ema5080 / ema2050 rules unchanged)
+- **`/auto-trade on|off|status`** (admin; status read-only). Boot default = `AUREON_AUTO`; the switch is persisted in
+  `logs/features.json` as `auto_trade` (source discord > env) and survives restarts. `cfg.auto_mode` is the boot default
+  only — `_detect_921`'s order gate reads the switch.
+  - **off:** no automatic placement at once. Crosses are still detected, journaled `cross_skipped why="auto-trade off"`,
+    and the SIGNAL card (no order line) is posted so `/place` can be used by hand. Nothing is closed.
+  - **on:** applies from the next bar close — a cross on a bar that closed before the switch is never taken. Refused with
+    the reason when `AUREON_EXECUTION=0` (not in paper), on a live account without `AUREON_ALLOW_LIVE=1` (or an unknown
+    account type), when `AUREON_MAX_LOTS` is unset or > 1.0 without `force`, or while the drawdown guard is tripped.
+    Never touches open positions.
+  - Cards `AUTO-TRADE ON · ema921 · <lots> · paper|live` / `AUTO-TRADE OFF · signals only`; journal `auto_trade_changed`
+    (by, from, to, reason) and `auto_trade_refused`. Shown on the boot card, `/status`, `/features`, `/env-check`;
+    `/feature-set auto_trade` goes through the same refusals. Weekly card line `auto-trade: on 5/5 days` or the off periods.
+- **`/decide-timeframe` for every mode, default = the running exec TF.**
+  - **Column contract** (the 22 Oct 01:02 `KeyError('ema_fast')`): `replay_guardian.run_combo` takes the mode and passes it
+    (and the strategy's `ema_cols`) to `guardian_sim.simulate`, `p_signals`, `regime.replay_states` and the HTF gate; they
+    used ema5080's `ema_fast` / `ema_slow` on any frame. `simulate` also reads ema921's `closed_by_rule` exit rows.
+  - **Default TF:** no `tf` → `cfg.exec_tf` (not M5); the ladder line and the plan name the current TF.
+    `tools/replay_guardian.py` without `--set exec_tf` uses `AUREON_EXEC_TF`.
+  - **ema921 / ema9200:** the mode's own replay (`S.analyse` → `strategies/<mode>/journeys.build`, the `replay_921` /
+    `replay_9200` logic) on `days` of MT5 bars per TF: one row per TF in {M15, M30, H1} + the requested one — trades,
+    win %, net pts, max DD, weeks + / −; M30 marked as the research TF. `apply:true` writes `AUREON_EXEC_TF` only (the
+    per-bar ema921 constants never go through the follow-knob rescaling); refused with a position open.
+  - Cache per (mode, tf, days, date); the command acks first and posts the table as the followup.
+- **Auto-update on merge** (`aureon_mt5/auto_update.py`). origin/master is polled every `AUREON_UPDATE_POLL_MIN` (2) minutes
+  through the existing fetch path; `AUREON_AUTO_UPDATE=1|0` (default 1).
+  - **Flat** (no live / paper position, no pending order; an unreadable snapshot is not flat): the v2.2.2 git path
+    (`pull --ff-only`; local edits to tracked files → `logs/local_changes_<sha>_<ts>.patch`, then discarded; `.env`, `logs/`,
+    `out/`, `news_blackout.txt` never touched), then the suite, then a restart — exit 75 under `AUREON_SUPERVISED=1`,
+    in-process re-exec otherwise. Card `UPDATE APPLIED · <short sha> · <PR title from the merge commit>`.
+  - **A position or pending order open:** `update_pending`, card `UPDATE PENDING · will apply when flat`; applied at the
+    first flat moment (after the guardian's own close — nothing is closed for an update) or in the maintenance window
+    (which now goes through the same updater), whichever first.
+  - **Suite red:** back to the running commit, no restart, card `UPDATE HELD · tests failed · <first failure line>`; that
+    sha is not retried — the next merge is.
+  - `/update` (admin) forces the check; `/update hold` / `/update resume` pause the automatic path. Boot card:
+    `auto-update on · last <sha> <when>`. Journal `update_pending` / `update_applied` / `update_held` / `update_hold`.
+  - `broker.pending_orders(symbol)` (orders_get) for the flat check.
+- **Pending-order entry for ema921** (`AUREON_921_ENTRY=market|limit`, default market; `AUREON_921_LIMIT_OFFSET=1.5`;
+  `AUREON_921_LIMIT_TTL_BARS=2`), behind `/auto-trade`. ema5080 / ema2050 unchanged; ema921 with the default `market` is
+  unchanged.
+  - A cross places `BUY_LIMIT` / `SELL_LIMIT` at close ∓ offset with SL / TP on the order (`TRADE_ACTION_PENDING`,
+    `ORDER_TIME_SPECIFIED`, expiration = cross bar close + TTL bars) — `broker.place_pending`, `broker.cancel_order`,
+    `broker.pending_orders`. Already through the level when sent → a market order. Journal `pending_placed`; card
+    `PENDING <side> · <buy|sell> limit <level> · SL · TP · expires`.
+  - Fill → adopted like a market entry, `pending_filled` (fill, points saved vs the cross close). Expiry → cancelled if the
+    broker hasn't, `pending_expired`, card `PENDING EXPIRED · no fill in N bars`. An opposite cross cancels it first
+    (`pending_cancelled`); `/auto-trade off` cancels an automatic one. Boot adopts Aureon's pending orders, never re-places.
+  - The one-position cap counts pending orders (also under the lock in `place_market` / `place_pending`).
+  - `/place … limit=<price|±pts>` places one by hand. Paper fills with the replay's rule.
+  - `journeys.Rules` gains `entry`, `limit_offset`, `limit_ttl_bars`; `tools/replay_921.py --set entry=limit …` fills on the
+    first later bar reaching the level and prints the comparison against `entry=market`.
+- README / `.env.example`: v2.17.0 section, the new keys, the entry-styles table, run from `C:\Aureon` (not OneDrive).
+
 ## v2.16.2 — 2026-10-21  (PATCH: resilience; strategy rules unchanged)
 - **Self-restart without a supervisor:** `AUREON_SUPERVISED=1` (set by the launcher / logon task) marks a supervised
   process.

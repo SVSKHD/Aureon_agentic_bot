@@ -29,6 +29,7 @@ from .strategies.ema5080.trend import find_reentries, state_of
 from . import alerts as alerts_mod
 from .common.chop import chop_state as _chop_state
 from . import leg_guardian as lg
+from . import pending921 as P921
 from . import setup as setup_mod
 import os
 import numpy as np
@@ -242,6 +243,8 @@ class SymbolAgent(threading.Thread):
                         self._trend_and_reentry(df, bar_t, close, ef, es)
                     self._session(df, bar_t, close, ef, es)
                 self._track_leg(df, bar_t, new_bar, sgn)
+                if self.S.name == "ema921":                                    # v2.17.0: pending orders — fill / expiry / boot adoption
+                    self._pending921_tick(bar_t, df, new_bar)
                 if self.g is not None:
                     self._guard(new_bar, bar_t, df, close, ef, es, sgn)
                 if self.S.name == "ema921" and new_bar:                        # v2.16.0: paper positions + the Friday week card
@@ -1427,7 +1430,9 @@ class SymbolAgent(threading.Thread):
         return None
 
     def _paper_open(self) -> list:
-        return list(self._state921().get("paper") or [])
+        """Paper positions + a paper pending order (v2.17.0: it counts as "in position" for the cap)."""
+        st = self._state921(); pend = st.get("pending")
+        return list(st.get("paper") or []) + ([pend] if pend and pend.get("paper") else [])
 
     def _paper_tick(self, bar_t, df):
         """v2.16.0 AUREON_PAPER=1: the same guardian on paper positions, one closed bar at a time (ema921_live.paper_step) — LOCK /
@@ -1477,10 +1482,167 @@ class SymbolAgent(threading.Thread):
         st = self._state921(); eq = self._equity_921()
         dd = (max(0.0, float(st.get("equity_peak") or eq) - eq)) if eq is not None else None
         lines = L.week_text(L.week_summary(trades), dd=dd, limit=float(self.cfg.max_dd_usd or 0), paper=paper)
+        from . import auto_trade
+        lines.append(auto_trade.week_line(self.journal.read(int(since)), since, now.timestamp(), auto_trade.is_on(self.cfg)))
         if post:
             self.notify.card(f"AUREON · MT5 · {self.symbol} · WEEK · {self.S.display_name}{' · PAPER' if paper else ''}", "\n".join(lines),
                              footer=f"{self.S.display_name} · week of {L.week_start(now):%d %b}")
         return lines
+
+    # ------------------------------------------------------------------ v2.17.0 pending-order entry (AUREON_921_ENTRY=limit)
+    def _paper_mode(self) -> bool:
+        return bool(self.cfg.paper or self.dry)
+
+    def _place_pending921(self, side, close, bar_t, lots, r, *, by: str = "auto"):
+        """→ (pending dict | None, BrokerResult | None, why-not | None). Paper: journaled only, filled by the replay's rule."""
+        lvl = P921.level(side, close, self.cfg.limit_offset_921); sl, tp = P921.stops(side, lvl, r.stop, r.tp)
+        exp = P921.expiry(bar_t, self.bar_s, self.cfg.limit_ttl_bars_921)
+        pend = {"side": side, "level": lvl, "sl": sl, "tp": tp, "lots": float(lots), "bar": int(bar_t), "expires": exp,
+                "cross_close": float(close), "paper": self._paper_mode(), "by": by}
+        return self._submit_pending921(pend)
+
+    def _submit_pending921(self, pend: dict):
+        st = self._state921(); side = pend["side"]
+        if pend["paper"]:
+            pend["id"] = f"L{pend['bar']}"
+            st["pending"] = pend; self._save921()
+            self.journal.log("pending_placed", symbol=self.symbol, mode=self.S.name, ticket=pend["id"], side=side, level=pend["level"],
+                             sl=pend["sl"], tp=pend["tp"], expires=pend["expires"], lots=pend["lots"], paper=True, by=pend["by"])
+            return pend, broker.BrokerResult(True, "PAPER", ticket=None, price=pend["level"], volume=pend["lots"]), None
+        if not (self.cfg.execution_enabled and (broker.is_demo() or self.cfg.allow_live)):
+            return None, None, "execution off (AUREON_EXECUTION=1 and demo / AUREON_ALLOW_LIVE=1 needed)"
+        comment = "aureon 921" if pend["by"] == "auto" else "aureon /place"
+        tk = broker.tick(self.symbol)
+        if tk and P921.marketable(side, pend["level"], tk["bid"], tk["ask"]):        # already through the level: at it or better
+            placed = broker.place_market(self.symbol, side, pend["lots"], pend["sl"], comment=comment, tp=pend["tp"])
+            self.journal.decision("order_placed", actor="agent" if pend["by"] == "auto" else "human", rationale="limit already reached",
+                                  symbol=self.symbol, mode=self.S.name, side=side, lots=pend["lots"], sl=pend["sl"], tp=pend["tp"],
+                                  level=pend["level"], ok=bool(placed.ok), status=placed.status, retcode=placed.retcode,
+                                  ticket=placed.ticket, fill=placed.price, fill_mode=placed.fill_mode)
+            if placed.ok:
+                self.closed_by_aureon.discard(placed.ticket)
+            return None, placed, (None if placed.ok else f"order rejected ({placed.why()})")
+        res = broker.place_pending(self.symbol, side, pend["lots"], pend["level"], pend["sl"], pend["tp"], pend["expires"], comment=comment)
+        self.journal.log("pending_placed", symbol=self.symbol, mode=self.S.name, ticket=res.ticket, side=side, level=pend["level"],
+                         sl=pend["sl"], tp=pend["tp"], expires=pend["expires"], lots=pend["lots"], ok=bool(res.ok), status=res.status,
+                         retcode=res.retcode, by=pend["by"])
+        if not res.ok:
+            return None, res, f"pending order rejected ({res.why()})"
+        pend["ticket"] = res.ticket; st["pending"] = pend; self._save921()
+        return pend, res, None
+
+    def _pending921_tick(self, bar_t, df, new_bar):
+        """Every poll: boot adoption (once), then fill / expiry of the one pending order. Paper: on each new closed bar."""
+        st = self._state921()
+        if not getattr(self, "_pend_adopted", False):
+            self._pend_adopted = True
+            if not self._paper_mode():
+                self._adopt_pending921()
+        pend = st.get("pending")
+        if not pend:
+            return
+        if pend.get("paper"):
+            if not new_bar or int(bar_t) <= int(pend["bar"]):
+                return
+            row = df.iloc[-1]
+            if P921.bar_fills(pend["side"], pend["level"], float(row["high"]), float(row["low"])):
+                from . import ema921_live as L
+                pos = L.new_paper(pend["side"], pend["level"], pend["lots"], pend["sl"], pend["tp"], int(bar_t)); pos["id"] = pend["id"]
+                st["paper"] = list(st.get("paper") or []) + [pos]
+                self._pending_filled921(pend, pend["id"], pend["level"])
+            elif int(bar_t) + self.bar_s >= int(pend["expires"]):
+                self._pending_expired921(pend)
+            return
+        if self.dry:
+            return
+        orders = broker.pending_orders(self.symbol)
+        if orders is None:
+            return                                                      # unreadable: decide on the next poll
+        now = broker.now_server(self.off)
+        if any(o["ticket"] == pend.get("ticket") for o in orders):
+            if now >= int(pend["expires"]):                             # the broker has not removed it yet: we do
+                rr = broker.cancel_order(pend["ticket"], self.symbol)
+                if rr.ok or rr.status == "ORDER_NOT_FOUND":
+                    self._pending_expired921(pend, by="aureon")
+            return
+        pos = broker.positions(self.symbol)
+        mine = [p for p in pos if p["ticket"] == pend.get("ticket")] or \
+               [p for p in pos if str(p.get("comment", "")).startswith(("aureon 921", "aureon /place"))
+                and p["direction"] == ("long" if pend["side"] == "LONG" else "short")]
+        if mine:
+            self._pending_filled921(pend, mine[0]["ticket"], float(mine[0]["price_open"]))
+        elif now >= int(pend["expires"]) - 60:
+            self._pending_expired921(pend, by="broker")
+        else:
+            self._pending_gone921(pend, "removed outside Aureon (MT5)")
+
+    def _adopt_pending921(self):
+        """Boot: the pending orders Aureon placed (comment `aureon 921` / `aureon /place`) are tracked again — never re-placed."""
+        orders = broker.pending_orders(self.symbol) or []
+        mine = [o for o in orders if o["comment"].startswith(("aureon 921", "aureon /place"))]
+        st = self._state921(); pend = st.get("pending")
+        for o in mine[:1]:
+            if pend and pend.get("ticket") == o["ticket"]:
+                return
+            st["pending"] = {"ticket": o["ticket"], "side": o["side"], "level": o["price"], "sl": o["sl"] or None, "tp": o["tp"] or None,
+                             "lots": o["volume"], "bar": None, "expires": int(o["expiration"] or (broker.now_server(self.off)
+                                                                                                  + self.bar_s * self.cfg.limit_ttl_bars_921)),
+                             "cross_close": None, "paper": False,
+                             "by": "auto" if o["comment"].startswith("aureon 921") else "/place"}
+            self._save921()
+            self.journal.log("pending_adopted", symbol=self.symbol, mode=self.S.name, ticket=o["ticket"], side=o["side"], level=o["price"],
+                             expires=st["pending"]["expires"])
+            self.notify.send(self.key("PENDING_ADOPTED", o["ticket"]),
+                             ctitle(self.symbol, f"PENDING {o['side']} adopted · {P921.order_type(o['side'])} {o['price']:.2f} · #{o['ticket']}"),
+                             ["found on boot — tracked again, never re-placed"], color=EVENT_COLOURS["info"], footer=cfooter(self.S.display_name))
+
+    def _pending_filled921(self, pend, ticket, fill):
+        sv = P921.saved(pend["side"], pend.get("cross_close"), fill)
+        st = self._state921(); st["pending"] = None; self._save921()
+        if not pend.get("paper"):
+            self.closed_by_aureon.discard(ticket)
+        self.journal.log("pending_filled", symbol=self.symbol, mode=self.S.name, ticket=ticket, order=pend.get("ticket") or pend.get("id"),
+                         side=pend["side"], level=pend["level"], fill=fill, cross_close=pend.get("cross_close"), saved=sv,
+                         paper=bool(pend.get("paper")), by=pend.get("by"))
+        side = pend["side"]
+        self.notify.send(self.key("PENDING_FILLED", ticket),
+                         ctitle(self.symbol, f"FILLED {side} · {P921.order_type(side)} {pend['level']:.2f} · fill {fill:.2f}"
+                                + (f" · {sv:+.1f} vs the cross close" if sv is not None else "") + (" · PAPER" if pend.get("paper") else ""), side),
+                         [f"#{ticket} · SL {pend['sl']:.2f} · TP {format(pend['tp'], '.2f') if pend.get('tp') else '—'} · "
+                          "managed like a market entry (same guardian, lock, exit)"],
+                         color=EVENT_COLOURS["signal_long" if side == "LONG" else "signal_short"], footer=cfooter(self.S.display_name), event="FILLED")
+
+    def _pending_expired921(self, pend, by: str = "aureon"):
+        st = self._state921(); st["pending"] = None; self._save921()
+        n = self.cfg.limit_ttl_bars_921
+        self.journal.log("pending_expired", symbol=self.symbol, mode=self.S.name, ticket=pend.get("ticket") or pend.get("id"), side=pend["side"],
+                         level=pend["level"], expires=pend["expires"], removed_by=by, paper=bool(pend.get("paper")))
+        self.notify.send(self.key("PENDING_EXPIRED", pend.get("ticket") or pend.get("id")),
+                         ctitle(self.symbol, f"PENDING EXPIRED · no fill in {n} bars" + (" · PAPER" if pend.get("paper") else "")),
+                         [f"{P921.order_type(pend['side'])} {pend['level']:.2f} · expired {ist(pend['expires'], self.off, '%H:%M')} IST · nothing opened"],
+                         color=EVENT_COLOURS["info"], footer=cfooter(self.S.display_name))
+
+    def _pending_gone921(self, pend, reason):
+        st = self._state921(); st["pending"] = None; self._save921()
+        self.journal.log("pending_cancelled", symbol=self.symbol, mode=self.S.name, ticket=pend.get("ticket") or pend.get("id"),
+                         side=pend["side"], level=pend["level"], reason=reason, paper=bool(pend.get("paper")))
+        self.notify.send(self.key("PENDING_CANCELLED", pend.get("ticket") or pend.get("id")),
+                         ctitle(self.symbol, f"PENDING CANCELLED · {reason}"),
+                         [f"{P921.order_type(pend['side'])} {pend['level']:.2f}" + (" · PAPER" if pend.get("paper") else "")],
+                         color=EVENT_COLOURS["info"], footer=cfooter(self.S.display_name))
+
+    def _cancel_pending921(self, reason: str, only_by: str | None = None) -> str | None:
+        """Cancel the pending order (opposite cross · /auto-trade off for automatic ones). Never touches a position."""
+        pend = self._state921().get("pending")
+        if not pend or (only_by and pend.get("by") != only_by):
+            return None
+        if not pend.get("paper") and not self.dry:
+            rr = broker.cancel_order(pend["ticket"], self.symbol)
+            if not (rr.ok or rr.status == "ORDER_NOT_FOUND"):
+                self.journal.log("pending_cancel_failed", symbol=self.symbol, ticket=pend["ticket"], reason=reason, retcode=rr.retcode)
+                return f"cancel failed ({rr.why()})"
+        self._pending_gone921(pend, reason)
+        return "cancelled"
 
     def _week_card_921(self, bar_t):
         """Friday, after the flat bar: the week card once per ISO week (logged in state_<symbol>.json)."""
@@ -1526,6 +1688,9 @@ class SymbolAgent(threading.Thread):
                 self.journal.log("cross_skipped", symbol=self.symbol, mode=self.S.name, side=side, bar=bar_t, price=close,
                                  why="stale after reconnect")
                 continue
+            pend_old = self._state921().get("pending")
+            if pend_old and pend_old.get("side") != side:                   # v2.17.0: an opposite cross cancels a pending order first
+                self._cancel_pending921("opposite cross")
             sl = close - s * r.stop; tp = (close + s * r.tp) if r.tp else None
             self.latest_signal = {"bar_time": bar_t, "symbol": self.symbol, "strategy": self.S.name, "kind": "cross", "direction": side, "consumed": False}
             self.health["last_signal"] = f"{side} 9/21 cross @ {ist(bar_t, off)}"
@@ -1533,19 +1698,22 @@ class SymbolAgent(threading.Thread):
                              gap=info["gap"], dist200=info["dist200"], last3=info["last3"], spread_pts=self._spread_pts())
             lots = (self._suggested(r.stop) or {}).get("lots") or self.cfg.max_lots
             why = None
-            from . import position_cap                                      # v2.16.2: max one open position per symbol
-            capped = position_cap.block(self.symbol, side, journal=self.journal, source="ema921 auto",
-                                        paper_positions=(self._paper_open() if (self.cfg.paper or self.dry) else ()))
-            if capped:
+            from . import auto_trade, position_cap                          # v2.16.2: max one open position per symbol
+            if not auto_trade.on_for_bar(self.cfg, bar_t, self.bar_s, self.off):     # v2.17.0: /auto-trade (never retroactive)
+                why = "auto-trade off — signal only · /place to take it by hand"
+                self.journal.log("cross_skipped", symbol=self.symbol, mode=self.S.name, side=side, bar=bar_t, price=close,
+                                 why="auto-trade off")
+            elif capped := position_cap.block(self.symbol, side, journal=self.journal, source="ema921 auto",
+                                              paper_positions=(self._paper_open() if (self.cfg.paper or self.dry) else ())):
                 why = "already in a position — " + capped
-            elif not self.cfg.auto_mode:
-                why = "AUREON_AUTO is off — signal only"
             elif self._feed_or_network_down():
                 why = self._feed_or_network_down()
             else:
                 why = self._equity_dd_block()
-            placed = None
-            if why is None:
+            placed = None; pend = None
+            if why is None and str(getattr(self.cfg, "entry_921", "market")) == "limit":   # v2.17.0: AUREON_921_ENTRY=limit
+                pend, placed, why = self._place_pending921(side, close, bar_t, lots, r)
+            elif why is None:
                 if self.cfg.paper or self.dry:
                     placed = broker.BrokerResult(True, "PAPER", changed=False, price=close, ticket=None, volume=lots)
                     self.journal.log("paper_fill", symbol=self.symbol, mode=self.S.name, side=side, lots=lots, price=close, sl=sl, tp=tp, bar=bar_t)
@@ -1569,13 +1737,21 @@ class SymbolAgent(threading.Thread):
                       field("Lock", f"+{r.lock_at:g} seen → SL {close + s * r.lock_to:.2f} (+{r.lock_to:g})"),
                       field("Exit", "first M30 close through EMA 9" + (f" · EMA 200 after +{r.lock_at:g}" if r.exit_mode == "e9>e200" else "")),
                       field("Backtest", "Jan–Oct 2026: 42% win · avg +1.6/trade · 35% reach +20", inline=False)]
-            if why:
+            if pend:
+                fields[1] = field("Entry", f"**{pend['level']:.2f}** ({P921.order_type(side)} · {self.cfg.limit_offset_921:g} back from the close {close:.2f})")
+                fields[7] = field("Stop / TP", f"{pend['sl']:.2f} (−{r.stop:g}) / " + (f"{pend['tp']:.2f} (+{r.tp:g})" if pend.get("tp") else "none"), inline=False)
+                fields[8] = field("Lock", f"+{r.lock_at:g} seen → SL {pend['level'] + s * r.lock_to:.2f} (+{r.lock_to:g} from the fill)")
+                fields.append(field("Order", f"{placed.status if placed is not None else 'PENDING'} · "
+                                    f"{'#' + str(pend.get('ticket')) if pend.get('ticket') else pend.get('id')} · "
+                                    f"expires {ist(pend['expires'], off, '%H:%M')} IST ({self.cfg.limit_ttl_bars_921} bars)", inline=False))
+            elif why:
                 fields.append(field("Not placed", why, inline=False))
             elif placed is not None:
                 fields.append(field("Order", f"{placed.status}" + (f" · ticket #{placed.ticket}" if placed.ticket else "") + (f" · fill {placed.price:.2f}" if placed.price else ""), inline=False))
             png = context_chart(df, self.symbol, self.S.display_name, self.S.fast, self.S.slow, self.S.ema_cols, off, self.chart_dir,
                                 marker={"index": last, "side": side, "label": "CROSS", "stop": sl, "secure": close + s * r.lock_at})
-            title = f"ENTER {side} · 9/21 cross" if why is None else f"SIGNAL {side} · 9/21 cross"
+            title = (P921.title(pend, lambda t: ist(t, off, "%H:%M") + " IST") if pend else
+                     f"ENTER {side} · 9/21 cross" if why is None else f"SIGNAL {side} · 9/21 cross")
             self.notify.send(self.key(f"ENTER_{side}", bk), ctitle(self.symbol, title, side), [], png=png, fields=fields + self._context_fields(df),
                              color=colour, footer=cfooter(self.S.display_name, f"bar {ist(bar_t, off)} · M30"), event="ENTER")
             for adv in self.advisors():

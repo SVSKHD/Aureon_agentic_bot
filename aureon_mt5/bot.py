@@ -122,6 +122,11 @@ def status_card(sym: str, ag, cfg, journal=None, monitor=None, claude=None, code
     else:
         fields.append(_field("Execution", "off"))
     try:
+        from . import auto_trade
+        fields.append(_field("Auto-trade", auto_trade.status_line(cfg)))       # v2.17.0
+    except Exception:
+        pass
+    try:
         from .control import mode_label
         fields.append(_field("Control", mode_label(journal, sym) if journal else "—"))
     except Exception:
@@ -207,7 +212,9 @@ HELP = {
         "take": "Accept pending ask — user places order unless AUREON_EXECUTION=1",
         "skip": "Reject pending ask — user action",
         "close": "Close the open position on a symbol now — same path as the phone's CLOSE (execution on)",
-        "place": "Manual order with the mode's SL/TP: /place long|short [lots] [sl] [tp] — same gate as auto entries",
+        "update": "Check origin/master now and apply when flat (suite green → restart) · /update hold | resume — admin",
+        "auto-trade": "ema921 automatic placement: /auto-trade on|off|status — off = signals only (/place by hand) — admin",
+        "place": "Manual order with the mode's SL/TP: /place long|short [lots] [sl] [tp] [limit=<price|±pts>] — same gate as auto entries",
         "sl": "Move the open position's SL: /sl -20 · /sl +15 · /sl 2450.5 (pts from entry ≤ 200, else a price)",
         "tp": "Set / remove the TP: /tp +60 · /tp 2500 · /tp off",
         "alert": "Arm price watch — user chooses price; bot monitors",
@@ -309,6 +316,10 @@ def feature_set_action(cfg, agents, journal, notify, claude, user, name: str, va
         new_preview = None if reset else features.parse(f, value)
     except ValueError as e:
         return f"⚠️ {e}"
+    if f.name == "auto_trade":                                      # v2.17.0: same refusals as /auto-trade
+        if reset:
+            return "⚠️ auto_trade: use /auto-trade on|off (the boot default is AUREON_AUTO)"
+        return auto_trade_action(cfg, agents, journal, notify, user, "on" if new_preview else "off", force=force, admin_role=role)
     if not f.hot and ops.positions_block_mode_change(agents) and not force:
         return (f"⛔ {f.name} is not hot — a position is open (or the snapshot cannot prove flat). "
                 f"Retry with force:true to change it anyway.")
@@ -332,6 +343,34 @@ def feature_set_action(cfg, agents, journal, notify, claude, user, name: str, va
             pass
     ov = features.load_overrides(cfg.log_dir)
     return f"{features.line(f, cfg, ov)}" + (" · forced with a position open" if force and not f.hot else "")
+
+
+def auto_trade_action(cfg, agents, journal, notify, user, action: str, force: bool = False, reason: str = "",
+                      admin_role: str | None = None, is_demo=None, environ=None) -> str:
+    """v2.17.0 /auto-trade on|off|status. on/off are admin only; status is read-only."""
+    from . import auto_trade, ops
+    act = (action or "status").strip().lower()
+    if act in ("status", ""):
+        return auto_trade.status_text(cfg, environ)
+    if act not in ("on", "off"):
+        return "⚠️ /auto-trade on | off | status"
+    role = os.environ.get("AUREON_ADMIN_ROLE_ID", "") if admin_role is None else admin_role
+    if not ops.admin_allowed(user, role):
+        return "Denied: configured administrator role required"
+    return auto_trade.set_state(cfg, agents, journal, notify, user, act == "on", force=force, reason=reason, is_demo=is_demo,
+                                environ=environ)
+
+
+def update_action(cfg, user, action: str = "", admin_role: str | None = None, updater=None) -> str:
+    """v2.17.0 /update · /update hold · /update resume (admin)."""
+    from . import auto_update, ops
+    role = os.environ.get("AUREON_ADMIN_ROLE_ID", "") if admin_role is None else admin_role
+    if not ops.admin_allowed(user, role):
+        return "Denied: configured administrator role required"
+    up = updater or auto_update.CURRENT.get("updater")
+    if up is None:
+        return "⚠️ the auto-updater is not running in this process"
+    return up.command(action, user)
 
 
 def repair_action(kind: str, cfg, agents, claude, repairer, user, n: int, force: bool = False, admin_role: str | None = None) -> Reply:
@@ -1374,8 +1413,10 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
     @tree.command(name="place", description="Manual order with the mode's SL/TP (pts ≤ 200 from entry, else a price) — same gate as auto")
     @app_commands.describe(side="long or short", lots="lots (default: the mode's risk size, capped at AUREON_MAX_LOTS)",
                            sl="SL: points from entry (≤ 200) or a price; default the mode's stop",
-                           tp="TP: points or a price; default the mode's (ema921: none); 'off' = none", symbol="default: primary")
-    async def place_cmd(inter: discord.Interaction, side: str, lots: float | None = None, sl: str = "", tp: str = "", symbol: str = ""):
+                           tp="TP: points or a price; default the mode's (ema921: none); 'off' = none", symbol="default: primary",
+                           limit="pending limit order: a price, or points back from the market (buy below / sell above)")
+    async def place_cmd(inter: discord.Interaction, side: str, lots: float | None = None, sl: str = "", tp: str = "", symbol: str = "",
+                        limit: str = ""):
         user = inter.user
         def work():
             if side.strip().lower() not in ("long", "short", "buy", "sell"):
@@ -1384,7 +1425,7 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
             if ag is None:
                 return Reply(content=f"⛔ no agent for {sym}")
             res = _manual.place(cfg, agents, journal, ag, "LONG" if side.strip().lower() in ("long", "buy") else "SHORT",
-                                lots=lots, sl_raw=(sl or None), tp_raw=(tp or None), user=user)
+                                lots=lots, sl_raw=(sl or None), tp_raw=(tp or None), user=user, limit_raw=(limit or None))
             return Reply(content=res["text"], card=res["card"])
         await run(inter, "place", work)
 
@@ -2034,6 +2075,18 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
                         kwargs={"log_dir": cfg.log_dir, "exit_hook": lambda code: ops.hard_exit(code, agents)}).start()
 
     # ------------------------------------------------------------------ v2.10.0 feature toggles
+    @tree.command(name="auto-trade", description="Admin: ema921 automatic placement on / off (status: read-only) — off = signals only")
+    @app_commands.describe(action="on | off | status", force="allow AUREON_MAX_LOTS unset or > 1.0", reason="journaled with the change")
+    async def auto_trade_cmd(inter: discord.Interaction, action: str = "status", force: bool = False, reason: str = ""):
+        user = inter.user
+        await run(inter, "auto-trade", lambda: Reply(content=auto_trade_action(cfg, agents, journal, notify, user, action, force, reason)))
+
+    @tree.command(name="update", description="Admin: check origin/master now and apply when flat · hold / resume the auto path")
+    @app_commands.describe(action="blank = check now · hold · resume")
+    async def update_cmd(inter: discord.Interaction, action: str = ""):
+        user = inter.user
+        await run(inter, "update", lambda: Reply(content=update_action(cfg, user, action)), timeout=1900)
+
     @tree.command(name="features", description="Every feature toggle with value and source (discord/env/default)")
     @app_commands.describe(group="claude | guardian | plan | repair | context | regime (default: all)")
     async def features_cmd(inter: discord.Interaction, group: str = ""):

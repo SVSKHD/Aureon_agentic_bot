@@ -165,6 +165,35 @@ def positions(symbol: str) -> list[dict]:
     return out
 
 
+PENDING_TYPES = {2: "buy_limit", 3: "sell_limit", 4: "buy_stop", 5: "sell_stop", 6: "buy_stop_limit", 7: "sell_stop_limit"}
+
+
+def pending_orders(symbol: str) -> list[dict] | None:
+    """v2.17.0: the symbol's pending orders (orders_get). [] without MT5; None when MT5 is there but the call fails."""
+    m = mt5()
+    if not m:
+        return []
+    if not hasattr(m, "orders_get"):
+        return []
+    try:
+        with _lock:
+            got = m.orders_get(symbol=symbol)
+    except Exception:
+        return None
+    if got is None:
+        return None if getattr(m, "last_error", lambda: (0, ""))()[0] not in (0, 1) else []
+    out = []
+    for o in got:
+        t = int(getattr(o, "type", -1))
+        out.append({"ticket": int(o.ticket), "symbol": symbol, "type": PENDING_TYPES.get(t, str(t)),
+                    "side": "LONG" if t in (2, 4, 6) else "SHORT", "price": float(getattr(o, "price_open", 0.0)),
+                    "sl": float(getattr(o, "sl", 0.0) or 0.0), "tp": float(getattr(o, "tp", 0.0) or 0.0),
+                    "volume": float(getattr(o, "volume_current", getattr(o, "volume_initial", 0.0)) or 0.0),
+                    "expiration": int(getattr(o, "time_expiration", 0) or 0), "comment": str(getattr(o, "comment", "") or ""),
+                    "magic": int(getattr(o, "magic", 0) or 0), "time_setup": int(getattr(o, "time_setup", 0) or 0)})
+    return out
+
+
 def digits(symbol: str) -> int:
     m = mt5()
     try:
@@ -443,7 +472,9 @@ def place_market(symbol: str, side: str, lots: float, sl: float | None = None, c
                 req["sl"] = c_sl
             if c_tp is not None:                                 # v2.16.0: broker-side take-profit (ema921 cap)
                 req["tp"] = c_tp
-            held = m.positions_get(symbol=symbol) or []      # v2.16.2: the position cap, under the lock (no racing taps)
+            held = list(m.positions_get(symbol=symbol) or [])    # v2.16.2: the position cap, under the lock (no racing taps)
+            if hasattr(m, "orders_get"):                     # v2.17.0: a pending order counts as "in position"
+                held += list(m.orders_get(symbol=symbol) or [])
             if held:
                 _emit("entry_blocked_position_cap", symbol=symbol, side="LONG" if is_buy else "SHORT", source=f"broker:{comment}",
                       open=[getattr(x, "ticket", None) for x in held])
@@ -466,6 +497,74 @@ def place_market(symbol: str, side: str, lots: float, sl: float | None = None, c
                         last_error="" if ok else _err(), requested_sl=req.get("sl", sl), bid=t.bid, ask=t.ask,
                         ticket=int(ticket) if ticket else None, price=float(price) if price else None, volume=float(getattr(r, "volume", lots) or lots),
                         fill_mode=used)
+
+
+PLACED_RETCODES = (10008, 10009)                    # TRADE_RETCODE_PLACED (a pending order) · TRADE_RETCODE_DONE
+INVALID_EXPIRATION = 10022                          # TRADE_RETCODE_INVALID_EXPIRATION
+
+
+def place_pending(symbol: str, side: str, lots: float, level: float, sl: float | None, tp: float | None, expiration: int,
+                  comment: str = "aureon 921") -> BrokerResult:
+    """v2.17.0 — a BUY_LIMIT (long, below the ask) / SELL_LIMIT (short, above the bid) at `level` with SL / TP on the order,
+    TRADE_ACTION_PENDING · ORDER_TIME_SPECIFIED · expiration (server-clock epoch, like bar times). Same cap as place_market,
+    under the lock: an open position or another pending order on the symbol refuses it."""
+    m = mt5()
+    if not m:
+        return BrokerResult(False, "NO_CONNECTION", comment="no MT5")
+    is_buy = side.upper() in ("LONG", "BUY")
+    with _lock:
+        m.symbol_select(symbol, True)
+        t = m.symbol_info_tick(symbol)
+        if not t:
+            return BrokerResult(False, "BROKER_REJECTED", comment="no tick", last_error=_err())
+        held = list(m.positions_get(symbol=symbol) or []) + (list(m.orders_get(symbol=symbol) or []) if hasattr(m, "orders_get") else [])
+        if held:
+            _emit("entry_blocked_position_cap", symbol=symbol, side="LONG" if is_buy else "SHORT", source=f"broker:{comment}",
+                  open=[getattr(x, "ticket", None) for x in held])
+            return BrokerResult(False, "POSITION_CAP", comment=f"{symbol} already has {len(held)} open position / order(s)",
+                                bid=t.bid, ask=t.ask)
+        si = stops_info(m, symbol); d = si["digits"]
+        req = {"action": getattr(m, "TRADE_ACTION_PENDING", 5), "symbol": symbol, "volume": float(lots),
+               "type": getattr(m, "ORDER_TYPE_BUY_LIMIT", 2) if is_buy else getattr(m, "ORDER_TYPE_SELL_LIMIT", 3),
+               "price": round(float(level), d), "deviation": 30, "comment": comment[:31],
+               "type_time": getattr(m, "ORDER_TIME_SPECIFIED", 2), "expiration": int(expiration)}
+        if sl is not None:
+            req["sl"] = round(float(sl), d)
+        if tp is not None:
+            req["tp"] = round(float(tp), d)
+        bad = getattr(m, "TRADE_RETCODE_INVALID_FILL", INVALID_FILL); r = None; used = None
+        for name in fill_sequence("return"):                  # pending orders: RETURN first, the others only on INVALID_FILL
+            req["type_filling"] = _fill_const(m, name); used = name
+            r = m.order_send(req)
+            if r is None or getattr(r, "retcode", None) != bad:
+                break
+        if r is not None and getattr(r, "retcode", None) == INVALID_EXPIRATION:   # the symbol refuses a set expiry:
+            req["type_time"] = getattr(m, "ORDER_TIME_GTC", 0); req.pop("expiration", None)   # GTC, Aureon cancels at expiry
+            r = m.order_send(req); used = f"{used} · gtc"
+    if r is None:
+        return BrokerResult(False, "BROKER_REJECTED", comment="order_send returned None", last_error=_err(), bid=t.bid, ask=t.ask)
+    ok = r.retcode in PLACED_RETCODES
+    ticket = getattr(r, "order", None)
+    return BrokerResult(ok, "PENDING_PLACED" if ok else "BROKER_REJECTED", changed=ok, retcode=r.retcode,
+                        comment=getattr(r, "comment", ""), last_error="" if ok else _err(), requested_sl=req.get("sl"),
+                        bid=t.bid, ask=t.ask, ticket=int(ticket) if ticket else None, price=req["price"], volume=float(lots),
+                        fill_mode=used, tp=req.get("tp"))
+
+
+def cancel_order(ticket: int, symbol: str = "") -> BrokerResult:
+    """v2.17.0 — remove a pending order (TRADE_ACTION_REMOVE). Gone already → ORDER_NOT_FOUND (not an error for callers)."""
+    m = mt5()
+    if not m:
+        return BrokerResult(False, "NO_CONNECTION", comment="no MT5")
+    with _lock:
+        if hasattr(m, "orders_get") and not (m.orders_get(ticket=ticket) or []):
+            return BrokerResult(False, "ORDER_NOT_FOUND", comment="order not found")
+        r = m.order_send({"action": getattr(m, "TRADE_ACTION_REMOVE", 8), "order": int(ticket)})
+    if r is None:
+        return BrokerResult(False, "BROKER_REJECTED", comment="order_send returned None", last_error=_err())
+    ok = r.retcode in PLACED_RETCODES
+    return BrokerResult(ok, "CANCELLED" if ok else "BROKER_REJECTED", changed=ok, retcode=r.retcode, comment=getattr(r, "comment", ""),
+                        last_error="" if ok else _err())
 
 
 def spread(symbol: str) -> float | None:
