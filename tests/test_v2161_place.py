@@ -33,7 +33,7 @@ def test_parse_place():
 
 
 def test_defaults_per_mode():
-    assert M.mode_defaults(get_strategy("ema921"), "XAUUSD") == (30.0, None)
+    assert M.mode_defaults(get_strategy("ema921"), "XAUUSD") == (10.0, 10.0)          # v2.18.0: 1000 / 1000 pts
     assert M.mode_defaults(get_strategy("ema9200"), "XAUUSD") == (30.0, None)
     for mode in ("ema2050", "ema5080"):
         S = get_strategy(mode)
@@ -78,9 +78,9 @@ def test_place_short_with_mode_defaults(harness, monkeypatch):
     res = do_place(ag, "SHORT", lots=0.24)
     assert res["ok"] and res["placed"] and calls["place"]
     (sym, side, lots, sl), kw = calls["place"][0]
-    assert (sym, side, lots, sl, kw["tp"], kw["comment"]) == ("XAUUSD", "SHORT", 0.24, 3330.0, None, "aureon /place")
+    assert (sym, side, lots, sl, kw["tp"], kw["comment"]) == ("XAUUSD", "SHORT", 0.24, 3310.0, 3290.0, "aureon /place")
     row = [r for r in ag.journal.read(0) if r["event"] == "order_placed"][-1]
-    assert row["actor"] == "human" and row["rationale"] == "/place" and row["sl"] == 3330.0 and row["tp"] is None
+    assert row["actor"] == "human" and row["rationale"] == "/place" and row["sl"] == 3310.0 and row["tp"] == 3290.0
     assert res["card"]["title"] == "XAUUSD · MT5 · PLACED SHORT"
     names = [f["name"] for f in res["card"]["fields"]]
     assert {"Side", "Entry", "Lot", "Stop / TP", "Lock", "Exit", "Order"} <= set(names)

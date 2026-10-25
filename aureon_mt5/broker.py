@@ -194,6 +194,34 @@ def pending_orders(symbol: str) -> list[dict] | None:
     return out
 
 
+def point(symbol: str) -> float | None:
+    """v2.18.0: the symbol's point (symbol_info.point). None without MT5."""
+    m = mt5()
+    if not m:
+        return None
+    try:
+        with _lock:
+            info = m.symbol_info(symbol)
+        return float(getattr(info, "point", 0.0) or 0.0) or None
+    except Exception:
+        return None
+
+
+def point_value(symbol: str) -> float | None:
+    """v2.18.0: account-currency value of ONE point at 1 lot (tick_value / tick_size × point). None without MT5."""
+    m = mt5()
+    if not m:
+        return None
+    try:
+        with _lock:
+            info = m.symbol_info(symbol)
+        tv = float(getattr(info, "trade_tick_value", 0.0) or 0.0); ts = float(getattr(info, "trade_tick_size", 0.0) or 0.0)
+        pt = float(getattr(info, "point", 0.0) or 0.0)
+        return tv / ts * pt if tv and ts and pt else None
+    except Exception:
+        return None
+
+
 def digits(symbol: str) -> int:
     m = mt5()
     try:

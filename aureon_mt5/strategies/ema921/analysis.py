@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 
 from ...common.source import Bars
-from .journeys import build as build_journeys, rules_for
+from .journeys import build as build_journeys, rules_for, with_overrides
 
 FAST, SLOW = 9, 21
 
@@ -26,7 +26,7 @@ def analyse(bars: dict[str, Bars], display_from: int | None, symbol: str, server
     key = next(iter(bars)); df = add_emas(bars[key].df)
     if display_from is not None:
         df = df[df["time"] >= display_from].reset_index(drop=True)
-    rules = dataclasses.replace(rules_for(symbol), news_times=news_times, **(overrides or {}))
+    rules = with_overrides(dataclasses.replace(rules_for(symbol), news_times=news_times), overrides)
     out = {"df": df, "crosses": [], "ema_periods": (FAST, SLOW)}
     out.update(build_journeys(df, rules, server_offset_h, trade_from, day_end, **guardian_kw))
     out["rules"] = rules; out["trend"] = out["bar_states"]; out["unfiltered_summary"] = out["summary"]

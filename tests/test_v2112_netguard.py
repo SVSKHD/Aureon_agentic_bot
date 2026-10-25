@@ -442,7 +442,8 @@ def test_heartbeat_card_carries_the_dns_line(tmp_path, monkeypatch):
     n = types.SimpleNamespace(send=lambda key, title, lines, **k: sent.append(lines) or True)
     cfg = Config(); cfg.log_dir = str(tmp_path)
     wd = Watchdog(n, Journal(str(tmp_path)), cfg, {})
-    wd._heartbeat(time.time()) if hasattr(wd, "_heartbeat") else wd.heartbeat(time.time())
+    tue = 1_792_454_400.0                                                   # Tue 20 Oct 2026 05:30 IST (a weekend skips a quiet heartbeat)
+    wd._heartbeat(tue) if hasattr(wd, "_heartbeat") else wd.heartbeat(tue)
     assert any("DNS: discord.com ❌ getaddrinfo failed" in l for l in sent[0])
 
 

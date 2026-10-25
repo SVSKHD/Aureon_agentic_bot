@@ -122,6 +122,35 @@ def timeframe_line(cfg) -> str:
     return f"exec {ex} · confirm {', '.join(conf) or '—'} · HTF gate {getattr(cfg, 'htf_align', 'off')}"
 
 
+METALS = ("XAU", "XAG")
+
+
+def startup_symbols(symbols: list[str], mode: str) -> tuple[list[str], list[str]]:
+    """v2.18.0 boot checks → (symbols to run, problems). symbols[0] drives market_open and the server offset, so it must be a
+    metal (raises SystemExit otherwise). ema921: a symbol without a rules row is dropped (it would run unmanaged) and reported."""
+    if not symbols or not symbols[0].upper().startswith(METALS):
+        raise SystemExit(f"AUREON_SYMBOLS must start with a metal (XAUUSD first) — symbols[0] drives market open / the server "
+                         f"offset; got {', '.join(symbols) or 'nothing'}")
+    if mode != "ema921":
+        return list(symbols), []
+    from aureon_mt5.strategies.ema921 import journeys as J
+    keep, bad = [], []
+    for sym in symbols:
+        try:
+            J.table_key(sym); keep.append(sym)
+        except J.UnknownSymbol as e:
+            bad.append(str(e))
+    return keep, bad
+
+
+def rules_banner(cfg, S) -> str:
+    """v2.18.0: the resolved per-symbol ema921 rules (table + AUREON_921_* + broker point) for the boot banner / card."""
+    if S.name != "ema921":
+        return ""
+    from aureon_mt5.strategies.ema921 import journeys as J
+    return "\n".join(J.banner_lines(cfg.symbols))
+
+
 def greet(notify, cfg, S, why, news_line):
     art = banner()
     gv = git_version() if "git_version" in globals() else ""
@@ -134,6 +163,8 @@ def greet(notify, cfg, S, why, news_line):
     except Exception:
         pass
     print(art); print(f"v{VERSION}{' · ' + gv if gv else ''} · {S.display_name} · {why} · {datetime.now(IST):%a %d %b %H:%M} IST · {', '.join(cfg.symbols)}")
+    if S.name == "ema921":
+        print(rules_banner(cfg, S))
     srv = datetime.now(timezone.utc) + timedelta(hours=cfg.server_utc_offset)
     guardian_on = any(S.guardian_for(s) for s in cfg.symbols)
     mt5_state = "CONNECTED" if broker.connected() else ("DRY" if cfg.dry else "DISCONNECTED")
@@ -154,6 +185,7 @@ def greet(notify, cfg, S, why, news_line):
             {"name": "IST", "value": f"{datetime.now(IST):%H:%M}", "inline": True},
             {"name": "News", "value": news_line, "inline": False},
             {"name": "Rules", "value": S.describe(), "inline": False},
+            *([{"name": "Per-symbol rules (points)", "value": rules_banner(cfg, S)[:1024], "inline": False}] if S.name == "ema921" else []),
             {"name": "Features", "value": features_field(cfg), "inline": False},
         ],
         footer=f"{S.display_name} · {datetime.now(IST):%H:%M} IST",
@@ -333,6 +365,9 @@ def main():
     except UnknownMode as e:
         print(mode_help(str(e))); sys.exit(2)
     if a.symbols: cfg.symbols = [s.strip().upper() for s in a.symbols.split(",")]
+    cfg.symbols, symbol_problems = startup_symbols(cfg.symbols, cfg.mode)        # v2.18.0: metal first; ema921 rows only
+    for p_ in symbol_problems:
+        print(f"⛔ {p_} — not started")
     cfg.dry = a.dry; cfg.enable_silver = a.enable_silver
     if a.dry: cfg.source = "synthetic"
     if a.webhook: cfg.webhook = a.webhook
@@ -353,6 +388,9 @@ def main():
     journal.log("process_start", version=VERSION, mode=cfg.mode, exec_tf=tf_synth.exec_tf(), htf_align=cfg.htf_align,
                 symbols=list(cfg.symbols), self_restart_mode=_selfheal_mode())
     health_notify = Notifier(cfg.health_webhook) if cfg.health_webhook else notify
+    if symbol_problems:
+        health_notify.card("AUREON · MT5 · SYMBOLS NOT STARTED", "\n".join(symbol_problems)[:1900],
+                           footer="Aureon MT5 · a symbol without rules never runs unmanaged")
     # v2.10.1 BOOT CHECK: unparsable / out-of-range / contradictory settings fall back to the safe default, loudly
     from aureon_mt5.config import apply_fallbacks, validate as validate_cfg
     boot_problems = validate_cfg(cfg)

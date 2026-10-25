@@ -1,5 +1,17 @@
 # Aureon MT5 State
 
+## v2.18.0 — ema921 multi-symbol pullback (M15)
+- Strategy rules changed: **YES, ema921 only** (ema5080 / ema2050 / ema9200 untouched). Six symbols: XAUUSD (first — it drives
+  market open and the server offset), XAGUSD, EURUSD, GBPUSD, AUDUSD, USDJPY.
+- Rules per symbol in POINTS (`strategies/ema921/journeys.py` SYMBOLS; `to_price` is the only conversion). A symbol without a row
+  raises and is never started.
+- Entry `ema9touch`: cross arms → first later EMA 9 touch within 16 bars → TRADE card. Detect-and-alert: `AUREON_EXECUTION=0`,
+  a human places the trade. Exits bracket (SL / TP / lock / Friday flat).
+- Claude only on `AUREON_CLAUDE_SYMBOLS` (XAUUSD, XAGUSD). A gateway-only Discord outage no longer restarts the process for
+  `AUREON_GATEWAY_ONLY_RESTART_S` (30 min) while MT5 is up.
+- Before live alerts: `python main.py --dry --mode ema921 --symbols <six>` for 30 min (six RUNNING lines in `/parallel-status`),
+  `tools/replay_921.py --symbol XAUUSD` on the Oct 2026 M15 CSV, then one week of `AUREON_PAPER=1`.
+
 ## v2.2.0 operational work
 - Canonical branch: master. Strategy rules changed: **NO**.
 - Do not modify `aureon_mt5/strategies/ema5080/`.

@@ -34,7 +34,13 @@ HEARTBEAT_EVERY_S = 30.0
 STALL_DUMP_LAG_S = 3.0
 RESTART_LAG_S = 30.0
 RESTART_GATEWAY_S = 300.0         # v2.16.2: gateway down this long → in-process rebuild (no supervisor) or exit 75 (supervised)
+GATEWAY_ONLY_RESTART_S = 1800.0   # v2.18.0: supervised, MT5 still up — a gateway-only outage waits this long before exit 75
 REBUILD_BACKOFF_S = (5.0, 30.0, 120.0)   # v2.16.2: between in-process rebuilds while the gateway stays down (capped at the last)
+
+
+def _broker_connected() -> bool:
+    from . import broker
+    return bool(broker.connected())
 
 
 def supervised(environ=None) -> bool:
@@ -84,7 +90,8 @@ def read_heartbeat(log_dir: str) -> str | None:
 class HealthGuard:
     def __init__(self, *, monitor, agents: dict, log_dir: str, journal=None, notify=None, deadman_url: str | None = None,
                  stale_bar_s: float = 900.0, ping=http_ping, exit_hook=None, clock=_time.monotonic, wall=_time.time,
-                 period: float = 2.0, bot_expected: bool = True, is_supervised: bool | None = None, rebuild_hook=None):
+                 period: float = 2.0, bot_expected: bool = True, is_supervised: bool | None = None, rebuild_hook=None,
+                 mt5_up=None, gateway_only_s: float | None = None):
         self.monitor, self.agents, self.log_dir = monitor, agents, log_dir
         self.journal, self.notify, self.deadman_url = journal, notify, deadman_url
         self.stale_bar_s, self.ping, self.exit_hook = stale_bar_s, ping, exit_hook
@@ -107,6 +114,11 @@ class HealthGuard:
         self.rebuilds = 0                           # in-process rebuilds in the current outage
         self.next_rebuild_at: float | None = None
         self.outage_t0: float | None = None
+        # v2.18.0: a DNS blip on the host must not bounce every agent while stops are live — exit 75 on a lost gateway only
+        # when MT5 is down too; a gateway-only outage waits AUREON_GATEWAY_ONLY_RESTART_S (1800 s)
+        self.mt5_up = mt5_up if mt5_up is not None else _broker_connected
+        self.gateway_only_s = float(gateway_only_s if gateway_only_s is not None
+                                    else os.environ.get("AUREON_GATEWAY_ONLY_RESTART_S") or GATEWAY_ONLY_RESTART_S)
 
     # -------------------------------------------------------------- health conditions
     def _gateway_up(self) -> bool:
@@ -266,7 +278,15 @@ class HealthGuard:
         if down <= RESTART_GATEWAY_S:
             return None
         if self.supervised:
-            return f"Discord gateway down {down:.0f} s (> {RESTART_GATEWAY_S:.0f} s) — supervised, restarting"
+            try:
+                mt5_ok = bool(self.mt5_up())
+            except Exception:
+                mt5_ok = False
+            if not mt5_ok:
+                return f"Discord gateway down {down:.0f} s (> {RESTART_GATEWAY_S:.0f} s) and MT5 disconnected — supervised, restarting"
+            if down > self.gateway_only_s:
+                return f"Discord gateway down {down:.0f} s (> {self.gateway_only_s:.0f} s, MT5 up) — supervised, restarting"
+            return None                                           # gateway-only: the agents and their stops keep running
         if self.outage_t0 is None:
             self.outage_t0 = now - down
         if self.next_rebuild_at is not None and now < self.next_rebuild_at:

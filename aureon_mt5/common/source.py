@@ -136,11 +136,21 @@ def resample(bars: Bars, timeframe: str) -> Bars:
 
 
 # --------------------------------------------------------------------------- synthetic
+DRY_PRICES = {"XAG": 31.0, "EURUSD": 1.08, "GBPUSD": 1.29, "AUDUSD": 0.66, "USDJPY": 151.0}   # v2.18.0: --dry per symbol
+
+
 def synthetic_m1(symbol: str, minutes: int, start_price: float = 2650.0, seed: int = 7,
                  end_time: int | None = None) -> Bars:
     """Trending/mean-reverting random walk with intraday session shape so EMA
-    crosses actually happen. Deterministic for a given seed."""
+    crosses actually happen. Deterministic for a given seed. v2.18.0: other symbols start at their own price level (the steps
+    already scale with the price) and their own seed, so six --dry agents do not trade one identical series."""
+    if start_price == 2650.0:
+        u = symbol.upper()
+        key = next((k for k in DRY_PRICES if u.startswith(k)), None)
+        if key:
+            start_price = DRY_PRICES[key]; seed = seed + sum(map(ord, key))
     rng = random.Random(seed)
+    dg = 2 if start_price >= 200 else 3 if start_price >= 10 else 5
     end_time = end_time or 1_760_000_000  # ~Oct 2025 as server time
     end_time -= end_time % 60
     t0 = end_time - minutes * 60
@@ -159,10 +169,10 @@ def synthetic_m1(symbol: str, minutes: int, start_price: float = 2650.0, seed: i
         step = (drift + rng.gauss(0, 0.9)) * session * (price / 2650)
         o = price
         c = price + step
-        wick = abs(rng.gauss(0, 0.6)) * session
+        wick = abs(rng.gauss(0, 0.6)) * session * (price / 2650)      # v2.18.0: scaled like the step (FX wicks were $0.6)
         h = max(o, c) + wick * rng.random()
         l = min(o, c) - wick * rng.random()
-        rows.append((t, round(o, 2), round(h, 2), round(l, 2), round(c, 2), int(80 + 400 * session * rng.random())))
+        rows.append((t, round(o, dg), round(h, dg), round(l, dg), round(c, dg), int(80 + 400 * session * rng.random())))
         price = c
     df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume"])
     return Bars(symbol, "M1", df)

@@ -30,6 +30,7 @@ from . import alerts as alerts_mod
 from .common.chop import chop_state as _chop_state
 from . import leg_guardian as lg
 from . import pending921 as P921
+from .strategies.ema921.journeys import to_price as to_price_921
 from . import setup as setup_mod
 import os
 import numpy as np
@@ -195,6 +196,9 @@ class SymbolAgent(threading.Thread):
     def run(self):
         if not self.dry:
             self.off = broker.server_offset_hours(self.symbol, self.cfg.server_utc_offset); self.health["offset_h"] = self.off
+        if self.S.name == "ema921":                                       # v2.18.0: the broker's point → the rules' points
+            from .strategies.ema921 import journeys as _J
+            _J.set_point(self.symbol, None if self.dry else broker.point(self.symbol))
         announced_closed = False
         while not self._stop_evt.is_set():
             try:
@@ -262,6 +266,8 @@ class SymbolAgent(threading.Thread):
 
     def advisors(self) -> list:
         """v2.3.0: the advisors attached to this agent (advisory / manage), Claude first."""
+        if self.symbol.upper() not in tuple(getattr(self.cfg, "claude_symbols", ()) or ()):   # v2.18.0: AUREON_CLAUDE_SYMBOLS
+            return []
         return [a for a in (self.claude, self.codex) if a is not None]
 
     def chart_now(self) -> str | None:
@@ -309,7 +315,7 @@ class SymbolAgent(threading.Thread):
         n = len(df) - 1
 
         # ---- 1) current state at start-up
-        order = f"EMA {self.S.fast} {'above' if sign[n] > 0 else 'below'} EMA {self.S.slow} (gap {e_f[n] - e_s[n]:+.2f})"
+        order = f"EMA {self.S.fast} {'above' if sign[n] > 0 else 'below'} EMA {self.S.slow} (gap {e_f[n] - e_s[n]:+.{self._dg}f})"
         last_cross = next((i for i in range(n, max(start, 1) - 1, -1) if sign[i] != 0 and sign[i - 1] != 0 and sign[i] != sign[i - 1]), None)
         last_p = next((i for i in range(n, max(start, 1) - 1, -1) if i in pres), None)
         if last_p is not None and (last_cross is None or last_p > last_cross) and n - last_p <= 12:
@@ -317,7 +323,7 @@ class SymbolAgent(threading.Thread):
             colour = EVENT_COLOURS["signal_long" if pres[last_p].label == "PB" else "signal_short"]
         elif last_cross is not None and n - last_cross <= 24:
             side = "LONG" if sign[last_cross] > 0 else "SHORT"
-            state = f"**CROSS confirmed {n - last_cross} bars ago** — {side} at {ist(int(t[last_cross]), off)} IST @ {c[last_cross]:.2f} · {sess(t[last_cross])}"
+            state = f"**CROSS confirmed {n - last_cross} bars ago** — {side} at {ist(int(t[last_cross]), off)} IST @ {c[last_cross]:.{self._dg}f} · {sess(t[last_cross])}"
             colour = EVENT_COLOURS["cross"]
         else:
             state = "no setup right now — waiting for the next approach"; colour = EVENT_COLOURS["info"]
@@ -327,8 +333,8 @@ class SymbolAgent(threading.Thread):
                             bars=160, title_extra="start-up")
         self.notify.send(self.key("STARTUP", bar_key(bar_t, off)), ctitle(self.symbol, "STARTED · WHERE WE ARE"), [state], png,
                          fields=[field("Started", f"{datetime.now(IST):%d %b %H:%M} IST"), field("Session", sess(bar_t)),
-                                 field("Last bar", f"{ist(bar_t, off)} IST"), field("Price", f"**{close:.2f}**"),
-                                 field(f"EMA {self.S.fast}", f"{ef:.2f}"), field(f"EMA {self.S.slow}", f"{es:.2f}"),
+                                 field("Last bar", f"{ist(bar_t, off)} IST"), field("Price", f"**{close:.{self._dg}f}**"),
+                                 field(f"EMA {self.S.fast}", f"{ef:.{self._dg}f}"), field(f"EMA {self.S.slow}", f"{es:.{self._dg}f}"),
                                  field("Lines", order, inline=False)],
                          color=colour, footer=cfooter(self.S.display_name, "late-start catch-up"))
 
@@ -361,19 +367,19 @@ class SymbolAgent(threading.Thread):
             status = "still running" if lg["open"] else f"leg ended {ist(int(t[lg['end']]), off)[-5:]} IST"
             fields.append(field(head,
                                 f"Trend **{trend}**\n"
-                                f"Cross at **{c[ci]:.2f}** → moved till **{till_px:.2f}** at {ist(int(t[pk]), off)[-5:]} IST\n"
-                                f"Move **{lg['move']:+.1f}** · against −{lg['adverse']:.1f} · {status}", inline=False))
+                                f"Cross at **{c[ci]:.{self._dg}f}** → moved till **{till_px:.{self._dg}f}** at {ist(int(t[pk]), off)[-5:]} IST\n"
+                                f"Move **{lg['move']:+.{self._dgm}f}** · against −{lg['adverse']:.{self._dgm}f} · {status}", inline=False))
         if ps_today:
             fields.append(field("P signals today", " · ".join(f"{ist(int(t[i]), off)[-5:]} {sd}" for i, sd in ps_today[-8:]), inline=False))
         total = sum(lg["move"] for lg in legs if not lg["before_day"])
         for lg in legs:
             long = lg["side"] == "LONG"; pk = lg["peak_idx"]
-            lg["label"] = f"{c[lg['start']]:.1f} → {float(h_[pk] if long else l_[pk]):.1f}"
+            lg["label"] = f"{c[lg['start']]:.{self._dgm}f} → {float(h_[pk] if long else l_[pk]):.{self._dgm}f}"
         png2 = context_chart(df, self.symbol, self.S.display_name, self.S.fast, self.S.slow, self.S.ema_cols, off, self.chart_dir,
                              bars=max(160, n - (legs[0]["start"] if legs else n) + 20), title_extra="legs since day start",
                              regions=legs, day_start_ts=day_start_srv)
         self.notify.send(self.key("STARTUP_EARLIER", bar_key(bar_t, off)), ctitle(self.symbol, f"EARLIER TODAY · {self.S.fast}/{self.S.slow} LEGS"),
-                         [f"{sum(not lg['before_day'] for lg in legs)} cross(es) since 00:00 IST · available move today **{total:+.1f}** · "
+                         [f"{sum(not lg['before_day'] for lg in legs)} cross(es) since 00:00 IST · available move today **{total:+.{self._dgm}f}** · "
                           f"shaded on the chart: cross → peak of each leg"],
                          png2, fields=fields, color=EVENT_COLOURS["info"], footer=cfooter(self.S.display_name, "late-start catch-up"))
 
@@ -1454,7 +1460,7 @@ class SymbolAgent(threading.Thread):
                 lock_px = pos["entry"] + s * r.lock_to
                 self.journal.log("locked", symbol=self.symbol, mode=self.S.name, ticket=pos["id"], sl=lock_px, peak=pos["peak"], paper=True)
                 self.notify.send(self.key("LOCK", pos["id"]), ctitle(self.symbol, f"🔒 +{r.lock_at:g} seen → floor +{r.lock_to:g} · PAPER", side),
-                                 [f"paper SL → {lock_px:.2f} · peak +{pos['peak']:.1f}"], color=EVENT_COLOURS["info"],
+                                 [f"paper SL → {lock_px:.{self._dg}f} · peak +{pos['peak']:.{self._dg}f}"], color=EVENT_COLOURS["info"],
                                  footer=cfooter(self.S.display_name, tag), event="LOCK")
             if not out or out["event"] != "close":
                 keep.append(pos); continue
@@ -1465,8 +1471,8 @@ class SymbolAgent(threading.Thread):
                    "ema_close": f"close through {str(out.get('line', 'ema9')).upper()}"}.get(out["reason"], out["reason"])
             self.journal.log("closed_by_rule", symbol=self.symbol, mode=self.S.name, ticket=pos["id"], reason=out["reason"], points=pts,
                              peak=pos["peak"], lots=pos["lots"], price=out["price"], paper=True)
-            self.notify.send(self.key("CLOSED", f"{pos['id']}-paper"), ctitle(self.symbol, f"CLOSED {pos['side']} {pts:+.1f} · {why} · PAPER", side),
-                             [f"entry {pos['entry']:.2f} → {out['price']:.2f} · peak +{pos['peak']:.1f} · worst −{pos.get('mae', 0.0):.1f} · "
+            self.notify.send(self.key("CLOSED", f"{pos['id']}-paper"), ctitle(self.symbol, f"CLOSED {pos['side']} {pts:+.{self._dg}f} · {why} · PAPER", side),
+                             [f"entry {pos['entry']:.{self._dg}f} → {out['price']:.{self._dg}f} · peak +{pos['peak']:.{self._dg}f} · worst −{pos.get('mae', 0.0):.{self._dg}f} · "
                               f"${usd:+,.0f} at {pos['lots']:g} lots"],
                              color=EVENT_COLOURS["closed_win" if pts > 0 else "closed_loss"], footer=cfooter(self.S.display_name, tag),
                              event="CLOSED" if pts > 0 else "STOP", points=pts)
@@ -1593,7 +1599,7 @@ class SymbolAgent(threading.Thread):
             self.journal.log("pending_adopted", symbol=self.symbol, mode=self.S.name, ticket=o["ticket"], side=o["side"], level=o["price"],
                              expires=st["pending"]["expires"])
             self.notify.send(self.key("PENDING_ADOPTED", o["ticket"]),
-                             ctitle(self.symbol, f"PENDING {o['side']} adopted · {P921.order_type(o['side'])} {o['price']:.2f} · #{o['ticket']}"),
+                             ctitle(self.symbol, f"PENDING {o['side']} adopted · {P921.order_type(o['side'])} {o['price']:.{self._dg}f} · #{o['ticket']}"),
                              ["found on boot — tracked again, never re-placed"], color=EVENT_COLOURS["info"], footer=cfooter(self.S.display_name))
 
     def _pending_filled921(self, pend, ticket, fill):
@@ -1606,9 +1612,9 @@ class SymbolAgent(threading.Thread):
                          paper=bool(pend.get("paper")), by=pend.get("by"))
         side = pend["side"]
         self.notify.send(self.key("PENDING_FILLED", ticket),
-                         ctitle(self.symbol, f"FILLED {side} · {P921.order_type(side)} {pend['level']:.2f} · fill {fill:.2f}"
-                                + (f" · {sv:+.1f} vs the cross close" if sv is not None else "") + (" · PAPER" if pend.get("paper") else ""), side),
-                         [f"#{ticket} · SL {pend['sl']:.2f} · TP {format(pend['tp'], '.2f') if pend.get('tp') else '—'} · "
+                         ctitle(self.symbol, f"FILLED {side} · {P921.order_type(side)} {pend['level']:.{self._dg}f} · fill {fill:.{self._dg}f}"
+                                + (f" · {sv:+.{self._dg}f} vs the cross close" if sv is not None else "") + (" · PAPER" if pend.get("paper") else ""), side),
+                         [f"#{ticket} · SL {pend['sl']:.{self._dg}f} · TP {format(pend['tp'], f'.{self._dg}f') if pend.get('tp') else '—'} · "
                           "managed like a market entry (same guardian, lock, exit)"],
                          color=EVENT_COLOURS["signal_long" if side == "LONG" else "signal_short"], footer=cfooter(self.S.display_name), event="FILLED")
 
@@ -1619,7 +1625,7 @@ class SymbolAgent(threading.Thread):
                          level=pend["level"], expires=pend["expires"], removed_by=by, paper=bool(pend.get("paper")))
         self.notify.send(self.key("PENDING_EXPIRED", pend.get("ticket") or pend.get("id")),
                          ctitle(self.symbol, f"PENDING EXPIRED · no fill in {n} bars" + (" · PAPER" if pend.get("paper") else "")),
-                         [f"{P921.order_type(pend['side'])} {pend['level']:.2f} · expired {ist(pend['expires'], self.off, '%H:%M')} IST · nothing opened"],
+                         [f"{P921.order_type(pend['side'])} {pend['level']:.{self._dg}f} · expired {ist(pend['expires'], self.off, '%H:%M')} IST · nothing opened"],
                          color=EVENT_COLOURS["info"], footer=cfooter(self.S.display_name))
 
     def _pending_gone921(self, pend, reason):
@@ -1628,7 +1634,7 @@ class SymbolAgent(threading.Thread):
                          side=pend["side"], level=pend["level"], reason=reason, paper=bool(pend.get("paper")))
         self.notify.send(self.key("PENDING_CANCELLED", pend.get("ticket") or pend.get("id")),
                          ctitle(self.symbol, f"PENDING CANCELLED · {reason}"),
-                         [f"{P921.order_type(pend['side'])} {pend['level']:.2f}" + (" · PAPER" if pend.get("paper") else "")],
+                         [f"{P921.order_type(pend['side'])} {pend['level']:.{self._dg}f}" + (" · PAPER" if pend.get("paper") else "")],
                          color=EVENT_COLOURS["info"], footer=cfooter(self.S.display_name))
 
     def _cancel_pending921(self, reason: str, only_by: str | None = None) -> str | None:
@@ -1643,6 +1649,83 @@ class SymbolAgent(threading.Thread):
                 return f"cancel failed ({rr.why()})"
         self._pending_gone921(pend, reason)
         return "cancelled"
+
+    def _arm_event921(self, ev, r, side, bar_t, close, info, names):
+        """ARM: `CROSS <side> — waiting for pullback` · CANCEL: `cross cancelled` (opposite cross) · EXPIRE: journal only."""
+        off = self.off; bk = bar_key(bar_t, off); dg = self._dg; pt = r.point
+        if ev.label == "ARM":
+            if self._stale_cross(bar_t):
+                self.journal.log("cross_skipped", symbol=self.symbol, mode=self.S.name, side=side, bar=bar_t, price=close,
+                                 why="stale after reconnect"); return
+            self.journal.log("cross_armed", symbol=self.symbol, mode=self.S.name, side=side, bar=bar_t, price=close, ema9=info["ema9"],
+                             gap_pts=round(info["gap"] / pt), ttl_bars=r.arm_ttl_bars)
+            self.health["last_signal"] = f"{side} 9/21 cross @ {ist(bar_t, off)} — waiting for pullback"
+            self.notify.send(self.key(f"ARM_{side}", bk), ctitle(self.symbol, f"CROSS {side} — waiting for pullback", side),
+                             [f"entry on the first bar touching EMA 9 within {r.arm_ttl_bars} bars "
+                              f"({r.arm_ttl_bars * self.bar_s // 60} min) · an opposite cross cancels"],
+                             fields=[field("EMA 9 now", f"{info['ema9']:.{dg}f}"), field("Price", f"{close:.{dg}f}"),
+                                     field("EMA gap", f"{info['gap'] / pt:+.0f} pts"),
+                                     field("ATR(14)", f"{(info['atr'] or 0) / pt:.0f} pts"), field("Session", names.get(info["session"], "—"))],
+                             color=EVENT_COLOURS["info"], footer=cfooter(self.S.display_name, f"cross · {ist(bar_t, off)} · {self.exec_tf}"),
+                             event="CROSS")
+        elif ev.label == "CANCEL":
+            self.journal.log("cross_cancelled", symbol=self.symbol, mode=self.S.name, side=side, bar=bar_t, price=close, why=ev.reason)
+            self.notify.send(self.key(f"CANCEL_{side}", bk), ctitle(self.symbol, f"cross cancelled · {side} pullback never came", side),
+                             [f"{ev.reason} at {ist(bar_t, off)} — no entry"], color=EVENT_COLOURS["info"],
+                             footer=cfooter(self.S.display_name, self.exec_tf))
+        else:
+            self.journal.log("cross_expired", symbol=self.symbol, mode=self.S.name, side=side, bar=bar_t, price=close, why=ev.reason)
+
+    def _trade_fields921(self, r, side, info, entry, sl, tp, lots, close) -> list:
+        """The TRADE card (the alert a human acts on): entry level, TP / SL in points and money at AUREON_LOT, EMA gap, ATR,
+        spread, session."""
+        dg = self._dg; pt = r.point; lot = float(getattr(self.cfg, "lot", 1.0) or 1.0)
+        names = {"asia": "Asia", "london": "London", "ny": "New York", "off": "off-hours"}
+        cur = lambda pts: (lambda v: f"${v:,.0f}" if v is not None else "—")(self._money921(r, pts, lot))
+        spread = self._spread_pts()
+        out = [field("Symbol", self.symbol), field("Side", f"**{side}**"),
+               field("Entry", f"**{entry:.{dg}f}** (EMA 9 touch · bar close {close:.{dg}f})"),
+               field("TP", (f"{tp:.{dg}f} · +{r.tp_pts} pts · {cur(r.tp_pts)}" if tp else "none")),
+               field("SL", f"{sl:.{dg}f} · −{r.sl_pts} pts · {cur(r.sl_pts)}"),
+               field("Lock", f"+{r.lock_at_pts} pts at a bar close → SL +{r.lock_to_pts} pts"),
+               field("Lot", f"{lot:g} (AUREON_LOT) · money at this lot" + (" · PAPER" if (self.cfg.paper or self.dry) else "")),
+               field("EMA gap", f"{info['gap'] / pt:+.0f} pts"), field("ATR(14)", f"{(info.get('atr') or 0) / pt:.0f} pts"),
+               field("Spread", f"{spread / pt:.0f} pts" if spread is not None else "—"),
+               field("Session", names.get(info.get("session"), "—")),
+               field("After the cross", f"{info.get('bars_after_cross', '?')} bar(s)"),
+               field("Exit", self._exit_text921(r), inline=False)]
+        return out
+
+    @property
+    def _dg(self) -> int:
+        """v2.18.0: price decimals of this symbol (gold 2, JPY / silver 3, FX 5) for every ema921 card."""
+        try:
+            return int(self.S.rules_for(self.symbol).digits) if self.S.name == "ema921" else 2
+        except Exception:
+            return 2
+
+    @property
+    def _dgm(self) -> int:
+        """Decimals of a MOVE on the catch-up cards: 1 (as before) everywhere but ema921, where FX moves are 0.00x."""
+        return self._dg if self.S.name == "ema921" else 1
+
+    def _exit_text921(self, r) -> str:
+        if r.exit_mode == "bracket":
+            return (f"broker TP +{r.tp_pts} / SL −{r.sl_pts} pts · +{r.lock_at_pts} at a bar close → SL +{r.lock_to_pts} pts"
+                    + (f" · Friday flat {r.friday_flat_hour:g}:00 server" if r.friday_flat else ""))
+        return f"first {self.exec_tf} close through EMA 9" + (f" · EMA 200 after +{r.lock_at:g}" if r.exit_mode == "e9>e200" else "")
+
+    def _money921(self, r, pts: float, lots: float) -> float | None:
+        """Account-currency value of `pts` at `lots`: the broker's tick value when MT5 answers, else the table's contract size
+        (a JPY-quoted symbol divided by the price)."""
+        v = broker.point_value(self.symbol) if not self.dry else None
+        if v:
+            return float(pts) * v * float(lots)
+        per = to_price_921(pts, r.point) * r.contract * float(lots)
+        if r.symbol.endswith("JPY"):
+            px = float((self.health or {}).get("close") or 0.0)
+            return per / px if px else None
+        return per
 
     def _week_card_921(self, bar_t):
         """Friday, after the flat bar: the week card once per ISO week (logged in state_<symbol>.json)."""
@@ -1670,10 +1753,10 @@ class SymbolAgent(threading.Thread):
                     continue
                 self.notify.send(self.key("PRE", bk), ctitle(self.symbol, f"PRE-CROSS · 9/21 converging → likely {side}"),
                                  ["no entry on a pre-cross · the close that crosses is the order"],
-                                 fields=[field("Gap", f"{info['gap']:+.2f}"), field("Price", f"{close:.2f}"), field("EMA 9 / 21", f"{info['ema9']:.2f} / {info['ema21']:.2f}"),
-                                         field("EMA 200", f"{info['ema200']:.2f} ({info['dist200']:+.1f})"), field("Last 3", " ".join(info["last3"])),
+                                 fields=[field("Gap", f"{info['gap']:+.{self._dg}f}"), field("Price", f"{close:.{self._dg}f}"), field("EMA 9 / 21", f"{info['ema9']:.{self._dg}f} / {info['ema21']:.{self._dg}f}"),
+                                         field("EMA 200", f"{info['ema200']:.{self._dg}f} ({info['dist200']:+.{self._dg}f})"), field("Last 3", " ".join(info["last3"])),
                                          field("Session", names.get(info["session"], "—"))],
-                                 color=EVENT_COLOURS["info"], footer=cfooter(self.S.display_name, f"pre-cross · {ist(bar_t, off)} · M30"), event="PRE")
+                                 color=EVENT_COLOURS["info"], footer=cfooter(self.S.display_name, f"pre-cross · {ist(bar_t, off)} · {self.exec_tf}"), event="PRE")
                 self.journal.log("pre_cross", symbol=self.symbol, mode=self.S.name, side=side, bar=bar_t, price=close, gap=info["gap"])
                 continue
             if ev.label == "F":
@@ -1681,6 +1764,9 @@ class SymbolAgent(threading.Thread):
                 if getattr(self.cfg, "verbose", False):
                     self.notify.send(self.key("SKIP", bk), ctitle(self.symbol, f"cross {side} skipped"), [ev.reason], color=EVENT_COLOURS["info"],
                                      footer=cfooter(self.S.display_name, ist(bar_t, off)))
+                continue
+            if ev.label in ("ARM", "CANCEL", "EXPIRE"):                    # v2.18.0: the ema9touch state machine
+                self._arm_event921(ev, r, side, bar_t, close, info, names)
                 continue
             if ev.label not in ("EB", "ES"):
                 continue
@@ -1691,7 +1777,9 @@ class SymbolAgent(threading.Thread):
             pend_old = self._state921().get("pending")
             if pend_old and pend_old.get("side") != side:                   # v2.17.0: an opposite cross cancels a pending order first
                 self._cancel_pending921("opposite cross")
-            sl = close - s * r.stop; tp = (close + s * r.tp) if r.tp else None
+            touch = r.entry == "ema9touch" and "level" in info               # v2.18.0: the entry is the EMA 9 touch, not the cross
+            entry_px = float(info["level"]) if touch else close
+            sl = entry_px - s * r.stop; tp = (entry_px + s * r.tp) if r.tp else None
             self.latest_signal = {"bar_time": bar_t, "symbol": self.symbol, "strategy": self.S.name, "kind": "cross", "direction": side, "consumed": False}
             self.health["last_signal"] = f"{side} 9/21 cross @ {ist(bar_t, off)}"
             self.journal.log("signal", symbol=self.symbol, mode=self.S.name, side=side, signal_kind="cross", price=close, bar=bar_t,
@@ -1711,16 +1799,18 @@ class SymbolAgent(threading.Thread):
             else:
                 why = self._equity_dd_block()
             placed = None; pend = None
-            if why is None and str(getattr(self.cfg, "entry_921", "market")) == "limit":   # v2.17.0: AUREON_921_ENTRY=limit
+            if why is None and not touch and str(getattr(self.cfg, "entry_921", "market")) == "limit":   # v2.17.0: AUREON_921_ENTRY=limit
                 pend, placed, why = self._place_pending921(side, close, bar_t, lots, r)
             elif why is None:
                 if self.cfg.paper or self.dry:
-                    placed = broker.BrokerResult(True, "PAPER", changed=False, price=close, ticket=None, volume=lots)
-                    self.journal.log("paper_fill", symbol=self.symbol, mode=self.S.name, side=side, lots=lots, price=close, sl=sl, tp=tp, bar=bar_t)
+                    placed = broker.BrokerResult(True, "PAPER", changed=False, price=entry_px, ticket=None, volume=lots)
+                    self.journal.log("paper_fill", symbol=self.symbol, mode=self.S.name, side=side, lots=lots, price=entry_px, sl=sl, tp=tp, bar=bar_t)
                     from . import ema921_live as _L
-                    st921 = self._state921(); st921["paper"] = list(st921.get("paper") or []) + [_L.new_paper(side, close, lots, sl, tp, bar_t)]
+                    st921 = self._state921(); st921["paper"] = list(st921.get("paper") or []) + [_L.new_paper(side, entry_px, lots, sl, tp, bar_t)]
                     self._save921()
                 elif self.cfg.execution_enabled and (broker.is_demo() or self.cfg.allow_live):
+                    if touch:                                                # at market now: the stops from the bar close
+                        sl = close - s * r.stop; tp = (close + s * r.tp) if r.tp else None
                     placed = broker.place_market(self.symbol, side, lots, sl, comment="aureon 921", tp=tp)
                     self.journal.decision("order_placed", actor="agent", rationale="ema921 cross", symbol=self.symbol, mode=self.S.name, side=side,
                                           lots=lots, sl=sl, tp=tp, ok=bool(placed.ok), status=placed.status, retcode=placed.retcode, ticket=placed.ticket, fill=placed.price,
@@ -1730,30 +1820,39 @@ class SymbolAgent(threading.Thread):
                 else:
                     why = "execution off (AUREON_EXECUTION=1 and demo / AUREON_ALLOW_LIVE=1 needed)"
             colour = EVENT_COLOURS["signal_long" if side == "LONG" else "signal_short"]
-            fields = [field("Side", f"**{side}**"), field("Entry", f"**{close:.2f}** (bar close)"), field("Lot", f"{lots:g}" + (" · PAPER" if (self.cfg.paper or self.dry) else "")),
-                      field("EMA 9 / 21", f"{info['ema9']:.2f} / {info['ema21']:.2f}"), field("EMA 200", f"{info['ema200']:.2f} ({info['dist200']:+.1f})"),
+            fields = [field("Side", f"**{side}**"), field("Entry", f"**{close:.{self._dg}f}** (bar close)"), field("Lot", f"{lots:g}" + (" · PAPER" if (self.cfg.paper or self.dry) else "")),
+                      field("EMA 9 / 21", f"{info['ema9']:.{self._dg}f} / {info['ema21']:.{self._dg}f}"), field("EMA 200", f"{info['ema200']:.{self._dg}f} ({info['dist200']:+.{self._dg}f})"),
                       field("Session", names.get(info["session"], "—")), field("Last 3", " ".join(info["last3"])),
-                      field("Stop / TP", f"{sl:.2f} (−{r.stop:g}) / " + (f"{tp:.2f} (+{r.tp:g})" if tp else "none"), inline=False),
-                      field("Lock", f"+{r.lock_at:g} seen → SL {close + s * r.lock_to:.2f} (+{r.lock_to:g})"),
-                      field("Exit", "first M30 close through EMA 9" + (f" · EMA 200 after +{r.lock_at:g}" if r.exit_mode == "e9>e200" else "")),
+                      field("Stop / TP", f"{sl:.{self._dg}f} (−{r.stop:g}) / " + (f"{tp:.{self._dg}f} (+{r.tp:g})" if tp else "none"), inline=False),
+                      field("Lock", f"+{r.lock_at:g} seen → SL {close + s * r.lock_to:.{self._dg}f} (+{r.lock_to:g})"),
+                      field("Exit", self._exit_text921(r)),
                       field("Backtest", "Jan–Oct 2026: 42% win · avg +1.6/trade · 35% reach +20", inline=False)]
             if pend:
-                fields[1] = field("Entry", f"**{pend['level']:.2f}** ({P921.order_type(side)} · {self.cfg.limit_offset_921:g} back from the close {close:.2f})")
-                fields[7] = field("Stop / TP", f"{pend['sl']:.2f} (−{r.stop:g}) / " + (f"{pend['tp']:.2f} (+{r.tp:g})" if pend.get("tp") else "none"), inline=False)
-                fields[8] = field("Lock", f"+{r.lock_at:g} seen → SL {pend['level'] + s * r.lock_to:.2f} (+{r.lock_to:g} from the fill)")
+                fields[1] = field("Entry", f"**{pend['level']:.{self._dg}f}** ({P921.order_type(side)} · {self.cfg.limit_offset_921:g} back from the close {close:.{self._dg}f})")
+                fields[7] = field("Stop / TP", f"{pend['sl']:.{self._dg}f} (−{r.stop:g}) / " + (f"{pend['tp']:.{self._dg}f} (+{r.tp:g})" if pend.get("tp") else "none"), inline=False)
+                fields[8] = field("Lock", f"+{r.lock_at:g} seen → SL {pend['level'] + s * r.lock_to:.{self._dg}f} (+{r.lock_to:g} from the fill)")
                 fields.append(field("Order", f"{placed.status if placed is not None else 'PENDING'} · "
                                     f"{'#' + str(pend.get('ticket')) if pend.get('ticket') else pend.get('id')} · "
                                     f"expires {ist(pend['expires'], off, '%H:%M')} IST ({self.cfg.limit_ttl_bars_921} bars)", inline=False))
             elif why:
                 fields.append(field("Not placed", why, inline=False))
             elif placed is not None:
-                fields.append(field("Order", f"{placed.status}" + (f" · ticket #{placed.ticket}" if placed.ticket else "") + (f" · fill {placed.price:.2f}" if placed.price else ""), inline=False))
+                fields.append(field("Order", f"{placed.status}" + (f" · ticket #{placed.ticket}" if placed.ticket else "") + (f" · fill {placed.price:.{self._dg}f}" if placed.price else ""), inline=False))
+            if touch:
+                fields = self._trade_fields921(r, side, info, entry_px, sl, tp, lots, close)
+                if why:
+                    fields.append(field("Not placed", why, inline=False))
+                elif placed is not None:
+                    fields.append(field("Order", f"{placed.status}" + (f" · ticket #{placed.ticket}" if placed.ticket else "")
+                                        + (f" · fill {placed.price:.{self._dg}f}" if placed.price else ""), inline=False))
             png = context_chart(df, self.symbol, self.S.display_name, self.S.fast, self.S.slow, self.S.ema_cols, off, self.chart_dir,
-                                marker={"index": last, "side": side, "label": "CROSS", "stop": sl, "secure": close + s * r.lock_at})
+                                marker={"index": last, "side": side, "label": "EMA9" if touch else "CROSS", "stop": sl,
+                                        "secure": entry_px + s * r.lock_at})
             title = (P921.title(pend, lambda t: ist(t, off, "%H:%M") + " IST") if pend else
+                     f"TRADE {side} · EMA 9 pullback" + ("" if why is None else " · act by hand") if touch else
                      f"ENTER {side} · 9/21 cross" if why is None else f"SIGNAL {side} · 9/21 cross")
             self.notify.send(self.key(f"ENTER_{side}", bk), ctitle(self.symbol, title, side), [], png=png, fields=fields + self._context_fields(df),
-                             color=colour, footer=cfooter(self.S.display_name, f"bar {ist(bar_t, off)} · M30"), event="ENTER")
+                             color=colour, footer=cfooter(self.S.display_name, f"bar {ist(bar_t, off)} · {self.exec_tf}"), event="ENTER")
             for adv in self.advisors():
                 adv.request_entry(self, "enter", side, bar_t, df, card_key=self.key(f"ENTER_{side}", bk), png=png)
 
@@ -1782,8 +1881,8 @@ class SymbolAgent(threading.Thread):
                 self.journal.log("locked", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], sl=(rr.existing_sl if kept else lock_px),
                                  peak=st["peak"], kept_manual_sl=kept)
                 self.notify.send(self.key("LOCK", p["ticket"]), ctitle(self.symbol, f"🔒 +{r.lock_at:g} seen → floor +{r.lock_to:g}", p["direction"]),
-                                 [(f"your SL {rr.existing_sl:.2f} is already tighter — kept" if kept else f"SL moved to {lock_px:.2f}")
-                                  + f" · peak +{st['peak']:.1f} · armed at the bar close"], color=EVENT_COLOURS["info"],
+                                 [(f"your SL {rr.existing_sl:.{self._dg}f} is already tighter — kept" if kept else f"SL moved to {lock_px:.{self._dg}f}")
+                                  + f" · peak +{st['peak']:.{self._dg}f} · armed at the bar close"], color=EVENT_COLOURS["info"],
                                  footer=cfooter(self.S.display_name, f"#{p['ticket']}"), event="LOCK")
         if why:
             label = {"lock_close": f"+{r.lock_at:g} seen, closed below +{r.lock_to:g}", "friday_flat": "Friday flat",
@@ -1793,8 +1892,8 @@ class SymbolAgent(threading.Thread):
                 self.closed_by_aureon.add(p["ticket"])
                 self.journal.log("closed_by_rule", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], reason=why, points=pts,
                                  peak=st["peak"], lots=p.get("volume"))
-                self.notify.send(self.key("CLOSED", f"{p['ticket']}-rule"), ctitle(self.symbol, f"CLOSED {p['direction'].upper()} {pts:+.1f} · {label}", p["direction"]),
-                                 [f"entry {e:.2f} → {c:.2f} · peak +{st['peak']:.1f} · worst −{max(0.0, -min(st.get('mae', 0.0), 0.0)):.1f}"],
+                self.notify.send(self.key("CLOSED", f"{p['ticket']}-rule"), ctitle(self.symbol, f"CLOSED {p['direction'].upper()} {pts:+.{self._dg}f} · {label}", p["direction"]),
+                                 [f"entry {e:.{self._dg}f} → {c:.{self._dg}f} · peak +{st['peak']:.{self._dg}f} · worst −{max(0.0, -min(st.get('mae', 0.0), 0.0)):.{self._dg}f}"],
                                  color=EVENT_COLOURS["closed_win" if pts > 0 else "closed_loss"], footer=cfooter(self.S.display_name, label),
                                  event="CLOSED" if pts > 0 else "STOP", points=pts)
 
