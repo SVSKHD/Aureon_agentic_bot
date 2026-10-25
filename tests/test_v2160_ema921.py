@@ -17,7 +17,17 @@ from aureon_mt5.strategies.ema921.analysis import add_emas
 from tests.test_v181 import harness  # noqa: F401
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-R = J.Rules()
+# v2.18.0: the v2.16 gold rules (cross at the close, SL −30, no TP, +20 → +15, exit through EMA 9) are now an env override
+# of the per-symbol table — these tests pin that mechanism through the same AUREON_921_* keys a server would use.
+LEGACY_ENV = {"AUREON_921_ENTRY": "market", "AUREON_921_EXIT": "e9", "AUREON_921_SL_XAUUSD": "3000", "AUREON_921_TP_XAUUSD": "0",
+              "AUREON_921_LOCK_AT_XAUUSD": "2000", "AUREON_921_LOCK_TO_XAUUSD": "1500", "AUREON_921_HOURS_XAUUSD": "all"}
+R = J.Rules(sl_pts=3000, tp_pts=0, lock_at_pts=2000, lock_to_pts=1500, exit_mode="e9", entry="market")
+
+
+@pytest.fixture(autouse=True)
+def legacy_gold_rules(monkeypatch):
+    for k, v in LEGACY_ENV.items():
+        monkeypatch.setenv(k, v)
 T0 = 1_760_918_400                                                          # Mon 2025-10-20 00:00 server
 
 
@@ -25,7 +35,7 @@ T0 = 1_760_918_400                                                          # Mo
 def test_registered_and_enumerated(tmp_path):
     assert "ema921" in available() and resolve_mode("921") == resolve_mode("ema9/21") == "ema921"
     S = get_strategy("ema921")
-    assert S.ema_cols == ("ema9", "ema21") and J.guardian_for("XAUUSD").pre_stop == 30.0
+    assert S.ema_cols == ("ema9", "ema21") and J.guardian_for("XAUUSD").pre_stop == 10.0          # v2.18.0: 1000 pts
     env = tmp_path / ".env"; env.write_text("AUREON_MODE=ema5080\n")
     ops.write_mode(str(env), "ema921")
     assert "AUREON_MODE=ema921" in env.read_text()

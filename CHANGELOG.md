@@ -2,6 +2,53 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.18.0 — 2026-10-25  (MINOR: ema921 = six symbols on M15 with the pullback-to-EMA9 entry; ema5080 untouched)
+**Strategy-rule change (ema921 only).** The v2.16 gold rules (cross at the close, SL −$30, no TP, +20 → +15, exit through
+EMA 9) are replaced by the M15 pullback study's per-symbol table. They stay reachable through env overrides
+(`AUREON_921_ENTRY=market AUREON_921_EXIT=e9 AUREON_921_SL_XAUUSD=3000 …` — the v2.16 tests now run that way).
+- **Per-symbol rules in POINTS** (`strategies/ema921/journeys.py`): `Rules.point`, `sl_pts`, `tp_pts`, `lock_at_pts`,
+  `lock_to_pts`, `limit_offset_pts`, `cost_pts`; the price distances (`stop`, `tp`, `lock_at`, `lock_to`) are derived through
+  `to_price(pts, point)`, the only conversion. Table (M15, 1 lot):
+
+  | symbol | point | TP | SL | lock at → to | entries (server h) |
+  |---|---|---|---|---|---|
+  | XAUUSD | 0.01 | 1000 | 1000 | 300 → 150 | all |
+  | XAGUSD | 0.001 | 200 | 100 | 60 → 30 | 9–15 |
+  | EURUSD / GBPUSD | 0.00001 | 100 | 200 | 50 → 20 | 9–22 |
+  | AUDUSD | 0.00001 | 100 | 200 | 50 → 20 | 9–15 |
+  | USDJPY | 0.001 | 350 | 350 | 150 → 60 | all |
+
+  - The point comes from `broker.symbol_info(symbol).point` at agent start (`--dry`: the table). A broker point that differs
+    from the table's rescales the points so the price distances stay as researched.
+  - Hours → `no_entry_server_hours` (the complement). `friday_no_entry_from=16`, `friday_flat` for all.
+  - Env overrides `AUREON_921_TP_<SYM>`, `_SL_`, `_LOCK_AT_`, `_LOCK_TO_`, `_COST_` (points), `AUREON_921_HOURS_<SYM>="9-15"`.
+    The boot banner and the boot card list the resolved rules per symbol.
+- **`GUARDIANS`**: one per symbol, built from the table (price distances converted from the points). `guardian_for()` and
+  `rules_for()` **raise** `UnknownSymbol` for a symbol without a row (EURJPY, XPTUSD …); `main.py` drops such a symbol at boot
+  with a `SYMBOLS NOT STARTED` card instead of running it unmanaged. Symbols match the six names (broker suffixes allowed),
+  not three-letter prefixes, so EURJPY can never inherit EURUSD's points.
+- **Entry `ema9touch`** (the new default of `AUREON_921_ENTRY`): IDLE → ARMED on a cross (card `CROSS <side> — waiting for
+  pullback`) → entry on the first LATER bar whose low (long) / high (short) reaches EMA 9, at the EMA 9 level → IDLE. An
+  opposite cross cancels (card `cross cancelled`); no touch within `arm_ttl_bars` (16) expires; the entry gates (days /
+  hours / Friday / news) apply at the touch and a blocked touch keeps waiting. One state machine inside `journeys.build`
+  (`touches_ema9`) — the replay, the paper tracker and the live agent all read its events.
+  - **TRADE card** (the alert a human acts on with `AUREON_EXECUTION=0`): symbol, side, entry level, TP / SL in points and in
+    money at `AUREON_LOT` (broker tick value; `--dry`: contract size, JPY divided by the price), EMA gap, ATR(14), spread
+    (points), session, bars after the cross.
+  - Exits: `exit_mode=bracket` (default: SL / TP / lock / Friday flat, no close-through-EMA exit); `AUREON_921_EXIT=e9|e9>e200`
+    keeps the v2.16 exits.
+  - With auto-trade on, the order goes at market when the touch bar closes (stops from that close); paper fills at the EMA 9
+    level, as the replay does.
+- **Process:** `AUREON_CLAUDE_SYMBOLS` (default `XAUUSD,XAGUSD`) — the advisors are off for every other symbol (FX cards go out
+  without a verdict). `AUREON_SYMBOLS` must start with a metal (`symbols[0]` drives market open and the server offset; boot
+  stops otherwise). Supervised self-restart on a lost Discord gateway only when MT5 is disconnected too; a gateway-only outage
+  waits `AUREON_GATEWAY_ONLY_RESTART_S` (1800 s). `notify.py` masks webhook tokens (`…/webhooks/<id>/***`) in every log line.
+- `AUREON_TF` is accepted as an alias of `AUREON_EXEC_TF`; `AUREON_LOT` (1) prices the TRADE card. `/decide-timeframe` marks
+  M15 as ema921's research TF. `tools/replay_921.py --symbol` uses that symbol's rules and reports points and $ per lot per symbol.
+- `--dry`: each symbol starts at its own price level and seed; the synthetic wicks scale with the price; prices keep their
+  decimals. Every ema921 card prints the symbol's decimals.
+- Tests: `tests/test_v2180_multisymbol.py` (28). `test_heartbeat_card_carries_the_dns_line` no longer depends on the weekday.
+
 ## v2.17.0 — 2026-10-22  (MINOR: runtime auto-trade switch, /decide-timeframe for every mode, auto-update on merge, pending-order entry; ema5080 / ema2050 rules unchanged)
 - **`/auto-trade on|off|status`** (admin; status read-only). Boot default = `AUREON_AUTO`; the switch is persisted in
   `logs/features.json` as `auto_trade` (source discord > env) and survives restarts. `cfg.auto_mode` is the boot default

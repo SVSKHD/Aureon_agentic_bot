@@ -126,8 +126,10 @@ def test_ema921_table_rows_marks_and_cache(tmp_path):
     lines = [l for l in table if l[:3] in ("M15", "M30", "H1 ")]
     assert [l[:3] for l in lines] == ["M15", "M30", "H1 "]
     m30 = next(l for l in lines if l.startswith("M30"))
-    assert "research" in m30 and "◀ current" in m30
-    assert "M30 is the research timeframe for ema921" in out and "apply:false — nothing changed" in out
+    assert "research" not in m30 and "◀ current" in m30
+    m15 = next(l for l in lines if l.startswith("M15"))
+    assert "research" in m15                                                # v2.18.0: the pullback study ran on M15
+    assert "M15 is the research timeframe for ema921" in out and "apply:false — nothing changed" in out
     assert sorted(calls) == ["H1", "M15", "M30"]
     out2 = D.decide(cfg, ag, j, n, ADMIN, "H4", admin_role="42", fetch=fetcher(calls))
     assert sorted(calls) == ["H1", "H4", "M15", "M30"]                      # only H4 was new: the rest came from the cache

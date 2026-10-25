@@ -22,11 +22,24 @@ v2.11.0 — notifications that arrive when the trade does
 """
 from __future__ import annotations
 
+import builtins
 import json
 import os
+import re
 import threading
 import time as _time
 from datetime import datetime, timedelta, timezone
+
+_WEBHOOK_TOKEN = re.compile(r"(webhooks/\d+/)[A-Za-z0-9_\-]+")
+
+
+def mask(text) -> str:
+    """v2.18.0: `.../webhooks/<id>/<token>` → `.../webhooks/<id>/***` — a requests error carries the full URL."""
+    return _WEBHOOK_TOKEN.sub(r"\1***", str(text))
+
+
+def print(*args, **kw):                                  # every log line this module prints goes through mask()
+    builtins.print(*(mask(a) for a in args), **kw)
 
 IST = timezone(timedelta(hours=5, minutes=30))
 MAX_ATTEMPTS = 20
@@ -525,6 +538,7 @@ class Notifier:
 
 
 def _rlog(key, msg):
+    msg = mask(msg)
     try:
         from .netguard import rlog
         rlog(key, msg)

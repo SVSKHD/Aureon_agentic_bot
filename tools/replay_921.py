@@ -2,6 +2,7 @@
 
     python tools/replay_921.py --csv xauusd_m30_20260101_20261021.csv --from 2026-01-01
     python tools/replay_921.py --csv ... --from 2026-01-01 --set exit_mode=e9>e200 --set stop=30
+    python tools/replay_921.py --csv eurusd_m15.csv --symbol EURUSD        # v2.18.0: that symbol's rules (points), pullback entry
     python tools/replay_921.py --csv ... --set entry=limit --set limit_offset=1.5 --set limit_ttl_bars=2
         v2.17.0: a limit fills on the first LATER bar whose extreme reaches close ∓ offset (never on the signal bar), else it
         expires after ttl bars; the run also prints the comparison line against entry=market.
@@ -40,23 +41,29 @@ def run(df: pd.DataFrame, overrides: dict, *, start=None, symbol="XAUUSD", offse
                      trade_from=trade_from, overrides=overrides)["M5"]
 
 
+def usd(J: pd.DataFrame, rules) -> pd.Series:
+    """v2.18.0: $ per lot per trade — result (price) × contract, a JPY-quoted symbol divided by its entry price."""
+    v = J.result * float(getattr(rules, "contract", USD_PER_POINT_PER_LOT))
+    return v / J.entry_price if str(getattr(rules, "symbol", "")).endswith("JPY") else v
+
+
 def stats(res: dict) -> dict:
-    s = res["summary"]
+    s = res["summary"]; r = res["rules"]
     J = pd.DataFrame([j.to_dict() for j in res["journeys"] if j.exit_reason not in (None, "open")])
-    out = {"trades": s["trades"], "win": s["win_rate"] * 100, "net": s["net"], "usd": s["net"] * USD_PER_POINT_PER_LOT,
+    out = {"trades": s["trades"], "win": s["win_rate"] * 100, "net": s["net"], "net_pts": s["net"] / r.point, "usd": 0.0,
            "unfilled": s.get("unfilled", 0), "weeks_pos": 0, "weeks_neg": 0, "max_dd_usd": 0.0}
     if len(J):
-        J["week"] = pd.to_datetime(J.entry_time, unit="s").dt.strftime("%G-W%V")
-        W = J.groupby("week").result.sum(); c = J.result.cumsum() * USD_PER_POINT_PER_LOT
-        out.update(weeks_pos=int((W > 0).sum()), weeks_neg=int((W < 0).sum()), max_dd_usd=float((c - c.cummax()).min()))
+        J["usd"] = usd(J, r); J["week"] = pd.to_datetime(J.entry_time, unit="s").dt.strftime("%G-W%V")
+        W = J.groupby("week").usd.sum(); c = J.usd.cumsum()
+        out.update(usd=float(J.usd.sum()), weeks_pos=int((W > 0).sum()), weeks_neg=int((W < 0).sum()), max_dd_usd=float((c - c.cummax()).min()))
     return out
 
 
 def comparison_line(limit: dict, market: dict, ov: dict) -> str:
     return (f"entry=limit offset {ov.get('limit_offset', 1.5):g} ttl {ov.get('limit_ttl_bars', 2)}: trades {limit['trades']} "
-            f"(unfilled {limit['unfilled']}) · win {limit['win']:.0f}% · net {limit['net']:+.1f} pts ${limit['usd']:+,.0f}/lot · "
+            f"(unfilled {limit['unfilled']}) · win {limit['win']:.0f}% · net {limit['net_pts']:+.0f} pts ${limit['usd']:+,.0f}/lot · "
             f"weeks +{limit['weeks_pos']}/−{limit['weeks_neg']}  vs  entry=market: trades {market['trades']} · win {market['win']:.0f}% · "
-            f"net {market['net']:+.1f} pts ${market['usd']:+,.0f}/lot · weeks +{market['weeks_pos']}/−{market['weeks_neg']}  "
+            f"net {market['net_pts']:+.0f} pts ${market['usd']:+,.0f}/lot · weeks +{market['weeks_pos']}/−{market['weeks_neg']}  "
             f"→ limit {limit['usd'] - market['usd']:+,.0f} $/lot")
 
 
@@ -69,18 +76,23 @@ def main(argv=None) -> dict:
     ov = parse_sets(a.set)
     res = run(df, ov, start=a.start, symbol=a.symbol, offset=a.offset)
     s = res["summary"]; r = res["rules"]
-    print(f"{S.display_name} · entry {r.entry}" + (f" {r.limit_offset:g}/{r.limit_ttl_bars} bars" if r.entry == "limit" else "")
-          + f" · exit {r.exit_mode} · SL −{r.stop:g} TP {('+' + format(r.tp, 'g')) if r.tp else 'none'} · lock {r.lock_at:g}→{r.lock_to:g} · days {r.days}")
-    print(f"crosses {s['crosses']} · pre cards {s['pre']} · trades {s['trades']} · win {s['win_rate'] * 100:.0f}% · net {s['net']:+.1f} pts (${s['net'] * 100:,.0f}/lot) · "
-          f"stop {s['stop']} locked {s['locked']} tp {s['tp']} ema_close {s['ema_close']} friday {s['friday_flat']}"
-          + (f" · unfilled {s['unfilled']}" if r.entry == "limit" else ""))
+    st = stats(res)
+    print(f"{S.display_name} · {a.symbol} · entry {r.entry}" + (f" {r.limit_offset_pts} pts/{r.limit_ttl_bars} bars" if r.entry == "limit" else
+                                                               f" (arm {r.arm_ttl_bars} bars)" if r.entry == "ema9touch" else "")
+          + f" · exit {r.exit_mode} · SL −{r.sl_pts} TP {('+' + str(r.tp_pts)) if r.tp_pts else 'none'} · lock {r.lock_at_pts}→{r.lock_to_pts} pts"
+          + f" (point {r.point:g}) · days {r.days}")
+    print(f"crosses {s['crosses']} · pre cards {s['pre']} · trades {s['trades']} · win {s['win_rate'] * 100:.0f}% · net {st['net_pts']:+.0f} pts "
+          f"(${st['usd']:,.0f}/lot) · stop {s['stop']} locked {s['locked']} tp {s['tp']} ema_close {s['ema_close']} friday {s['friday_flat']}"
+          + (f" · unfilled {s['unfilled']}" if r.entry == "limit" else "")
+          + (f" · armed {s['armed']} cancelled {s['cancelled']} expired {s['expired']}" if r.entry == "ema9touch" else ""))
     J = pd.DataFrame([j.to_dict() for j in res["journeys"]])
     if len(J):
+        J["usd"] = usd(J, r)
         J["dt"] = pd.to_datetime(J.entry_time, unit="s"); J["week"] = J.dt.dt.strftime("%G-W%V"); J["month"] = J.dt.dt.strftime("%Y-%m")
-        W = J.groupby("week").result.sum(); c = J.result.cumsum() * 100
-        print(f"weeks {len(W)} · positive {(W > 0).sum()} · negative {(W < 0).sum()} · worst ${W.min() * 100:,.0f} · best ${W.max() * 100:,.0f} · max DD ${(c - c.cummax()).min():,.0f}")
-        print((J.groupby("month").result.sum() * 100).round(0).to_string())
-    out = {"res": res, "stats": stats(res)}
+        W = J.groupby("week").usd.sum(); c = J.usd.cumsum()
+        print(f"weeks {len(W)} · positive {(W > 0).sum()} · negative {(W < 0).sum()} · worst ${W.min():,.0f} · best ${W.max():,.0f} · max DD ${(c - c.cummax()).min():,.0f}")
+        print(J.groupby("month").usd.sum().round(0).to_string())
+    out = {"res": res, "stats": st}
     if ov.get("entry") == "limit":
         market = stats(run(df, {**ov, "entry": "market"}, start=a.start, symbol=a.symbol, offset=a.offset))
         out["compare"] = comparison_line(out["stats"], market, ov); out["market"] = market

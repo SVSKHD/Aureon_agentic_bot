@@ -202,7 +202,7 @@ def default_avg_range(cfg, tf: str, days: int) -> float:
 # ----------------------------------------------------------------------------- v2.16.2 ema921 / ema9200: the mode's own replay
 MODE_REPLAY = ("ema921", "ema9200")
 MODE_TFS = ("M15", "M30", "H1")
-RESEARCH_TF = {"ema921": "M30", "ema9200": "M30"}
+RESEARCH_TF = {"ema921": "M15", "ema9200": "M30"}                       # v2.18.0: the ema921 pullback study ran on M15
 WARMUP_BARS = 300                                     # EMA 200 needs 200 bars before the first rule can fire
 
 

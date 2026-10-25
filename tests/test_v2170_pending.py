@@ -182,7 +182,7 @@ def test_fill_is_adopted_like_a_market_entry(harness, monkeypatch):
     row = [r for r in ag.journal.read(0) if r["event"] == "pending_filled"][-1]
     assert (row["ticket"], row["fill"], row["saved"]) == (701, lvl - 0.05, round(c - (lvl - 0.05), 2))
     assert ag._state921()["pending"] is None and 701 not in ag.closed_by_aureon
-    assert any(f"FILLED LONG · BUY LIMIT {lvl:.2f} · FILL {lvl - 0.05:.2f} · +1.6 VS THE CROSS CLOSE" in t for t in titles(sent))
+    assert any(f"FILLED LONG · BUY LIMIT {lvl:.2f} · FILL {lvl - 0.05:.2f} · +1.55 VS THE CROSS CLOSE" in t for t in titles(sent))
     p = dict(box["positions"][0]); st = {"peak": 0.0, "secured": 0.0}                # the same guardian takes it from here
     ag._guard_921(p, st, 1, True, int(df["time"].iloc[-1]), df, float(df["close"].iloc[-1]))
     assert st["entry"] == p["price_open"]
@@ -263,8 +263,8 @@ def test_place_limit_by_hand_with_auto_trade_off(harness, monkeypatch):
     monkeypatch.setattr(broker, "tick", lambda sym: {"bid": 4000.0, "ask": 4000.3, "time": 0})
     monkeypatch.setattr(broker, "now_server", lambda off=0: 1_800_000_000 + 600)
     r = M.place(ag.cfg, {"XAUUSD": ag}, ag.journal, ag, "SHORT", lots=0.5, limit_raw="2", governor_ctx={"open_positions": []})
-    assert r["ok"] and box["pend"][0][1:6] == ("SHORT", 0.5, 4002.0, 4032.0, None) and box["pend"][0][7] == "aureon /place"
-    assert r["text"].startswith("✅ PENDING SHORT · sell limit 4002.00 · SL 4032.00 · TP — · expires")
+    assert r["ok"] and box["pend"][0][1:6] == ("SHORT", 0.5, 4002.0, 4012.0, 3992.0) and box["pend"][0][7] == "aureon /place"
+    assert r["text"].startswith("✅ PENDING SHORT · sell limit 4002.00 · SL 4012.00 · TP 3992.00 · expires")
     assert ag._state921()["pending"]["by"] == "/place"
     r2 = M.place(ag.cfg, {"XAUUSD": ag}, ag.journal, ag, "LONG", lots=0.5, limit_raw="3990", governor_ctx={"open_positions": []})
     assert not r2["ok"] and "position cap" in r2["text"]                       # the pending order counts as in position
@@ -280,7 +280,8 @@ def bars(n=1500, seed=11):
 
 
 def test_replay_fills_on_the_first_later_bar_that_reaches_the_level():
-    df = bars(); r = J.Rules(entry="limit", limit_offset=1.5, limit_ttl_bars=2)
+    df = bars(); r = J.Rules(entry="limit", limit_offset_pts=150, limit_ttl_bars=2, exit_mode="e9", sl_pts=3000, tp_pts=0,
+                             lock_at_pts=2000, lock_to_pts=1500)
     res = J.build(df, r)
     js = [j for j in res["journeys"]]
     assert js and res["summary"]["entry"] == "limit"
@@ -291,7 +292,7 @@ def test_replay_fills_on_the_first_later_bar_that_reaches_the_level():
         assert 1 <= kf - k <= 2 and j.entry_price == pytest.approx(lvl)            # never the signal bar, within the TTL
         reach = (lambda i: lo[i] <= lvl) if s > 0 else (lambda i: hi[i] >= lvl)
         assert reach(kf) and not any(reach(i) for i in range(k + 1, kf))       # the FIRST later bar that reaches it
-    m = J.build(df, J.Rules())
+    m = J.build(df, J.Rules(entry="market", exit_mode="e9"))
     assert all(j.entry_index == j.cross_index for j in m["journeys"]) and m["summary"]["unfilled"] == 0
     assert res["summary"]["unfilled"] > 0
 
@@ -304,4 +305,4 @@ def test_replay_tool_prints_the_comparison(tmp_path, capsys):
     line = out["compare"]
     assert line.startswith("entry=limit offset 1.5 ttl 2: trades ") and " vs  entry=market: trades " in line and "$/lot" in line
     assert line in capsys.readouterr().out
-    assert out["market"]["trades"] == R.stats(R.run(pd.read_csv(csv), {}))["trades"]
+    assert out["market"]["trades"] == R.stats(R.run(pd.read_csv(csv), {"entry": "market"}))["trades"]

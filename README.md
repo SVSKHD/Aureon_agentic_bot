@@ -1,4 +1,4 @@
-# Aureon MT5 v2.17.0
+# Aureon MT5 v2.18.0
 
 You place the trade. Aureon detects (per selected EMA mode), fires a Discord gunshot, then manages what you placed:
 protect → secure +10 → ride in +5 steps → close on the fast-EMA turn → news safeguard. Reports and slash commands.
@@ -25,6 +25,51 @@ protected (SL never loosened) but receive no strategy rules; a `⚠️ MODE MISM
 Production: run it under the supervisor (auto-restart, hang kill, boot start) — **[docs/SERVICE.md](docs/SERVICE.md)**:
 
     powershell -ExecutionPolicy Bypass -File .\scripts\aureon_service.ps1 -Action install
+
+## v2.18.0 — ema921 on six symbols, M15, the pullback to EMA 9
+
+Research (10 months of M15, 1 lot, bar by bar, spread deducted): the raw cross at the close had about zero edge on every
+symbol; waiting for the pullback to EMA 9 after the cross was positive on all six. ema5080 is untouched.
+
+    AUREON_MODE=ema921
+    AUREON_SYMBOLS=XAUUSD,XAGUSD,EURUSD,GBPUSD,AUDUSD,USDJPY      # XAUUSD first: it drives market open / the server offset
+    AUREON_TF=M15
+    AUREON_921_ENTRY=ema9touch
+    AUREON_LOT=1
+    AUREON_CLAUDE_SYMBOLS=XAUUSD,XAGUSD
+    AUREON_EXECUTION=0                                            # alert only; a human places the trade
+
+| symbol | point | TP | SL | lock at → to | entries (server h) |
+|---|---|---|---|---|---|
+| XAUUSD | 0.01 | 1000 ($10) | 1000 | 300 → 150 | all |
+| XAGUSD | 0.001 | 200 ($0.20) | 100 | 60 → 30 | London 9–15 |
+| EURUSD / GBPUSD | 0.00001 | 100 (10 pips) | 200 | 50 → 20 | London + NY 9–22 |
+| AUDUSD | 0.00001 | 100 | 200 | 50 → 20 | London 9–15 |
+| USDJPY | 0.001 | 350 (35 pips) | 350 | 150 → 60 | all |
+
+All distances are in broker points; `to_price(pts, point)` is the only conversion, and the point comes from the broker at
+start (a different point rescales the points so the prices stay as researched). Overrides per symbol:
+`AUREON_921_TP_<SYM>`, `_SL_`, `_LOCK_AT_`, `_LOCK_TO_`, `_COST_`, `AUREON_921_HOURS_<SYM>="9-15"`. The boot banner lists
+the resolved rules. A symbol without a row (EURJPY, XPTUSD …) is not started: its guardian lookup raises.
+
+**The entry (`ema9touch`):**
+1. A 9/21 cross arms the side — card `CROSS LONG — waiting for pullback`.
+2. The first LATER bar whose low (long) / high (short) reaches EMA 9 is the entry, at the EMA 9 level — the **TRADE** card:
+   entry level, TP / SL in points and in money at `AUREON_LOT`, EMA gap, ATR(14), spread, session.
+3. An opposite cross cancels (card `cross cancelled`); no touch in 16 bars (4 h) expires. Day / hour / Friday / news gates
+   apply at the touch; a blocked touch keeps waiting. One position per symbol; crosses in a position are ignored.
+
+The replay (`journeys.build`) holds the state machine and the touch test; the live agent and the paper tracker read its
+events, so `tools/replay_921.py --csv <m15.csv> --symbol XAUUSD` is the live entry rule. Exits are a bracket: SL, TP, the
+lock armed at a bar close, Friday flat (`AUREON_921_EXIT=e9` restores the v2.16 close-through-EMA exit).
+
+**One symbol can't jam another:** one agent thread per symbol (a crash restarts only that agent); Claude only on
+`AUREON_CLAUDE_SYMBOLS`; a Discord-only outage (MT5 up) no longer restarts the process for 30 min
+(`AUREON_GATEWAY_ONLY_RESTART_S`); webhook tokens are masked in the logs.
+
+**Before live alerts:** `python main.py --dry --mode ema921 --symbols XAUUSD,XAGUSD,EURUSD,GBPUSD,AUDUSD,USDJPY` for 30 min
+(six RUNNING lines in `/parallel-status`), `tools/replay_921.py` on the Oct 2026 M15 data for XAUUSD, then a week of
+`AUREON_PAPER=1`.
 
 ## v2.17.0 — auto-trade switch, /decide-timeframe for every mode, auto-update on merge, pending-order entry
 
