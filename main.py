@@ -498,11 +498,13 @@ def main():
             _srv.cold_start(cfg, journal, health_notify,
                             {s_: (broker.positions(s_) if not cfg.dry else []) for s_ in cfg.symbols}, last_exit=last_exit,
                             heartbeat=prev_heartbeat)
-        if marker.get("kind") in ("maintenance", "repair-auto", "repair-rollback"):
+        if marker.get("kind") in ("maintenance", "repair-auto", "repair-rollback", "update-force", "ops-repair"):
             why = f"restarted · {marker['kind']}"
             text = {"maintenance": f"maintenance reboot · {marker.get('reason', '')}",
                     "repair-auto": f"auto-applied repair · {marker.get('reason', '')} — verifying",
-                    "repair-rollback": f"repair rolled back · {marker.get('reason', '')}"}[marker["kind"]]
+                    "repair-rollback": f"repair rolled back · {marker.get('reason', '')}",
+                    "update-force": f"update-force · {marker.get('reason', '')} — positions re-adopted below",
+                    "ops-repair": f"/repair restart · {marker.get('reason', '')}"}[marker["kind"]]
             health_notify.card("AUREON · MT5 · BACK ONLINE", f"{text}\n{down} · running `{last_hash}`", footer="Aureon MT5 · unattended")
         manual_reason = os.environ.pop("AUREON_RESTART_REASON", "") or (
             f"manual:{marker.get('reason', '')}" if marker.get("kind") == "manual" else "")
@@ -539,6 +541,10 @@ def main():
                         fields=[{"name": "Enable explicitly", "value": "`--enable-silver`", "inline": True}],
                         footer="Aureon MT5")
     start_agents()
+    from aureon_mt5 import symbols_ctl as _sc                          # v2.18.1: /attach · /detach while live
+    sym_ctl = _sc.SymbolController(cfg, agents, make_agent, journal, notify, strategy=S,
+                                   env_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+    _sc.CURRENT["ctl"] = sym_ctl
     if preflight_res is not None:                                  # v2.15.0 pre-flight steps 3–4
         from aureon_mt5 import preflight as _pf
         closed = not broker.market_open(cfg.symbols[0], cfg.server_utc_offset, cfg.dry)
@@ -608,6 +614,10 @@ def main():
     updater = _au.AutoUpdater(cfg, journal, health_notify, agents,
                               restart_fn=lambda: _au.restart(agents, exit_hook=restart_exit))
     _au.CURRENT["updater"] = updater; maint.updater = updater
+    from aureon_mt5 import ops_repair as _or                           # v2.18.1: /repair — diagnosis + allowlisted actions
+    repair_helper = _or.OpsRepair(cfg, journal, health_notify, updater=updater, agents=agents,
+                                  restart=lambda: _au.restart(agents, exit_hook=restart_exit))
+    _or.CURRENT["repair"] = repair_helper; updater.on_problem = repair_helper.on_problem
     netguard.MONITOR = monitor
 
     def on_net_flip(degraded_now):
@@ -633,6 +643,7 @@ def main():
             # v2.10.1: code updates moved into the maintenance window (flat, outside the session, suite green)
             maint.tick(now)
             updater.tick(now)
+            sym_ctl.tick()
             mt5_mgr.tick(now)
             if now - last_clock >= 6 * 3600:
                 last_clock = now; srv.check_clock(journal, health_notify)

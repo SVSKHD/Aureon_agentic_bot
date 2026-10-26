@@ -77,6 +77,16 @@ def restart(agents, *, exit_hook=None, execv=None, environ=None, argv=None):
 CURRENT: dict = {}                                   # {"updater": AutoUpdater} for /update (set in main)
 
 
+def dns_down() -> bool:
+    """netguard's view: discord.com (or github.com, when checked) did not resolve on the last DNS check."""
+    try:
+        from . import netguard
+        st = netguard.STATE
+        return bool(st.get("dns_fail")) or any((st.get("dns") or {}).get(k, {}).get("ok") is False for k in ("discord", "github"))
+    except Exception:
+        return False
+
+
 class AutoUpdater:
     def __init__(self, cfg, journal, notify, agents, *, sh=subprocess.run, root: str = ROOT, python: str = sys.executable,
                  clock=_time.time, flat=None, restart_fn=None, update=None):
@@ -85,6 +95,7 @@ class AutoUpdater:
         self.flat_fn = flat or self._flat
         self.restart_fn = restart_fn or (lambda: restart(self.agents))
         self.update = update                          # injectable update_to_origin (tests)
+        self.on_problem = None                        # v2.18.1: ops_repair's auto hook (UPDATE FAILED / UPDATE HELD)
         self.state = self._load()
 
     # -- persistence
@@ -160,6 +171,7 @@ class AutoUpdater:
         self.state["last_check"] = now; self._save()
         head, origin = self.remote()
         if not head or not origin:
+            self._error("git fetch origin master failed")
             return "fetch failed"
         if head == origin:
             if self.state.get("update_pending"):
@@ -184,8 +196,9 @@ class AutoUpdater:
         subject, _, body = out.partition("\n")
         return pr_title(subject, body)
 
-    def apply(self, why: str = "") -> str:
-        """git → suite → restart. Red → back to the running commit, no restart."""
+    def apply(self, why: str = "", *, forced: bool = False, skip_suite: bool = False) -> str:
+        """git → suite → restart. Red → back to the running commit, no restart. forced (/update force): the flat gate was
+        skipped — open positions are carried (the guardian is restart-safe), never closed. skip_suite: /update force notests."""
         from .common.updater import discarded_title, update_to_origin
         res = (self.update or (lambda: update_to_origin(self.cfg.log_dir, run=self.sh, cwd=self.root)))()
         if res["status"] == "current":
@@ -194,17 +207,21 @@ class AutoUpdater:
         if res["status"] != "updated":
             self._card("UPDATE FAILED", res.get("error", "")[:300], 0xE74C3C)
             self.journal.log("update_failed", error=res.get("error", "")[:200])
+            self._error(res.get("error", ""), kind="UPDATE FAILED")
             return "failed"
         if res.get("discarded"):
             self._card(discarded_title(res), f"restore: `git apply {res['patch']}`")
         new = res["new"]; old = res["old"]
-        try:
-            r = self.sh([self.python, "-m", "pytest", "-q", "-x", "tests"], cwd=self.root, capture_output=True, text=True, timeout=1800)
-            green = r.returncode == 0
-            out = (r.stdout or "") + "\n" + (r.stderr or "")
-            summary = ((r.stdout or "").strip().splitlines() or ["?"])[-1]
-        except Exception as e:
-            green, out, summary = False, repr(e), repr(e)
+        if skip_suite:
+            green, out, summary = True, "", "SUITE SKIPPED"
+        else:
+            try:
+                r = self.sh([self.python, "-m", "pytest", "-q", "-x", "tests"], cwd=self.root, capture_output=True, text=True, timeout=1800)
+                green = r.returncode == 0
+                out = (r.stdout or "") + "\n" + (r.stderr or "")
+                summary = ((r.stdout or "").strip().splitlines() or ["?"])[-1]
+            except Exception as e:
+                green, out, summary = False, repr(e), repr(e)
         title = self.title(new)
         if not green:
             _git(self.sh, self.root, "reset", "--hard", old, timeout=60)        # the files on disk = the running build again
@@ -213,15 +230,62 @@ class AutoUpdater:
             self.journal.log("update_held", sha=new, old=old, failure=line)
             self._card(f"UPDATE HELD · tests failed · {line}"[:256], f"origin/master `{new[:8]}` · {title}\nstill running `{old[:8]}` · "
                        "retried on the next merge", 0xE74C3C)
+            self._error(f"tests failed on {new[:8]}: {line}\n{out[-1500:]}", kind="UPDATE HELD")
             return "held"
         from . import ops
-        self.state.update(last_sha=new, last_at=self.clock(), update_pending=None, held_sha=None); self._save()
-        self.journal.log("update_applied", sha=new, old=old, title=title, summary=summary, why=why)
-        ops.write_restart_marker(self.cfg.log_dir, "auto-update", f"{old[:8]} -> {new[:8]} · {title}")
-        self._card(f"UPDATE APPLIED · {new[:7]} · {title}"[:256], f"`{old[:8]}` → `{new[:8]}` · {summary} · restarting ({why})",
-                   0x2ECC71)
+        self.state.update(last_sha=new, last_at=self.clock(), update_pending=None, held_sha=None, last_error=None); self._save()
+        self.journal.log("update_applied", sha=new, old=old, title=title, summary=summary, why=why, forced=forced, suite_skipped=skip_suite)
+        if forced:
+            n = self.positions_open()
+            ops.write_restart_marker(self.cfg.log_dir, "update-force", f"{old[:8]} -> {new[:8]} · {n} position(s) carried"
+                                     + (" · SUITE SKIPPED" if skip_suite else ""))
+            self._card(f"UPDATE FORCED · {old[:7]} → {new[:7]} · {n} positions carried" + (" · SUITE SKIPPED" if skip_suite else ""),
+                       f"{title} · {summary} · restarting ({why}) — nothing was closed; the guardian re-adopts the positions on boot",
+                       0xE74C3C if skip_suite else 0xE67E22)
+        else:
+            ops.write_restart_marker(self.cfg.log_dir, "auto-update", f"{old[:8]} -> {new[:8]} · {title}")
+            self._card(f"UPDATE APPLIED · {new[:7]} · {title}"[:256], f"`{old[:8]}` → `{new[:8]}` · {summary} · restarting ({why})",
+                       0x2ECC71)
         self.restart_fn()
         return "applied"
+
+    def positions_open(self) -> int:
+        n = 0
+        for ag in (self.agents or {}).values():
+            n += len((getattr(ag, "snapshot", None) or {}).get("positions") or [])
+            try:
+                if getattr(ag, "_paper_open", None) and (self.cfg.paper or self.cfg.dry):
+                    n += len(ag._paper_open())
+            except Exception:
+                pass
+        return n
+
+    def _error(self, text: str, kind: str = ""):
+        """The last error (/update status) and, for UPDATE FAILED / UPDATE HELD, the repair helper's auto hook."""
+        self.state["last_error"] = str(text)[:2000]; self.state["last_error_at"] = self.clock(); self._save()
+        if kind and self.on_problem is not None:
+            try:
+                self.on_problem(kind, str(text))
+            except Exception:
+                pass
+
+    def force(self, user="", *, skip_suite: bool = False) -> str:
+        """/update force [notests]: pull now whatever is open (never closing anything), suite (unless skipped), restart."""
+        if dns_down():
+            self.journal.log("update_refused", by=str(user), why="network degraded")
+            self._card("UPDATE REFUSED · network degraded", "DNS is down — a forced pull can only fail; retry when the network is back",
+                       0xE74C3C)
+            return "UPDATE REFUSED · network degraded"
+        self.state["last_check"] = self.clock(); self._save()
+        head, origin = self.remote()
+        if not head or not origin:
+            self._error("git fetch origin master failed")
+            return "fetch failed — /update status shows the error"
+        if head == origin:
+            return "already at origin/master — " + self.boot_line()
+        res = self.apply(why=f"/update force by {user}", forced=True, skip_suite=skip_suite)
+        return {"applied": "UPDATE FORCED — restarting", "held": "UPDATE HELD · tests failed (card posted) — nothing restarted",
+                "failed": "UPDATE FAILED (card posted)"}.get(res, res)
 
     # -- /update
     def command(self, arg: str = "", user="") -> str:
@@ -234,13 +298,39 @@ class AutoUpdater:
             self.state["hold"] = False; self._save()
             self.journal.log("update_resume", by=str(user))
             return "auto-update **resumed** — " + self.boot_line()
+        if a == "status":
+            return self.status_text()
+        if a == "force":
+            return self.force(user)
+        if a == "force notests":
+            self.state["notests_until"] = self.clock() + 60; self._save()
+            return "⚠️ the suite will NOT run — confirm with `/update force notests confirm` within 60 s"
+        if a == "force notests confirm":
+            until = float(self.state.get("notests_until") or 0)
+            self.state["notests_until"] = None; self._save()
+            if self.clock() > until:
+                return "⛔ no pending `/update force notests` (or it is older than 60 s) — start again"
+            return self.force(user, skip_suite=True)
         if a not in ("", "check", "now"):
-            return "⚠️ /update · /update hold · /update resume"
+            return "⚠️ /update · /update status · /update force [notests] · /update hold · /update resume"
         res = self.check(force=True, why=f"/update by {user}")
         return {"current": "already at origin/master — " + self.boot_line(),
                 "pending": "UPDATE PENDING · will apply when flat",
                 "held": "UPDATE HELD · tests failed (card posted)",
                 "applied": "UPDATE APPLIED — restarting"}.get(res, res)
+
+    def status_text(self) -> str:
+        head = _git(self.sh, self.root, "rev-parse", "HEAD", timeout=10)[1] or "?"
+        origin = _git(self.sh, self.root, "rev-parse", "origin/master", timeout=10)[1] or "?"
+        lc = self.state.get("last_check")
+        when = datetime.fromtimestamp(float(lc), IST).strftime("%d %b %H:%M:%S IST") if lc else "never"
+        pend, held = self.state.get("update_pending"), self.state.get("held_sha")
+        err = (self.state.get("last_error") or "")[:300]
+        return "\n".join([f"**/update status** · {self.boot_line()}",
+                          f"last check {when} · HEAD `{head[:8]}` · origin/master `{origin[:8]}`"
+                          + (" (behind)" if head != origin and "?" not in (head, origin) else ""),
+                          f"pending: {pend[:8] if pend else '—'} · held: {held[:8] if held else '—'} · hold: {'on' if self.state.get('hold') else 'off'}",
+                          f"last error: {err or '—'}"])
 
     def boot_line(self) -> str:
         if not getattr(self.cfg, "auto_update", True):

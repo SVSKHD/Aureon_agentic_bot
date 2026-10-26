@@ -208,7 +208,7 @@ class SymbolAgent(threading.Thread):
                         announced_closed = True
                         self.notify.send(self.key("MARKET", f"closed-{datetime.now(IST):%Y-%m-%d}"), ctitle(self.symbol, "MARKET CLOSED"), ["agent sleeping"], color=EVENT_COLOURS["market"], footer=cfooter(self.S.display_name))
                     self._refresh_snapshot(False)
-                    _time.sleep(30); continue
+                    self._stop_evt.wait(30); continue                     # v2.18.1: /detach stops a sleeping agent at once
                 if announced_closed:
                     announced_closed = False
                     self.notify.send(self.key("MARKET", f"open-{datetime.now(IST):%Y-%m-%d-%H}"), ctitle(self.symbol, "MARKET OPEN"), ["Aureon resumed"], color=EVENT_COLOURS["secured"], footer=cfooter(self.S.display_name))
@@ -218,7 +218,7 @@ class SymbolAgent(threading.Thread):
                 closed = m5.df[m5.df["time"] + self.bar_s <= broker.now_server(self.off)].reset_index(drop=True)
                 if len(closed) < 120:
                     self._refresh_snapshot(True)
-                    _time.sleep(self.cfg.poll_seconds); continue
+                    self._stop_evt.wait(self.cfg.poll_seconds); continue
                 bar_t = int(closed["time"].iloc[-1]); new_bar = bar_t != self.last_bar
                 df = self.S.add_emas(closed)
                 if self.cfg.zl_context:                                        # v2.10.0: zero-lag context columns (no rule reads them)
@@ -262,7 +262,7 @@ class SymbolAgent(threading.Thread):
                 self.health["errors"] += 1; self.health["status"] = f"error: {e}"
                 report_crash(self, e)
                 return  # supervisor restarts this agent, unless crash guard paused it
-            _time.sleep(self.cfg.poll_seconds)
+            self._stop_evt.wait(self.cfg.poll_seconds)
 
     def advisors(self) -> list:
         """v2.3.0: the advisors attached to this agent (advisory / manage), Claude first."""
@@ -1103,6 +1103,8 @@ class SymbolAgent(threading.Thread):
 
     # ------------------------------------------------------------------ detection
     def _detect(self, closed, df, bar_t, close, ef, es):
+        if getattr(self, "detaching", False):                    # v2.18.1: /detach — no new entries; the guardian keeps running
+            return
         res = self.S.analyse({"M5": Bars(self.symbol, "M5", closed)}, self.symbol, self.off, self.news)["M5"]
         self.last_res = res
         last = len(df) - 1

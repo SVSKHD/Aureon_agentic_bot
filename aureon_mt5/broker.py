@@ -194,6 +194,18 @@ def pending_orders(symbol: str) -> list[dict] | None:
     return out
 
 
+def select(symbol: str) -> bool:
+    """v2.18.1 /attach: symbol_select(symbol, True) and the symbol exists on this account."""
+    m = mt5()
+    if not m:
+        return False
+    try:
+        with _lock:
+            return bool(m.symbol_select(symbol, True)) and m.symbol_info(symbol) is not None
+    except Exception:
+        return False
+
+
 def point(symbol: str) -> float | None:
     """v2.18.0: the symbol's point (symbol_info.point). None without MT5."""
     m = mt5()
