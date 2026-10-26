@@ -6,6 +6,7 @@
     .\scripts\aureon_service.ps1 -Action status
     .\scripts\aureon_service.ps1 -Action run                # the launcher loop itself (what the service / task runs)
     .\scripts\aureon_service.ps1 -Action install-fallback   # Task Scheduler: scripts\deadman_fallback.py every 5 min
+    .\scripts\aureon_service.ps1 -Action restart-mt5        # v2.18.1: stop + start terminal64 (used by /repair)
 
   The launcher loop:
     * runs `python main.py` (mode / symbols come from .env — do NOT pass --mode/--symbols, /mode could not change them)
@@ -15,7 +16,7 @@
     * stdout/stderr → logs\service.log, rotated at 10 MB (5 files kept)
 #>
 param(
-    [ValidateSet("install", "uninstall", "status", "run", "install-fallback")]
+    [ValidateSet("install", "uninstall", "status", "run", "install-fallback", "restart-mt5")]
     [string]$Action = "run",
     [string]$Python = "",
     [string]$Root = "",
@@ -137,6 +138,14 @@ $launcherArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Ac
 
 switch ($Action) {
     "run" { Run-Loop }
+    "restart-mt5" {
+        # v2.18.1: /repair's restart_mt5_terminal — stop terminal64 for this MT5 path, start it again (Ensure-Mt5)
+        $path = Get-Mt5Path
+        Get-Process terminal64 -ErrorAction SilentlyContinue | Where-Object { -not $path -or $_.Path -eq $path } | Stop-Process -Force
+        Start-Sleep -Seconds 3
+        Ensure-Mt5
+        Write-SvcLog "restart-mt5 done"
+    }
     "install" {
         if ($nssm) {
             & $nssm install $Name "powershell.exe" $launcherArgs

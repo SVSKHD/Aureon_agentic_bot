@@ -1,4 +1,4 @@
-# Aureon MT5 v2.18.0
+# Aureon MT5 v2.18.1
 
 You place the trade. Aureon detects (per selected EMA mode), fires a Discord gunshot, then manages what you placed:
 protect → secure +10 → ride in +5 steps → close on the fast-EMA turn → news safeguard. Reports and slash commands.
@@ -25,6 +25,23 @@ protected (SL never loosened) but receive no strategy rules; a `⚠️ MODE MISM
 Production: run it under the supervisor (auto-restart, hang kill, boot start) — **[docs/SERVICE.md](docs/SERVICE.md)**:
 
     powershell -ExecutionPolicy Bypass -File .\scripts\aureon_service.ps1 -Action install
+
+## v2.18.1 — ops: forced updates, the repair helper, symbols attached live
+
+| command | what it does |
+|---|---|
+| `/update status` | last check, HEAD vs origin/master, pending / held / hold, the last error |
+| `/update force` | pull now even with positions open (never closed — re-adopted on boot), the suite, restart → `UPDATE FORCED · <old> → <new> · <n> positions carried` |
+| `/update force notests` + `/update force notests confirm` (60 s) | the same without the suite → card ends `SUITE SKIPPED` |
+| `/repair` · `/repair go` · `/repair auto on\|off` · `/repair status` | diagnosis → the allowlisted actions it wants → run them in order, stop at the first failure. Auto only for `UPDATE FAILED` / `UPDATE HELD`. 3 runs / hour. `/repair <n>` still drafts an incident patch |
+| `/attach XAGUSD,EURUSD` | rules checked, thread started, `ATTACHED · XAGUSD · rules: tp 200 / sl 100 pts · London` (queued while closed; max `AUREON_MAX_SYMBOLS`=8) |
+| `/detach EURUSD [now]` | no new entries at once; the thread stops at the first flat moment (`DETACH PENDING` meanwhile); nothing is ever closed; never `symbols[0]` |
+| `/symbols` | RUNNING / PENDING ATTACH / DETACH PENDING / RESTARTING and each symbol's rules |
+
+Forced updates are refused while DNS is down. The repair helper's actions are `fetch_origin`, `reset_to_origin`,
+`pip_install_requirements`, `rerun_suite`, `restart_bot`, `restart_mt5_terminal`, `flush_card_queue`. Anything else, from
+the rules or from Claude (CLI login, `AUREON_REPAIR_MODEL`), is rejected before it runs. Attach / detach rewrite only
+`AUREON_SYMBOLS=` in `.env`.
 
 ## v2.18.0 — ema921 on six symbols, M15, the pullback to EMA 9
 
