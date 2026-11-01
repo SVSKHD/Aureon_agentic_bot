@@ -2659,11 +2659,26 @@ class SymbolAgent(threading.Thread):
             st["bars_in_dd"] = 0 if (close - p["price_open"]) * s >= 0 else int(st.get("bars_in_dd", 0)) + 1
 
     # ------------------------------------------------------------------ guardian
+    def _without_ema921e(self, pos: list) -> list:
+        """v3.0: positions opened by the ema921e runner (comment `aureon ema921e`) are managed by EngineE alone. The guardian
+        is in SHOW mode for them: seen once in the journal, never an SL move or a close."""
+        from .strategies.ema921e.brokers import COMMENT as E_COMMENT
+        mine = [p for p in pos if not str(p.get("comment", "")).startswith(E_COMMENT)]
+        seen = getattr(self, "_e_seen", set())
+        for p in pos:
+            if p["ticket"] not in seen and str(p.get("comment", "")).startswith(E_COMMENT):
+                seen.add(p["ticket"])
+                self.journal.log("guardian_show_only", symbol=self.symbol, mode=self.S.name, ticket=p["ticket"], owner="ema921e",
+                                 note="ema921e position — the guardian logs, never manages")
+        self._e_seen = seen
+        return mine
+
     def _guard(self, new_bar, bar_t, df, close, ef, es, sgn):
         g = self.g; cf, cs = self.S.ema_cols
         gap = (df[cf] - df[cs]).to_numpy()
         pos = broker.positions(self.symbol)
         self._pos_seen = pos
+        pos = self._without_ema921e(pos)                                  # v3.0: ema921e runs its own rules (guardian: show only)
         live = {p["ticket"] for p in pos}
         for t in list(self.state):
             if t not in live:
