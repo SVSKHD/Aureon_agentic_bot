@@ -6,6 +6,7 @@ import types
 import pytest
 
 from aureon_mt5.strategies.ema921e import config as C
+from aureon_mt5.strategies.ema921e.engine import EngineE
 from aureon_mt5.strategies.ema921e.mode import EMode, params_from
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -226,3 +227,51 @@ def test_acceptance_1_replay_parity_on_the_real_export(capsys):
     assert rc == 0, out
     assert "replay:     trades=291 cut=49 floor=215 cross=27 stop=0 gross $119,346" in out
     assert "PARITY ✓" in out
+
+
+# ----------------------------------------------------------------------------- step 7: acceptance test 2 (restart parity)
+def test_acceptance_2_restart_parity(capsys):
+    """Real child processes, SIGKILLed mid-trade (paper / SimBroker, config/ema921e.yaml), restarted on the same logs dir:
+    A/B/C adopt with the uninterrupted run's bars_in / floor / MFE and the rest of the run is identical; D closes late;
+    D2 logs the broker floor SL fill from while it was down; E (closed by hand) logs it and continues flat."""
+    if not os.path.exists(os.path.join(REPO, "data", "XAUUSD_M30.csv")):
+        pytest.skip("data/XAUUSD_M30.csv not in this checkout")
+    from tools import restart_ema921e as T
+    rc = T.main(["--csv", os.path.join(REPO, "data", "XAUUSD_M30.csv")])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "RESTART PARITY ✓" in out and out.count("identical: True") == 6
+
+
+def test_adoption_entry_source(tmp_path):
+    """The engine's entry on adoption: the state's requested price for that ticket, else the cross bar's close when that bar is a
+    cross to the position's side, else the open price (the brief's rule)."""
+    from aureon_mt5.strategies.ema921e.brokers import SimBroker
+    rows = [{"time": 1_790_000_000 + j * 1800, "open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0 - 0.05 * j} for j in range(300)]
+    rows += [{"time": 1_790_000_000 + j * 1800, "open": 85.0, "high": 120.0, "low": 84.9, "close": 85.0 + 2.0 * (j - 299)}
+             for j in range(300, 330)]                                     # a rally: the 9 crosses above the 21 at some bar
+    class F:
+        def bars(s, k): return rows[-k:]
+        def now_server(s): return rows[-1]["time"] + 60
+        def tick(s): return {"bid": rows[-1]["close"], "ask": rows[-1]["close"] + 0.25, "time": rows[-1]["time"]}
+    s, _ = C.load(YAML)
+    cfg = types.SimpleNamespace(max_dd_usd=0, execution_enabled=False, allow_live=False, daily_report_ist="23:00")
+    from aureon_mt5.strategies.ema921e.mode import _eng_bar
+    probe = EngineE("XAUUSD", params_from(s)); probe.warmup(_eng_bar(r) for r in rows)
+    kx = next(j for j in range(300, 330) if probe.side[j] == 1 and probe.side[j - 1] == -1)
+    def adopt(d, open_time, state=None):
+        b = SimBroker("XAUUSD", F(), str(d))
+        b.book["positions"] = [{"ticket": 5, "symbol": "XAUUSD", "direction": "long", "price_open": 123.45, "time": open_time,
+                                "sl": 0.0, "tp": 0.0, "volume": 0.3}]
+        r = EMode(cfg, s, b, log_dir=str(d)); r._show_gates = lambda bar: None
+        r.st.update(state or {})
+        got = []; r.journal = types.SimpleNamespace(log=lambda ev, **k: got.append((ev, k)))
+        r.startup()
+        return next(k for ev, k in got if ev == "ema921e_adopted")
+    after_cross = rows[kx]["time"] + 1800 + 5                              # filled just after the cross bar closed
+    a = adopt(tmp_path / "a", after_cross, {"ticket": 5, "entry_req": 111.0, "side": 1})
+    assert (a["entry_src"], a["engine_entry"], a["entry"]) == ("state", 111.0, 123.45)
+    b = adopt(tmp_path / "b", after_cross)
+    assert (b["entry_src"], b["engine_entry"]) == ("cross_bar_close", rows[kx]["close"])
+    c = adopt(tmp_path / "c", rows[kx + 3]["time"] + 1800 + 5)             # not a cross bar, no state
+    assert (c["entry_src"], c["engine_entry"]) == ("open_price", 123.45)

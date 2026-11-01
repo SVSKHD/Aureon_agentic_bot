@@ -68,6 +68,7 @@ class EMode(threading.Thread):
         self.health = {"status": "starting", "broker": getattr(broker, "name", "?")}
         self.regime = None
         self._last_mfe = None
+        self._month_restored = False
         self.off = float(getattr(broker, "off", None) or getattr(cfg, "server_utc_offset", 3.0) or 0.0)   # server − UTC, h
         self.skip_log: list[tuple] = []                    # (server ts, reason) — /e status, the daily summary
         self.trade_rows: list[dict] = []                   # closed trades this process knows (+ the CSV, step 5)
@@ -138,6 +139,12 @@ class EMode(threading.Thread):
             self._last_mfe = self.eng.closed_trades[-1]["mfe_atr"] * before.atr     # the engine's MFE, in points
         return acts
 
+    def _save_month(self):
+        """The engine's own month bucket (month, month_pnl) — the month stop survives a restart exactly."""
+        m = [self.eng.month[0], self.eng.month[1], float(self.eng.month_pnl)] if self.eng.month else None
+        if m and m != self.st.get("eng_month"):
+            self.st["eng_month"] = m; self.save_state()
+
     def _drop_engine_position(self, why: str):
         if self.eng.pos is not None:
             self.log("ema921e_engine_flat", why=why, entry=self.eng.pos.entry, side=self.eng.pos.side)
@@ -159,6 +166,10 @@ class EMode(threading.Thread):
         closed = self._closed(rows)[-WARMUP_BARS:]
         if not closed:
             raise RuntimeError("ema921e: no closed bars")
+        em = self.st.get("eng_month")                    # before any bar is fed: the adoption replay may close a trade
+        self._month_restored = bool(em and len(em) == 3)
+        if self._month_restored:
+            self.eng.month, self.eng.month_pnl = (int(em[0]), int(em[1])), float(em[2])
         live = self.broker.positions()
         if live:
             self._adopt(live[0], closed)
@@ -166,14 +177,34 @@ class EMode(threading.Thread):
             self.eng.warmup(_eng_bar(b) for b in closed)
             self.times = [int(b["time"]) for b in closed]; self.last_bar = self.times[-1]
             if self.st.get("ticket"):
-                self.log("ema921e_expected_position_missing", ticket=self.st.get("ticket"))
-                self.emit("note", text=f"state expected #{self.st.get('ticket')} — none in MT5, continuing flat")
-                self._clear_trade()
+                self._closed_while_down()
         self._restore_logs()
         self._restore_month()
+        self._save_month()
         self.health["status"] = "running"
         self.log("ema921e_start", bars=len(self.times), broker=self.health["broker"], enabled=self.enabled,
                  in_position=self.eng.pos is not None, settings=self.settings)
+
+    def _closed_while_down(self):
+        """The state file expected a position, MT5 has none: closed while we were down — by the broker SL (the disaster stop,
+        or the floor from the second rung on) or by hand. The closing deal goes in the trades CSV; no deal → logged, flat."""
+        tk = int(self.st["ticket"])
+        px = self.broker.close_price(tk)
+        self.log("ema921e_expected_position_missing", ticket=tk, close_price=px)
+        if px is None:
+            self.emit("note", text=f"state expected #{tk} — none in MT5 and no closing deal, continuing flat")
+            self._clear_trade(); return
+        d = int(self.st.get("side") or 0); e = float(self.st.get("entry_req") or self.st.get("entry_fill") or 0.0)
+        bf = float(self.st.get("broker_floor") or 0.0)
+        stop = e - d * self.eng.p.stop_atr * float(self.st.get("entry_atr") or 0.0) if self.st.get("entry_atr") else None
+        if bf and abs(px - bf) <= 0.5:
+            reason, req = "floor (broker SL, while down)", bf
+        elif stop is not None and abs(px - stop) <= 0.5:
+            reason, req = "stop (broker SL, while down)", stop
+        else:
+            reason, req = "external (while down)", None
+        self.emit("note", text=f"#{tk} closed while down @ {px:.2f} — {reason}")
+        self._record_trade(reason=reason, req=req, fill=px, bars=None, mfe=None)
 
     def _adopt(self, p: dict, closed: list[dict]):
         """MT5 holds an ema921e position the fresh engine does not know: entry = the open price, the entry bar = the last bar
@@ -184,10 +215,19 @@ class EMode(threading.Thread):
         side = 1 if p["direction"] == "long" else -1
         self.eng.warmup(_eng_bar(b) for b in closed[:k + 1])
         self.times = times[:k + 1]; self.last_bar = times[k]
-        self.eng.pos = Position(i=k, side=side, entry=float(p["price_open"]), atr=float(self.eng.atr[k]), opened=self.eng.t[k])
         same = int(self.st.get("ticket") or 0) == int(p["ticket"])
-        self.st.update(ticket=int(p["ticket"]), entry_fill=float(p["price_open"]),
-                       entry_req=float(self.st.get("entry_req") or p["price_open"]) if same else float(p["price_open"]),
+        # the engine's entry is its own decision price (the cross bar's close), not the fill: from the state file for this
+        # ticket; else the entry bar's close when that bar is a cross to this side; else the open price (the brief's rule)
+        crossed_k = k >= 1 and self.eng.side[k] == side and self.eng.side[k - 1] == -side
+        if same and self.st.get("entry_req"):
+            e_entry, src = float(self.st["entry_req"]), "state"
+        elif crossed_k:
+            e_entry, src = float(self.eng.c[k]), "cross_bar_close"
+        else:
+            e_entry, src = float(p["price_open"]), "open_price"
+        self.eng.pos = Position(i=k, side=side, entry=e_entry, atr=float(self.eng.atr[k]), opened=self.eng.t[k])
+        self.st["entry_atr"] = float(self.eng.atr[k])
+        self.st.update(ticket=int(p["ticket"]), entry_fill=float(p["price_open"]), entry_req=e_entry, entry_src=src,
                        side=side, opened_bar=times[k], broker_floor=float(self.st.get("broker_floor") or 0.0) if same else 0.0)
         self.save_state()
         missed = []
@@ -198,7 +238,7 @@ class EMode(threading.Thread):
                 elif a.kind == "enter":                   # a later cross after a missed exit: never taken late
                     self._drop_engine_position("stale entry during adoption replay")
         s = self.eng.status()
-        self.log("ema921e_adopted", ticket=p["ticket"], entry=p["price_open"], side=side, entry_bar=times[k],
+        self.log("ema921e_adopted", ticket=p["ticket"], entry=p["price_open"], engine_entry=e_entry, entry_src=src, side=side, entry_bar=times[k],
                  bars_in=s.get("bars_in"), floor_px=s.get("floor_px"), mfe_pts=s.get("mfe_pts"))
         self.emit("adopt", ticket=p["ticket"], side=side, entry=float(p["price_open"]), bars_in=s.get("bars_in"),
                   floor_px=s.get("floor_px"))
@@ -217,8 +257,10 @@ class EMode(threading.Thread):
         self.skip_log = read_skips(self.log_dir)[-500:]
 
     def _restore_month(self):
-        """The month-stop needs this month's P&L; warmup() cannot know it — rebuilt from the trades CSV (entry month, as the
-        engine buckets it)."""
+        """The month stop needs the engine's month P&L, which warmup() cannot know: the engine's own (month, month_pnl) saved
+        after every bar; without it, the trades CSV by entry month (fill P&L — an approximation)."""
+        if self._month_restored:
+            return
         now = datetime.fromtimestamp(self.broker.now_server(), tz=timezone.utc)
         self.eng.month = (now.year, now.month)
         ym = f"{now.year:04d}-{now.month:02d}"
@@ -243,6 +285,7 @@ class EMode(threading.Thread):
             self._show_gates(bar)
             for a in acts:
                 self._execute(a, stale=stale)
+            self._save_month()
             if had and self.eng.pos is not None and not self.st.get("ticket") and self.intrabar_exit is None:
                 self._drop_engine_position("closed outside the engine")
             if self.intrabar_exit is not None and self.eng.pos is None:
@@ -299,7 +342,7 @@ class EMode(threading.Thread):
             return
         fill = float(r.price or a.price)
         self.st.update(ticket=int(r.ticket), entry_fill=fill, entry_req=float(a.price), side=a.side, opened_bar=self.last_bar,
-                       broker_floor=0.0)
+                       broker_floor=0.0, entry_atr=a.extra.get("atr"))
         self.save_state()
         self.log("ema921e_enter", side=side, req=a.price, fill=fill, ticket=r.ticket, lots=self.lot, sl=sl, atr=a.extra.get("atr"),
                  fill_mode=getattr(r, "fill_mode", None), gates=self._gates_now())
@@ -396,7 +439,7 @@ class EMode(threading.Thread):
         self._clear_trade()
 
     def _clear_trade(self):
-        for k in ("ticket", "entry_fill", "entry_req", "side", "opened_bar", "broker_floor", "close_retry"):
+        for k in ("ticket", "entry_fill", "entry_req", "entry_src", "entry_atr", "side", "opened_bar", "broker_floor", "close_retry"):
             self.st.pop(k, None)
         self.save_state()
 
