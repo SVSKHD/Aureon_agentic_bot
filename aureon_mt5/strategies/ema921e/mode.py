@@ -68,6 +68,10 @@ class EMode(threading.Thread):
         self.health = {"status": "starting", "broker": getattr(broker, "name", "?")}
         self.regime = None
         self._last_mfe = None
+        self.off = float(getattr(broker, "off", None) or getattr(cfg, "server_utc_offset", 3.0) or 0.0)   # server − UTC, h
+        self.skip_log: list[tuple] = []                    # (server ts, reason) — /e status, the daily summary
+        self.trade_rows: list[dict] = []                   # closed trades this process knows (+ the CSV, step 5)
+        self.summary_at = str(getattr(cfg, "daily_report_ist", "23:00") or "23:00")
         self.config_path = config_path
         from .config import ConfigWatcher
         self.watcher = ConfigWatcher(config_path) if config_path else None
@@ -106,6 +110,11 @@ class EMode(threading.Thread):
 
     def emit(self, kind: str, **data):
         data.setdefault("symbol", self.symbol)
+        if kind == "skip":
+            self.skip_log.append((int(self.last_bar or self.broker.now_server()), str(data.get("reason"))))
+            del self.skip_log[:-500]
+        elif kind == "exit":
+            self.trade_rows.append({k: data.get(k) for k in ("time", "exit_time", "dir", "reason", "pnl_pts", "pnl_usd", "bars")})
         for fn in list(self.listeners):
             try:
                 fn(kind, data)
@@ -121,7 +130,7 @@ class EMode(threading.Thread):
 
     def _feed(self, bar: dict) -> list[Action]:
         before = self.eng.pos
-        acts = self.eng.on_bar(bar)
+        acts = self.eng.on_bar(_eng_bar(bar))
         self.times.append(int(bar["time"])); self.last_bar = int(bar["time"])
         if before is not None and self.eng.pos is not before and self.eng.closed_trades:
             self._last_mfe = self.eng.closed_trades[-1]["mfe_atr"] * before.atr     # the engine's MFE, in points
@@ -131,6 +140,12 @@ class EMode(threading.Thread):
         if self.eng.pos is not None:
             self.log("ema921e_engine_flat", why=why, entry=self.eng.pos.entry, side=self.eng.pos.side)
         self.eng.pos = None
+
+    def set_enabled(self, on: bool):
+        """/e on · /e off — new entries only; an open position keeps being managed either way."""
+        with self._lock:
+            self.st["enabled"] = bool(on); self.save_state()
+            self.log("ema921e_enabled", enabled=bool(on))
 
     @property
     def lot(self) -> float:
@@ -146,7 +161,7 @@ class EMode(threading.Thread):
         if live:
             self._adopt(live[0], closed)
         else:
-            self.eng.warmup(closed)
+            self.eng.warmup(_eng_bar(b) for b in closed)
             self.times = [int(b["time"]) for b in closed]; self.last_bar = self.times[-1]
             if self.st.get("ticket"):
                 self.log("ema921e_expected_position_missing", ticket=self.st.get("ticket"))
@@ -164,7 +179,7 @@ class EMode(threading.Thread):
         times = [int(b["time"]) for b in closed]
         k = max((j for j, t in enumerate(times) if t + self.bar_s <= int(p["time"])), default=0)
         side = 1 if p["direction"] == "long" else -1
-        self.eng.warmup(closed[:k + 1])
+        self.eng.warmup(_eng_bar(b) for b in closed[:k + 1])
         self.times = times[:k + 1]; self.last_bar = times[k]
         self.eng.pos = Position(i=k, side=side, entry=float(p["price_open"]), atr=float(self.eng.atr[k]), opened=self.eng.t[k])
         same = int(self.st.get("ticket") or 0) == int(p["ticket"])
@@ -462,8 +477,9 @@ class EMode(threading.Thread):
                 self._stop_evt.wait(5)
             self._stop_evt.wait(self.tick_s)
 
-    def on_loop(self):
-        """Per-loop: config hot reload (an edit of config/ema921e.yaml takes effect on the next loop)."""
+    def on_loop(self, now: float | None = None):
+        """Per-loop: config hot reload (an edit of config/ema921e.yaml takes effect on the next loop) · the 23:00 IST summary."""
+        self.summary_tick(now)
         if self.watcher is not None:
             new = self.watcher.poll()
             if new is not None:
@@ -472,6 +488,19 @@ class EMode(threading.Thread):
                 self._reported_problems = list(self.watcher.last_problems)
                 self.log("ema921e_config_problem", problems=self.watcher.last_problems)
                 self.emit("error", text="config: " + "; ".join(self.watcher.last_problems))
+
+    def summary_tick(self, now: float | None = None) -> str | None:
+        """Once per IST day at/after daily_report_ist (23:00): the day card. Persisted, so a restart does not repeat it."""
+        from .cards import IST, daily_summary
+        t = datetime.fromtimestamp(_time.time() if now is None else now, tz=IST)
+        day = t.strftime("%Y-%m-%d")
+        if t.strftime("%H:%M") < self.summary_at or self.st.get("summary_sent") == day:
+            return None
+        text = daily_summary(self.trade_rows, self.skip_log, day=day, off_h=self.off, lot=self.lot)
+        self.st["summary_sent"] = day; self.save_state()
+        self.log("ema921e_daily", day=day, text=text)
+        self.emit("summary", day=day, text=text)
+        return text
 
     # ------------------------------------------------------------------ hot config
     def apply_settings(self, new: dict, *, source: str) -> dict:
@@ -501,6 +530,14 @@ class EMode(threading.Thread):
             self.watcher.mtime = self.watcher._mtime()          # our own write: no second reload
         self.apply_settings({**self.settings, k: v}, source="/e set")
         return k, v
+
+
+def _eng_bar(bar: dict) -> dict:
+    """The engine reads `time` as naive server time; an int is converted here (the value engine.py would compute itself)."""
+    t = bar["time"]
+    if isinstance(t, (int, float)):
+        return {**bar, "time": datetime.fromtimestamp(int(t), tz=timezone.utc).replace(tzinfo=None)}
+    return bar
 
 
 def _fmt(t) -> str | None:

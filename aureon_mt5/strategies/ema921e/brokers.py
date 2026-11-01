@@ -88,6 +88,15 @@ class MT5Broker:
         a = self.b.account()
         return float(a["equity"]) if a else None
 
+    def account_login(self):
+        """The full login, only for the /e live confirmation (never logged or carded)."""
+        m = self.b.mt5()
+        if not m:
+            return None
+        with self.b._lock:
+            a = m.account_info()
+        return str(getattr(a, "login", "")) if a is not None else None
+
 
 # ----------------------------------------------------------------------------- simulated
 class SimBroker:
@@ -181,6 +190,9 @@ class SimBroker:
 
     def account_kind(self):
         return "demo"
+
+    def account_login(self):
+        return "SIM"
 
     def equity(self):
         return float(self.book.get("equity0", 0.0)) + float(self.book.get("realized", 0.0))
