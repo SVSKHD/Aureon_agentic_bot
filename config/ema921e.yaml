@@ -1,0 +1,14 @@
+symbol: XAUUSD
+timeframe: M30
+lot: 0.3
+spike: 0.15
+no_monday: true
+hours: [0, 24]
+atr_gate: 0.7
+month_stop_per_lot: 2000
+cut_bars: 2
+ladder: [[0.25, 0.05], [0.5, 0.25], [1.0, 0.5]]
+step: 0.5
+stop_atr: 3.0
+news_pause_minutes: 30        # optional: pause entries around high-impact events if a calendar feed exists
+paper: true                   # demo account; flips to live only by explicit /e live

@@ -1,4 +1,4 @@
-# Aureon MT5 v2.18.1
+# Aureon MT5 v3.0.0
 
 You place the trade. Aureon detects (per selected EMA mode), fires a Discord gunshot, then manages what you placed:
 protect → secure +10 → ride in +5 steps → close on the fast-EMA turn → news safeguard. Reports and slash commands.
@@ -10,6 +10,7 @@ protect → secure +10 → ride in +5 steps → close on the fast-EMA turn → n
 | `ema2050` | ACTIVE (v2.0.0) | EMA 20/50: confirmed cross (3 bars + 1.5 gap) + pullback entry, own Gold guardian profile (−12 / +3→+1 / +10 / ride +5) |
 | `ema921` | ACTIVE (v2.16.0) | EMA 9/21 on **M30**, **mechanical**: every cross taken at the bar close · broker SL −30 · +20 → SL +15 · exit on the first close through EMA 9 (or EMA 200 after +20) · Friday flat · drawdown guard |
 | `ema9200` | ACTIVE (v2.15.0) | EMA 9/200 on **M30**: candidates only (pullback to EMA9 with the bias / momentum bar) → TAKE / SKIP, own Gold guardian profile (−30 / +40→+30 / ride +10 / EMA9 turn / Friday flat) |
+| `ema921e` | NEW (v3.0.0) · add-on | the backtested "E" 9/21 rule set on **XAUUSD M30**, **autonomous** (no per-trade approval): every cross at the closed bar unless skipped · bar-2 cut · ATR ladder floor · opposite-cross exit · 3×ATR disaster stop. Runs **next to** the agents (`--ema921e` / `AUREON_EMA921E=1` / `--mode ema921e`), default off — see v3.0.0 below |
 
 Nothing is ported between them. Resolution: `--mode` → `AUREON_MODE` → `ema5080`. Aliases `5080`, `2050`, `9200`, `921`.
 The mode is fixed for the life of the process; a change needs a restart. Positions managed under another mode are kept
@@ -25,6 +26,78 @@ protected (SL never loosened) but receive no strategy rules; a `⚠️ MODE MISM
 Production: run it under the supervisor (auto-restart, hang kill, boot start) — **[docs/SERVICE.md](docs/SERVICE.md)**:
 
     powershell -ExecutionPolicy Bypass -File .\scripts\aureon_service.ps1 -Action install
+
+## v3.0.0 — `ema921e`: the E rule set, autonomous on XAUUSD M30
+The spec is [docs/AUREON_EMA921E_BRIEF.md](docs/AUREON_EMA921E_BRIEF.md); the rules are
+`aureon_mt5/strategies/ema921e/engine.py` (pure, no MT5 / Discord — **never edited by the wrapper**). Backtest reference
+(gold M30, Jan–Oct 2026, 1 lot): 291 trades, 74 % win, gross $119,346, PF 2.38, max DD −$12,815.
+
+**Start (paper = demo account):**
+
+    set AUREON_EXECUTION=1
+    python main.py --mode ema921e --symbols XAUUSD
+
+then `/e on` in Discord. `--mode ema921e` runs the ema921e runner plus the usual agents in `AUREON_E_COMPANION_MODE`
+(default `ema5080`: asks only, no automatic entries). `--ema921e` (or `AUREON_EMA921E=1`) adds the runner to any other
+`--mode` instead. Not started unless asked; once started its new entries stay **off** until `/e on` (persisted).
+`--dry` or `AUREON_PAPER=1` → simulated fills (SimBroker, `logs/ema921e_sim.json`), no MT5 orders at all.
+
+**What runs** (`strategies/ema921e/mode.py`, one thread):
+- every closed M30 bar → `EngineE.on_bar()` → its actions, at once and in order: **enter** = market order at `lot`, broker
+  SL at the 3×ATR disaster stop only, **no TP** · **floor** = bot-side, checked against the live bid between bar closes,
+  market close the moment price trades through; the broker SL follows the floor only from the second rung (+0.25 ATR) ·
+  **exit** (cut / cross) = market close. Orders through `broker.place_market` / `close` (AUREON_FILLING, requote retry,
+  the stops clamp, the one-position-per-symbol cap).
+- startup: `warmup()` with the last 3,000 closed bars, then reconcile — an open `aureon ema921e` position is adopted
+  (the engine's own entry price, bars_in from the open time, the floor rebuilt by replaying the bars since through the
+  engine; an exit missed while down is taken at once, reason `… (late)`); a position closed while down (the broker SL, by
+  hand) is logged from its closing deal.
+- the guardian, the drawdown guard and the regime gate are **show only** for ema921e: logged, never override. The
+  agents' guardian skips positions with the comment `aureon ema921e`.
+- refused entries (switched off, `news_pause_minutes` around a news-file event, execution off, a real account while
+  `paper: true`, a broker reject, a stale bar after a reconnect) drop the engine's position and are logged as skips.
+
+**XAUUSD belongs to ema921e.** The position cap is kept: with `--mode ema921` on XAUUSD as well, whichever holds a
+position refuses the other's entries — a startup warning card says so. Run ema921 without XAUUSD in that case.
+
+**Config** — `config/ema921e.yaml`, hot-reloaded on save, or `/e set <key> <value>` (validated; one line rewritten,
+comments kept; a bad value is refused and the running settings kept; an open trade keeps its entry ATR):
+
+| key | default | |
+|---|---|---|
+| `symbol` / `timeframe` | XAUUSD / M30 | the only validated pair in v3.0 — restart to change |
+| `lot` | 0.3 | 0.01–5 |
+| `spike` | 0.15 | skip if EMA 9's slope two bars before the cross > this ATR/bar toward the cross (0 = off) |
+| `no_monday` | true | no new entries on Monday (server time) |
+| `hours` | [0, 24] | entry window, server hours [from, to) |
+| `atr_gate` | 0.7 | skip if ATR(14) < this × its 2,880-bar average (0 = off) |
+| `month_stop_per_lot` | 2000 | no new entries once the month's P&L ≤ −this × lot (0 = off) |
+| `cut_bars` | 2 | at that bar's close: close ≤ entry → out |
+| `ladder` / `step` | [[0.25, 0.05], [0.5, 0.25], [1.0, 0.5]] / 0.5 | MFE trigger → floor lock, in ATR at entry; +step per +step after the last rung |
+| `stop_atr` | 3.0 | the disaster stop (the only broker SL until the floor reaches the second rung) |
+| `news_pause_minutes` | 30 | no new entries within ± this of an event in the news file (+ NFP); 0 = off |
+| `paper` | true | orders only on a demo account — changed only by `/e live <account number>` (needs `AUREON_ALLOW_LIVE=1`) / `/e demo` |
+
+**Discord:** `/e status` (position, entry / fill, bars in, the next cut bar's close time, MFE, the floor in price + pts + ATR,
+the disaster stop, month P&L, today's skips, regime / drawdown shown) · `/e on` · `/e off` · `/e flat` · `/e set` · `/e live` ·
+`/e demo`. One-line cards: `ENTER LONG 4012.3 | ATR 18.4 | cut@bar2 | floor rungs 4.6/9.2/18.4 | stop 3957`,
+`FLOOR +0.25 ATR → 4016.9`, `EXIT floor +9.1 pts +$273 (bars 6)`, `SKIP spike · LONG 4012.3`; the 23:00 IST day card
+(trades, cut / floor / cross / stop, $ day, $ month, vs the backtest ≈ $400 / trade / lot, skips).
+
+**Logs:** `logs/ema921e_trades.csv` — the backtester's `trades_<SYMBOL>_<TF>.csv` columns + `fill_slippage_pts` (the
+engine's price vs the fill, + = worse), real fills, server time · `logs/ema921e_skips.csv` — every skipped / refused cross.
+
+**Acceptance tests** (the first two are in the suite and must stay green before auto-trade is enabled):
+1. **Replay parity** — `python tools/replay_ema921e.py --csv data/XAUUSD_M30.csv --expect` (no `--csv` = MT5). The runner
+   itself, bar by bar, vs `tools/e_strategy_backtest.py --symbols XAUUSD --tf M30 --no-monday --ladder-unit atr --ladder
+   0.25:0.05,0.5:0.25,1:0.5 --step 0.5 --csv-dir data`: trade count, exit reasons, gross $, row for row, skips.
+   Result: **291 trades, cut 49 / floor 215 / cross 27, gross $119,346 on both sides — PARITY ✓**.
+2. **Restart parity** — `python tools/restart_ema921e.py --csv data/XAUUSD_M30.csv`: real processes SIGKILLed mid-trade
+   (paper), restarted on the same logs: adopted bars_in / floor / MFE equal the uninterrupted run and the rest of the run is
+   identical (immediate restart, bar 1, after a gap); a missed exit closes late; a broker-SL fill or a hand close while
+   down is logged. **RESTART PARITY ✓**.
+3. **Paper week** — 5 sessions on demo: `/e status` and the 23:00 card agree with `logs/ema921e_trades.csv`; median
+   `fill_slippage_pts` under 1 pt.
 
 ## v2.18.1 — ops: forced updates, the repair helper, symbols attached live
 

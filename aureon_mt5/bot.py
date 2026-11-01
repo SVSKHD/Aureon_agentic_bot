@@ -292,6 +292,7 @@ HELP = {
         "mode": "Change process mode and restart — admin only",
         "decide-timeframe": "Exec timeframe + its two confirm TFs: plan, replay, apply:true restarts — admin only",
         "discord-bot": "Bot administration — admin",
+        "e": "ema921e: status · on / off · flat · set <key> <value> · live <account> / demo — operator",
         "commands": "This directory — read-only",
     },
 }
@@ -1134,7 +1135,8 @@ def alert_preview(ag, a: dict, current: float | None) -> dict | None:
 
 
 def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_notify=None, claude=None, alerts=None, codex=None,
-            repair: dict | None = None, actions=None):
+            repair: dict | None = None, actions=None, ema921e=None):
+    """ema921e: a callable returning the running ema921e runner (or None) — the /e group (v3.0)."""
     try:
         import discord  # type: ignore
         from discord import app_commands  # type: ignore
@@ -1882,6 +1884,50 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
         await run(inter, "discord-bot sync", work, timeout=30)
 
     tree.add_command(bot_group)
+
+    # ---------------------------------------------------------------- v3.0 /e — the ema921e runner
+    from .strategies.ema921e import commands as e_cmd
+    e_group = app_commands.Group(name="e", description="ema921e: status, on / off, flat, set, live / demo")
+
+    def e_work(fn):
+        def work():
+            try:
+                return Reply(content=fn()[:1900], source="live")
+            except LookupError as ex:
+                return Reply(content=str(ex))
+        return work
+
+    @e_group.command(name="status", description="ema921e: position, bars in, next cut, floor (pts / ATR), month P&L, skips")
+    async def e_status(inter: discord.Interaction):
+        await run(inter, "e status", e_work(lambda: e_cmd.status(ema921e)), timeout=20)
+
+    @e_group.command(name="on", description="ema921e: enable new entries")
+    async def e_on(inter: discord.Interaction):
+        await run(inter, "e on", e_work(lambda: e_cmd.on(ema921e)), timeout=20)
+
+    @e_group.command(name="off", description="ema921e: disable new entries (an open position keeps being managed)")
+    async def e_off(inter: discord.Interaction):
+        await run(inter, "e off", e_work(lambda: e_cmd.off(ema921e)), timeout=20)
+
+    @e_group.command(name="flat", description="ema921e: close the position now")
+    async def e_flat(inter: discord.Interaction):
+        await run(inter, "e flat", e_work(lambda: e_cmd.flat(ema921e)), timeout=20)
+
+    @e_group.command(name="set", description="ema921e: hot config change (lot, spike, atr_gate, ladder, step, stop_atr, …)")
+    @app_commands.describe(key="config/ema921e.yaml key", value="new value, e.g. 0.5 · 1-23 · 0.25:0.05,0.5:0.25,1:0.5")
+    async def e_set(inter: discord.Interaction, key: str, value: str):
+        await run(inter, "e set", e_work(lambda: e_cmd.set_(ema921e, key, value)), timeout=20)
+
+    @e_group.command(name="live", description="ema921e: paper → live (AUREON_ALLOW_LIVE=1 + the account number typed here)")
+    @app_commands.describe(account="the MT5 account number, typed in full as the confirmation")
+    async def e_live(inter: discord.Interaction, account: str):
+        await run(inter, "e live", e_work(lambda: e_cmd.live(ema921e, account, allow_live=bool(getattr(cfg, "allow_live", False)))), timeout=20)
+
+    @e_group.command(name="demo", description="ema921e: back to paper (orders only on a demo account)")
+    async def e_demo(inter: discord.Interaction):
+        await run(inter, "e demo", e_work(lambda: e_cmd.demo(ema921e)), timeout=20)
+
+    tree.add_command(e_group)
 
     @tree.command(name="alerts", description="List armed price watches; read-only")
     @app_commands.describe(symbol="default: primary symbol")
