@@ -212,3 +212,17 @@ def test_backtester_columns_are_a_prefix():
     for k in keys:
         assert f'"{k}"' in src
     assert L.TRADE_COLUMNS[:-1] == keys and L.TRADE_COLUMNS[-1] == "fill_slippage_pts"
+
+
+# ----------------------------------------------------------------------------- step 6: acceptance test 1 (replay parity)
+def test_acceptance_1_replay_parity_on_the_real_export(capsys):
+    """The runner on data/XAUUSD_M30.csv == tools/e_strategy_backtest.py --csv-dir data (the brief's flags):
+    count, exit reasons, gross $, row for row, skips — and the brief's 291 / 49-215-27 / $119,346."""
+    if not os.path.exists(os.path.join(REPO, "data", "XAUUSD_M30.csv")):
+        pytest.skip("data/XAUUSD_M30.csv not in this checkout")
+    from tools import replay_ema921e as R
+    rc = R.main(["--csv", os.path.join(REPO, "data", "XAUUSD_M30.csv"), "--expect", "--no-show-gates"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "replay:     trades=291 cut=49 floor=215 cross=27 stop=0 gross $119,346" in out
+    assert "PARITY ✓" in out
