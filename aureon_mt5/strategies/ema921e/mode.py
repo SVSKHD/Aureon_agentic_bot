@@ -50,7 +50,8 @@ def second_rung(p: Params) -> float:
 class EMode(threading.Thread):
     """One XAUUSD ema921e runner. Testable without a thread: startup(), poll_bars(), poll_tick(), flat()."""
 
-    def __init__(self, cfg, settings: dict, broker, *, journal=None, log_dir: str = "logs", tick_s: float = 1.0, bar_poll_s: float = 5.0):
+    def __init__(self, cfg, settings: dict, broker, *, journal=None, log_dir: str = "logs", tick_s: float = 1.0, bar_poll_s: float = 5.0,
+                 config_path: str | None = None):
         super().__init__(daemon=True, name="ema921e")
         self.cfg, self.settings, self.broker, self.journal = cfg, dict(settings), broker, journal
         self.symbol = str(self.settings.get("symbol", "XAUUSD")).upper()
@@ -67,6 +68,9 @@ class EMode(threading.Thread):
         self.health = {"status": "starting", "broker": getattr(broker, "name", "?")}
         self.regime = None
         self._last_mfe = None
+        self.config_path = config_path
+        from .config import ConfigWatcher
+        self.watcher = ConfigWatcher(config_path) if config_path else None
         self._stop_evt = threading.Event()
         self._lock = threading.RLock()
 
@@ -459,7 +463,44 @@ class EMode(threading.Thread):
             self._stop_evt.wait(self.tick_s)
 
     def on_loop(self):
-        """Per-loop hook (config hot reload, daily summary — added by the later steps)."""
+        """Per-loop: config hot reload (an edit of config/ema921e.yaml takes effect on the next loop)."""
+        if self.watcher is not None:
+            new = self.watcher.poll()
+            if new is not None:
+                self.apply_settings(new, source="file")
+            elif self.watcher.last_problems and not getattr(self, "_reported_problems", None) == self.watcher.last_problems:
+                self._reported_problems = list(self.watcher.last_problems)
+                self.log("ema921e_config_problem", problems=self.watcher.last_problems)
+                self.emit("error", text="config: " + "; ".join(self.watcher.last_problems))
+
+    # ------------------------------------------------------------------ hot config
+    def apply_settings(self, new: dict, *, source: str) -> dict:
+        """Swap the running settings and the engine's Params (the open position keeps its entry ATR; a new ladder / step /
+        cut applies from the next bar). symbol / timeframe changes are ignored until a restart. Returns the changes."""
+        from .config import RESTART_ONLY
+        with self._lock:
+            changes = {k: (self.settings.get(k), v) for k, v in new.items() if self.settings.get(k) != v and k not in RESTART_ONLY}
+            if not changes:
+                return {}
+            self.settings.update({k: v for k, (_, v) in changes.items()})
+            self.eng.p = params_from(self.settings)
+            self.log("ema921e_config", source=source, changes=changes)
+            self.emit("config", source=source, changes=changes)
+            return changes
+
+    def set(self, key: str, value) -> tuple[str, object]:
+        """/e set <key> <value>: validated, written to the yaml (comments kept), applied at once."""
+        from .config import VIA_COMMAND, ConfigError, parse_value, set_key
+        if self.config_path:
+            k, v = set_key(self.config_path, key, value)
+        elif key.strip().lower() in VIA_COMMAND:
+            raise ConfigError(f"{key}: {VIA_COMMAND[key.strip().lower()]}")
+        else:
+            k, v = parse_value(key, value)
+        if self.watcher is not None:
+            self.watcher.mtime = self.watcher._mtime()          # our own write: no second reload
+        self.apply_settings({**self.settings, k: v}, source="/e set")
+        return k, v
 
 
 def _fmt(t) -> str | None:

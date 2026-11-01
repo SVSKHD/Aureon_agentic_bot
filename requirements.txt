@@ -5,6 +5,7 @@ requests
 pyfiglet
 discord.py
 python_dotenv
+PyYAML
 MetaTrader5 ; platform_system == "Windows"
 fastapi
 uvicorn
