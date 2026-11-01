@@ -2,6 +2,42 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v2.18.1 — 2026-10-26  (PATCH: ops — /update force, the bounded repair helper, attach / detach live; strategy rules unchanged)
+Sections 1–5 of the multi-symbol brief shipped in v2.18.0; this release is its section 6.
+- **`/update force`**: skips the flat gate — pull now, the suite, restart. Open positions are never closed (the guardian is
+  restart-safe and re-adopts them on boot). Card `UPDATE FORCED · <old> → <new> · <n> positions carried`; restart marker
+  kind `update-force` (the boot card says so). A red suite still holds the update and restarts nothing.
+  - `/update force notests` asks for `/update force notests confirm` within 60 s, then skips the suite: the card ends in
+    `SUITE SKIPPED` (red).
+  - Both are refused with `UPDATE REFUSED · network degraded` while netguard reports DNS down.
+  - `/update status`: last check, HEAD vs origin/master, pending / held / hold, the last error (300 chars).
+- **`/repair`** (`aureon_mt5/ops_repair.py`): diagnosis plus an allowlist of named actions — `fetch_origin`,
+  `reset_to_origin` (the local patch saved first; a stale `.git/index.lock` cleared), `pip_install_requirements`,
+  `rerun_suite`, `restart_bot`, `restart_mt5_terminal` (`aureon_service.ps1 -Action restart-mt5`, new), `flush_card_queue`.
+  - Reads: the last 200 lines of `logs/aureon.log`, the updater's last error, `git status --porcelain`,
+    `git rev-parse HEAD origin/master`, DNS for github.com / discord.com, `pip check`, the failing test output.
+  - Rules decide first (DNS down → no action; a locked index → fetch, reset, suite, restart; a missing package → pip,
+    suite, restart; a failing test → rerun once). Only when they find nothing does it ask Claude, through the same CLI login
+    the advisor uses (`AUREON_REPAIR_MODEL`, default the advisor's review model; no API-key path).
+  - An answer containing an action outside the allowlist is rejected before anything runs.
+  - `/repair` posts `REPAIR · diagnosis`; `/repair go` runs the actions in order, stops at the first failure and posts
+    `REPAIR · done|failed`. `/repair auto on|off` (default off) runs it by itself for `UPDATE FAILED` / `UPDATE HELD` only.
+  - Hard limits: 3 runs an hour; never `.env`, `logs/`, `guardian_state.json`; never an order; every action journaled
+    `actor=repair`. `/repair <n>` still drafts an incident's patch (v2.10.0).
+- **`/attach` / `/detach` / `/symbols`** (`aureon_mt5/symbols_ctl.py`).
+  - `/attach XAGUSD,EURUSD`: per symbol, the rules are checked (a symbol without them is refused with the reason), then
+    `symbol_select`, the broker point, and the agent thread starts (it adopts an open position on that symbol). Card
+    `ATTACHED · XAGUSD · rules: tp 200 / sl 100 pts · London`.
+  - Refused when already running or over `AUREON_MAX_SYMBOLS` (8); queued (`PENDING ATTACH`) while that symbol's market is closed.
+  - `/detach EURUSD`: no new entries at once. Flat → the thread stops (`DETACHED`); in a position (live, paper or a pending
+    order) → `DETACH PENDING · managing N position`, detached at the first flat moment. `now` only when flat — nothing is
+    closed; `symbols[0]` can't be detached.
+  - `/symbols` lists RUNNING / PENDING ATTACH / DETACH PENDING / RESTARTING with each symbol's rules.
+  - Attach / detach rewrite only `AUREON_SYMBOLS=` in `.env`. The change is applied on the main loop, never from the
+    command thread. An attached symbol gets the advisor only if it is in `AUREON_CLAUDE_SYMBOLS`.
+- Agents sleep on their stop event, so a detached or stopping agent ends within a poll.
+- Tests: `tests/test_v2181_ops.py` (23).
+
 ## v2.18.0 — 2026-10-25  (MINOR: ema921 = six symbols on M15 with the pullback-to-EMA9 entry; ema5080 untouched)
 **Strategy-rule change (ema921 only).** The v2.16 gold rules (cross at the close, SL −$30, no TP, +20 → +15, exit through
 EMA 9) are replaced by the M15 pullback study's per-symbol table. They stay reachable through env overrides

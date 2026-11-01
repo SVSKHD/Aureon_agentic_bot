@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from dotenv import load_dotenv
 load_dotenv()   # load .env if present
 
-VERSION = "2.18.0"
+VERSION = "2.18.1"
 
 
 def _parse_lot_buttons(raw: str) -> list[float]:
@@ -84,7 +84,8 @@ class Config:
     filling: str = os.environ.get("AUREON_FILLING", "ioc").strip().lower()      # v2.16.1: ioc | fok | return (fallback on 10030)
     max_lots: float = _num("AUREON_MAX_LOTS", "1.0", float)
     entry_921: str = os.environ.get("AUREON_921_ENTRY", "ema9touch").strip().lower()    # v2.18.0 default ema9touch · market | limit (v2.17.0)
-    lot: float = _num("AUREON_LOT", "1", float)                                       # v2.18.0: the lot the TRADE card prices TP / SL at
+    lot: float = _num("AUREON_LOT", "1", float)
+    max_symbols: int = _num("AUREON_MAX_SYMBOLS", "8", int)                           # v2.18.1: /attach cap                                       # v2.18.0: the lot the TRADE card prices TP / SL at
     claude_symbols: tuple = tuple(x.strip().upper() for x in os.environ.get("AUREON_CLAUDE_SYMBOLS", "XAUUSD,XAGUSD").split(",") if x.strip())
     gateway_only_restart_s: float = _num("AUREON_GATEWAY_ONLY_RESTART_S", "1800", float)   # v2.18.0: gateway down, MT5 up
     limit_offset_921: float = _num("AUREON_921_LIMIT_OFFSET", "1.5", float)           # v2.17.0: points back from the cross close

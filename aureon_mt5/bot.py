@@ -203,6 +203,8 @@ HELP = {
         "chart": "Current chart — automatic, read-only",
         "symbols": "Configured symbols — automatic, read-only",
         "symbol-present": "Symbol presence — user supplies symbol",
+        "attach": "Start symbols live: /attach XAGUSD,EURUSD (rules checked, queued while closed) — admin",
+        "detach": "Stop a symbol: no new entries now, thread stops when flat; /detach EURUSD now only if flat — admin",
     },
     "Trading": {
         "override": "Override a missed setup — places the order at the current price (execution on)",
@@ -212,7 +214,7 @@ HELP = {
         "take": "Accept pending ask — user places order unless AUREON_EXECUTION=1",
         "skip": "Reject pending ask — user action",
         "close": "Close the open position on a symbol now — same path as the phone's CLOSE (execution on)",
-        "update": "Check origin/master now and apply when flat (suite green → restart) · /update hold | resume — admin",
+        "update": "Check origin/master now and apply when flat · /update status · /update force [notests] · /update hold | resume — admin",
         "auto-trade": "ema921 automatic placement: /auto-trade on|off|status — off = signals only (/place by hand) — admin",
         "place": "Manual order with the mode's SL/TP: /place long|short [lots] [sl] [tp] [limit=<price|±pts>] — same gate as auto entries",
         "sl": "Move the open position's SL: /sl -20 · /sl +15 · /sl 2450.5 (pts from entry ≤ 200, else a price)",
@@ -241,7 +243,7 @@ HELP = {
     },
     "Repair": {
         "repairs": "Open incidents and proposed patches — read-only",
-        "repair": "Draft a tested patch for an incident on a branch — admin; nothing is applied",
+        "repair": "Diagnose + allowlisted fixes: /repair · go · auto on|off · status · /repair <n> drafts an incident patch — admin",
         "repair-apply": "Apply a proposed patch, test, commit, restart — admin",
         "repair-discard": "Close an incident and drop its patch — admin",
     },
@@ -371,6 +373,30 @@ def update_action(cfg, user, action: str = "", admin_role: str | None = None, up
     if up is None:
         return "⚠️ the auto-updater is not running in this process"
     return up.command(action, user)
+
+
+def symbols_action(cfg, user, kind: str, arg: str, now: bool = False, admin_role: str | None = None, ctl=None) -> str:
+    """v2.18.1 /attach · /detach (admin)."""
+    from . import ops, symbols_ctl
+    role = os.environ.get("AUREON_ADMIN_ROLE_ID", "") if admin_role is None else admin_role
+    if not ops.admin_allowed(user, role):
+        return "Denied: configured administrator role required"
+    c = ctl or symbols_ctl.CURRENT.get("ctl")
+    if c is None:
+        return "⚠️ the symbol controller is not running in this process"
+    return (c.attach(arg, user) if kind == "attach" else c.detach(arg, now=now, user=user))[:1900]
+
+
+def ops_repair_action(cfg, user, arg: str = "", admin_role: str | None = None, helper=None) -> str:
+    """v2.18.1 /repair · /repair go · /repair auto on|off · /repair status (admin)."""
+    from . import ops, ops_repair
+    role = os.environ.get("AUREON_ADMIN_ROLE_ID", "") if admin_role is None else admin_role
+    if not ops.admin_allowed(user, role):
+        return "Denied: configured administrator role required"
+    h = helper or ops_repair.CURRENT.get("repair")
+    if h is None:
+        return "⚠️ the repair helper is not running in this process"
+    return h.command(arg, user)[:1900]
 
 
 def repair_action(kind: str, cfg, agents, claude, repairer, user, n: int, force: bool = False, admin_role: str | None = None) -> Reply:
@@ -1757,9 +1783,23 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
     async def agents_cmd(inter: discord.Interaction):
         await run(inter, "agents", lambda: Reply(card=agents_card(agents, cfg, started_at, monitor, claude, journal)))
 
-    @tree.command(name="symbols", description="List configured trading symbols and modes")
+    @tree.command(name="symbols", description="Live symbols: RUNNING / PENDING ATTACH / DETACH PENDING / RESTARTING and their rules")
     async def symbols(inter: discord.Interaction):
-        await run(inter, "symbols", lambda: Reply(card=symbols_card(agents, cfg)))
+        from . import symbols_ctl
+        ctl = symbols_ctl.CURRENT.get("ctl")
+        await run(inter, "symbols", lambda: Reply(content=(ctl.listing()[:1900] if ctl else None), card=symbols_card(agents, cfg)))
+
+    @tree.command(name="attach", description="Admin: start symbols live (rules checked; queued while the market is closed)")
+    @app_commands.describe(symbols="comma-separated, e.g. XAGUSD,EURUSD")
+    async def attach_cmd(inter: discord.Interaction, symbols: str):
+        user = inter.user
+        await run(inter, "attach", lambda: Reply(content=symbols_action(cfg, user, "attach", symbols)))
+
+    @tree.command(name="detach", description="Admin: stop a symbol — no new entries now; the thread stops at the first flat moment")
+    @app_commands.describe(symbol="e.g. EURUSD", now="only when flat (nothing is ever closed)")
+    async def detach_cmd(inter: discord.Interaction, symbol: str, now: bool = False):
+        user = inter.user
+        await run(inter, "detach", lambda: Reply(content=symbols_action(cfg, user, "detach", symbol, now)))
 
     @tree.command(name="symbol-present", description="Check whether a symbol is monitored")
     @app_commands.describe(symbol="e.g. XAUUSD")
@@ -2082,7 +2122,7 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
         await run(inter, "auto-trade", lambda: Reply(content=auto_trade_action(cfg, agents, journal, notify, user, action, force, reason)))
 
     @tree.command(name="update", description="Admin: check origin/master now and apply when flat · hold / resume the auto path")
-    @app_commands.describe(action="blank = check now · hold · resume")
+    @app_commands.describe(action="blank = check now · status · force · force notests [confirm] · hold · resume")
     async def update_cmd(inter: discord.Interaction, action: str = ""):
         user = inter.user
         await run(inter, "update", lambda: Reply(content=update_action(cfg, user, action)), timeout=1900)
@@ -2161,12 +2201,14 @@ def run_bot(cfg, agents: dict, journal, notify, started_at: float, *, health_not
         from . import repair as repair_mod
         await run(inter, "repairs", lambda: Reply(content=repair_mod.listing(cfg.log_dir)))
 
-    @tree.command(name="repair", description="Admin: draft a tested patch for an incident on a branch (nothing is applied)")
-    @app_commands.describe(n="incident number (see /repairs)")
-    async def repair_cmd(inter: discord.Interaction, n: int):
+    @tree.command(name="repair", description="Admin: diagnose + allowlisted fixes (go · auto on|off · status) · <n> = an incident's patch")
+    @app_commands.describe(arg="blank = diagnose · go · auto on · auto off · status · a number = draft a patch for that incident")
+    async def repair_cmd(inter: discord.Interaction, arg: str = ""):
         user = inter.user
-        await run(inter, "repair", lambda: repair_action("propose", cfg, agents, claude, _repairer(), user, n),
-                  timeout=float(cfg.repair_timeout) + 600)
+        a = arg.strip()
+        work = ((lambda: repair_action("propose", cfg, agents, claude, _repairer(), user, int(a))) if a.isdigit()   # v2.10.0 /repair <n>
+                else (lambda: Reply(content=ops_repair_action(cfg, user, a))))
+        await run(inter, "repair", work, timeout=max(3600.0, float(cfg.repair_timeout) + 600))
 
     @tree.command(name="repair-apply", description="Admin: apply a proposed repair patch, test, commit, push, restart")
     @app_commands.describe(n="incident number", force="apply and restart even with a position open")

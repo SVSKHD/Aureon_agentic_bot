@@ -1,5 +1,11 @@
 # Aureon MT5 State
 
+## v2.18.1 — ops
+- `/update force [notests]` never closes a position; the guardian re-adopts on boot. `/update status` for the updater's state.
+- `/repair` is diagnosis + a fixed allowlist of named actions (no shell, no orders, never `.env` / `logs/` /
+  `guardian_state.json`, 3 runs an hour). Claude is consulted only through the CLI login — keep it that way.
+- `/attach` / `/detach` change the live symbol set; only `AUREON_SYMBOLS=` in `.env` is ever written by the bot.
+
 ## v2.18.0 — ema921 multi-symbol pullback (M15)
 - Strategy rules changed: **YES, ema921 only** (ema5080 / ema2050 / ema9200 untouched). Six symbols: XAUUSD (first — it drives
   market open and the server offset), XAGUSD, EURUSD, GBPUSD, AUDUSD, USDJPY.
