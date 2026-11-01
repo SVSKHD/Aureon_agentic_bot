@@ -69,6 +69,7 @@ class EMode(threading.Thread):
         self.regime = None
         self._last_mfe = None
         self._month_restored = False
+        self.news: tuple = ()                              # UTC epochs of high-impact events (the news blackout file + NFP)
         self.off = float(getattr(broker, "off", None) or getattr(cfg, "server_utc_offset", 3.0) or 0.0)   # server − UTC, h
         self.skip_log: list[tuple] = []                    # (server ts, reason) — /e status, the daily summary
         self.trade_rows: list[dict] = []                   # closed trades this process knows (+ the CSV, step 5)
@@ -311,11 +312,21 @@ class EMode(threading.Thread):
             self._exit(a)
 
     # ------------------------------------------------------------------ enter
+    def news_near(self) -> int | None:
+        """news_pause_minutes: the event (UTC epoch) within ± that many minutes of now, else None. 0 = off."""
+        m = int(self.settings.get("news_pause_minutes", 0) or 0)
+        if not m or not self.news:
+            return None
+        now_utc = int(self.broker.now_server() - self.off * 3600)
+        return next((t for t in self.news if abs(now_utc - int(t)) <= m * 60), None)
+
     def _refusal(self) -> str | None:
         if not self.enabled:
             return "off"
         if self.st.get("ticket"):
             return "position_open"
+        if self.news_near() is not None:
+            return "news"
         kind = self.broker.account_kind() if self.broker.name != "SIM" else "demo"
         if self.broker.name != "SIM":
             if not getattr(self.cfg, "execution_enabled", False):

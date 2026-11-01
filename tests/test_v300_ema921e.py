@@ -275,3 +275,67 @@ def test_adoption_entry_source(tmp_path):
     assert (b["entry_src"], b["engine_entry"]) == ("cross_bar_close", rows[kx]["close"])
     c = adopt(tmp_path / "c", rows[kx + 3]["time"] + 1800 + 5)             # not a cross bar, no state
     assert (c["entry_src"], c["engine_entry"]) == ("open_price", 123.45)
+
+
+# ----------------------------------------------------------------------------- step 8: wiring, conflicts, news pause
+from aureon_mt5.strategies.ema921e import wiring as W
+
+
+def test_requested_default_off_and_the_three_ways_on():
+    assert W.requested(None, False, {}) == (False, None)
+    assert W.requested("ema921", False, {}) == (False, "ema921")
+    assert W.requested("ema2050", True, {}) == (True, "ema2050")
+    assert W.requested(None, False, {"AUREON_EMA921E": "1"}) == (True, None)
+    assert W.requested("ema921e", False, {}) == (True, "ema5080")
+    assert W.requested(None, False, {"AUREON_MODE": "921e", "AUREON_E_COMPANION_MODE": "ema9200"}) == (True, "ema9200")
+
+
+def test_existing_modes_untouched_by_the_registry():
+    from aureon_mt5.strategies import ALIASES, available
+    assert "ema921e" not in ALIASES and "ema921e" not in available()      # not a Strategy: the old /mode list is unchanged
+
+
+def test_conflict_warning_ema921_on_xauusd():
+    cfg = types.SimpleNamespace(mode="ema921", symbols=["XAUUSD", "XAGUSD"], auto_mode=True)
+    w = W.conflicts(cfg)
+    assert len(w) == 1 and "position cap" in w[0].replace("one-position-per-symbol cap", "position cap") and "auto-trade ON" in w[0]
+    assert W.conflicts(types.SimpleNamespace(mode="ema921", symbols=["XAGUSD"], auto_mode=True)) == []
+    assert W.conflicts(types.SimpleNamespace(mode="ema5080", symbols=["XAUUSD"], auto_mode=False)) == []
+
+
+def test_start_paper_runner_entries_off_cards_and_supervise(tmp_path, monkeypatch):
+    from aureon_mt5.strategies.ema921e import mode as M
+    sent, cards, logs = [], [], []
+    notify = types.SimpleNamespace(send=lambda key, title, lines, **kw: sent.append(title), card=lambda t, d="", **kw: cards.append((t, d)))
+    journal = types.SimpleNamespace(log=lambda ev, **k: logs.append(ev))
+    cfg = types.SimpleNamespace(dry=True, paper=False, log_dir=str(tmp_path), server_utc_offset=2.0, mode="ema921", symbols=["XAUUSD"],
+                                auto_mode=False, source="synthetic", max_dd_usd=0, execution_enabled=False, allow_live=False,
+                                daily_report_ist="23:00")
+    monkeypatch.setattr(M.EMode, "run", lambda self: None)              # no thread work in a unit test
+    h = W.start(cfg, journal, notify, news=(1,), config_path=_copy(tmp_path))
+    r = W.get(h)
+    assert r.broker.name == "SIM" and not r.enabled and r.news == (1,) and r.off == 2.0
+    assert any("CONFLICT" in t for t, _ in cards) and "ema921e_conflict_warning" in logs
+    r.join(1)
+    assert not W.supervise(h, now=h["spawned_at"] + 1)                  # backoff
+    assert W.supervise(h, now=h["spawned_at"] + W.RESPAWN_S + 1) and W.get(h) is not r and h["restarts"] == 1
+    assert any(t.startswith("E RESTARTED") for t in sent)
+
+
+def test_news_pause_refuses_entries(tmp_path):
+    r = _runner(tmp_path)
+    r.st["enabled"] = True
+    now_utc = r.broker.now_server() - int(r.off * 3600)
+    r.news = (now_utc + 20 * 60,)
+    assert r.news_near() is not None and r._refusal() == "news"
+    r.news = (now_utc + 31 * 60,)
+    assert r.news_near() is None and r._refusal() is None
+    r.settings["news_pause_minutes"] = 0; r.news = (now_utc,)
+    assert r._refusal() is None
+
+
+def test_main_wires_the_runner_without_touching_the_agents():
+    src = open(os.path.join(REPO, "main.py"), encoding="utf-8").read()
+    assert "e_wiring.requested(a.mode, a.ema921e)" in src and "ema921e=lambda: e_wiring.get(e_holder)" in src
+    assert "e_wiring.supervise(e_holder)" in src and "--ema921e" in src
+    assert "def make_agent(sym):\n        return SymbolAgent(sym, cfg, S, notify, journal, news, claude=claude, alerts=alerts, codex=codex)" in src

@@ -357,7 +357,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode"); ap.add_argument("--symbols"); ap.add_argument("--dry", action="store_true")
     ap.add_argument("--webhook"); ap.add_argument("--token"); ap.add_argument("--enable-silver", action="store_true")
+    ap.add_argument("--ema921e", action="store_true", help="v3.0: run the ema921e XAUUSD M30 runner next to the agents (AUREON_EMA921E=1)")
     a = ap.parse_args()
+    from aureon_mt5.strategies.ema921e import wiring as e_wiring          # v3.0: an add-on runner, never a SymbolAgent
+    e_on, a.mode = e_wiring.requested(a.mode, a.ema921e)
     cfg = Config()
     from aureon_mt5 import features as _features                     # v2.10.0: Discord overrides (logs/features.json) win over .env
     try:
@@ -473,6 +476,13 @@ def main():
                                "your CLI login is used — remove it from the environment to be sure nothing bills the API.",
                                footer="Aureon MT5 · Codex")
 
+    e_holder = None                                                    # v3.0 ema921e (default off; entries off until /e on)
+    if e_on:
+        try:
+            e_holder = e_wiring.start(cfg, journal, notify, news=news, health_notify=health_notify)
+        except Exception as e:
+            telemetry.failure(health_notify, journal, title="AUREON EMA921E START FAILED", key="ema921e:start", action="ema921e start", exc=e)
+
     def make_agent(sym):
         return SymbolAgent(sym, cfg, S, notify, journal, news, claude=claude, alerts=alerts, codex=codex)
 
@@ -572,7 +582,7 @@ def main():
     import atexit
     atexit.register(lambda: (console_srv.stop() if console_srv else None, push.stop()))
     if cfg.bot_token: monitor = run_bot(cfg, agents, journal, notify, started, health_notify=health_notify, claude=claude, alerts=alerts, codex=codex,
-                                        repair=bot_repair, actions=actions)
+                                        repair=bot_repair, actions=actions, ema921e=lambda: e_wiring.get(e_holder))
     else: print("no DISCORD_TOKEN — slash commands off, alerts via webhook only")
 
     # v2.7.2: self-heal + dead-man's switch + logs/heartbeat.txt, on its own thread (never the Discord loop)
@@ -678,6 +688,7 @@ def main():
             compare_saturday_tick(cfg, agents, journal, notify, claude, codex=codex)
             claude_report_tick(cfg, agents, journal, notify)
             supervise(agents, make_agent, notify, cfg.mode)
+            e_wiring.supervise(e_holder)                                       # v3.0: a dead ema921e runner is replaced
             wd.tick()
             from aureon_mt5.daily_plan import tick as plan_tick
             plan_tick(cfg, agents, journal, notify)

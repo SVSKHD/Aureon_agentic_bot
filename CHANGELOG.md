@@ -2,6 +2,22 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## v3.0.0 — 2026-11-01  (MAJOR: new autonomous mode `ema921e`; the existing modes' rules unchanged)
+- **`ema921e`** — the backtested "E" 9/21 rule set on XAUUSD M30, run by `aureon_mt5/strategies/ema921e/engine.py`
+  (delivered, unchanged) inside a bar-close runner (`mode.py`): enter at market with the 3×ATR disaster stop as the only
+  broker SL and no TP; the ATR-ladder floor kept bot-side against live ticks, the broker SL following it from the second
+  rung; cut / cross at market. Startup warmup (3,000 bars) + reconcile / adopt; guardian, drawdown guard and regime gate in
+  show mode for it. Add-on next to the agents (`--ema921e`, `AUREON_EMA921E=1`, `--mode ema921e`), default off; entries off
+  until `/e on`.
+- `config/ema921e.yaml` (hot reload, `/e set`); `/e status | on | off | flat | set | live | demo`; one-line ENTER / FLOOR /
+  EXIT / SKIP cards and the 23:00 IST day card; `logs/ema921e_trades.csv` (backtester columns + `fill_slippage_pts`),
+  `logs/ema921e_skips.csv`.
+- Acceptance: `tools/replay_ema921e.py` (replay parity: 291 / 49-215-27 / $119,346 = the backtester) and
+  `tools/restart_ema921e.py` (restart parity), both in the suite; `tools/e_strategy_backtest.py` and the Jan–Oct 2026 export
+  `data/XAUUSD_M30.csv` kept in-repo.
+- Shared code: `SymbolAgent._guard` ignores positions commented `aureon ema921e` (logged once); a startup warning when
+  `ema921` also runs on XAUUSD (the one-position cap stays). `PyYAML` added to requirements.
+
 ## v2.18.1 — 2026-10-26  (PATCH: ops — /update force, the bounded repair helper, attach / detach live; strategy rules unchanged)
 Sections 1–5 of the multi-symbol brief shipped in v2.18.0; this release is its section 6.
 - **`/update force`**: skips the flat gate — pull now, the suite, restart. Open positions are never closed (the guardian is
