@@ -173,3 +173,42 @@ def test_cards_listener_one_line_each(tmp_path):
                                        "FLOOR +0.25 ATR → 4016.9", "EXIT floor +9.1 pts +$273 (bars 6)", "SKIP monday · SHORT 4000.0"]
     assert all(lines == [] for _, _, lines in sent)
     assert r.skip_log[-1][1] == "monday" and r.trade_rows[-1]["pnl_usd"] == 273.0
+
+
+# ----------------------------------------------------------------------------- step 5: the CSV logs
+import csv as _csv
+
+from aureon_mt5.strategies.ema921e import logs as L
+
+
+def test_trades_and_skips_csv_columns_and_restore(tmp_path):
+    r = _runner(tmp_path)
+    r.emit("exit", symbol="XAUUSD", time="2026-11-02 10:00:00", dir="LONG", entry=4000.0, skipped="", exit_time="2026-11-02 11:00:00",
+           exit=4009.1, reason="floor", bars=2, mfe_pts=12.0, pnl_pts=9.1, pnl_usd=273.0, fill_slippage_pts=0.3)
+    r.last_bar = 1_793_000_000 - 1_793_000_000 % 1800
+    r.emit("skip", reason="spike", side=-1, price=4001.0, atr_ratio=1.1, s9_pre=0.2)
+    rows = list(_csv.DictReader(open(tmp_path / "ema921e_trades.csv")))
+    assert list(rows[0].keys()) == L.TRADE_COLUMNS == ["symbol", "time", "dir", "entry", "skipped", "exit_time", "exit", "reason",
+                                                       "bars", "mfe_pts", "pnl_pts", "pnl_usd", "fill_slippage_pts"]
+    assert rows[0]["reason"] == "floor" and float(rows[0]["fill_slippage_pts"]) == 0.3
+    sk = list(_csv.DictReader(open(tmp_path / "ema921e_skips.csv")))
+    assert sk[0]["reason"] == "spike" and sk[0]["dir"] == "SHORT" and sk[0]["time"] == L._srv(r.last_bar)
+    r2 = _runner(tmp_path)                                               # a restart reads both back
+    r2._restore_logs()
+    assert r2.trade_rows[0]["pnl_usd"] == "273.0" and r2.skip_log == [(r.last_bar, "spike")]
+    r2.broker.now = 1_793_000_000                                        # 2026-10-26 srv → the month bucket is October
+    r2._restore_month()
+    assert r2.eng.month_pnl == 0.0
+    r2.trade_rows[0]["time"] = "2026-10-29 01:00:00"; r2._restore_month()
+    assert r2.eng.month_pnl == 273.0
+
+
+def test_backtester_columns_are_a_prefix():
+    """The trades CSV is the backtester's trades_<SYMBOL>_<TF>.csv + fill_slippage_pts (so the two diff directly)."""
+    import ast
+    src = open(os.path.join(REPO, "tools", "e_strategy_backtest.py"), encoding="utf-8").read()
+    assert ast.parse(src)
+    keys = ["symbol", "time", "dir", "entry", "skipped", "exit_time", "exit", "reason", "bars", "mfe_pts", "pnl_pts", "pnl_usd"]
+    for k in keys:
+        assert f'"{k}"' in src
+    assert L.TRADE_COLUMNS[:-1] == keys and L.TRADE_COLUMNS[-1] == "fill_slippage_pts"

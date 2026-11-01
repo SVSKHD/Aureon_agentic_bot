@@ -72,6 +72,8 @@ class EMode(threading.Thread):
         self.skip_log: list[tuple] = []                    # (server ts, reason) — /e status, the daily summary
         self.trade_rows: list[dict] = []                   # closed trades this process knows (+ the CSV, step 5)
         self.summary_at = str(getattr(cfg, "daily_report_ist", "23:00") or "23:00")
+        from .logs import TradeLogs
+        self.trade_logs = TradeLogs(self)                  # logs/ema921e_trades.csv + logs/ema921e_skips.csv (always on)
         self.config_path = config_path
         from .config import ConfigWatcher
         self.watcher = ConfigWatcher(config_path) if config_path else None
@@ -167,6 +169,7 @@ class EMode(threading.Thread):
                 self.log("ema921e_expected_position_missing", ticket=self.st.get("ticket"))
                 self.emit("note", text=f"state expected #{self.st.get('ticket')} — none in MT5, continuing flat")
                 self._clear_trade()
+        self._restore_logs()
         self._restore_month()
         self.health["status"] = "running"
         self.log("ema921e_start", bars=len(self.times), broker=self.health["broker"], enabled=self.enabled,
@@ -205,21 +208,21 @@ class EMode(threading.Thread):
         elif s.get("floor_px") is not None:
             self._sync_broker_floor()
 
+    def _restore_logs(self):
+        """/e status, the daily summary and the month stop read the CSVs back after a restart (rows emitted before this
+        point in startup — an adoption's late exit — are already in the file, so the file is the whole truth)."""
+        from .logs import read_skips, read_trades
+        keep = ("time", "exit_time", "dir", "reason", "pnl_pts", "pnl_usd", "bars")
+        self.trade_rows = [{k: r.get(k) for k in keep} for r in read_trades(self.log_dir)]
+        self.skip_log = read_skips(self.log_dir)[-500:]
+
     def _restore_month(self):
-        """The month-stop needs this month's P&L; warmup() cannot know it — rebuilt from logs/ema921e_trades.csv."""
+        """The month-stop needs this month's P&L; warmup() cannot know it — rebuilt from the trades CSV (entry month, as the
+        engine buckets it)."""
         now = datetime.fromtimestamp(self.broker.now_server(), tz=timezone.utc)
         self.eng.month = (now.year, now.month)
-        path = os.path.join(self.log_dir, "ema921e_trades.csv")
-        tot = 0.0
-        try:
-            import csv
-            with open(path, encoding="utf-8") as f:
-                for r in csv.DictReader(f):
-                    if str(r.get("time", "")).startswith(f"{now.year:04d}-{now.month:02d}"):
-                        tot += float(r.get("pnl_usd") or 0.0)
-        except OSError:
-            pass
-        self.eng.month_pnl = tot
+        ym = f"{now.year:04d}-{now.month:02d}"
+        self.eng.month_pnl = sum(float(r.get("pnl_usd") or 0.0) for r in self.trade_rows if str(r.get("time") or "").startswith(ym))
 
     # ------------------------------------------------------------------ the bar loop
     def poll_bars(self) -> int:
