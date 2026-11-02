@@ -579,7 +579,17 @@ def main():
         why = console_srv.start()
         print(f"console: {why or 'listening on ' + cfg.console_bind}")
         journal.log("console_start", bind=cfg.console_bind, ok=not why, why=why or None)
+    status_exp = status_srv = None                                 # read-only status export for Aureon_Agentic
+    if os.environ.get("AUREON_STATUS_EXPORT", "0").strip() == "1":   # (off by default; docs/STATUS_EXPORT.md)
+        try:
+            from aureon_mt5 import console as _cs, status_export as _sx
+            status_exp, status_srv = _sx.start(
+                cfg, agents, started=started, ema921e_fn=lambda: e_wiring.get(e_holder),
+                state_fn=lambda: _cs.console_state(cfg, agents, actions, notify, started=started))
+        except Exception as e:                                     # never stops the bot
+            print(f"status export off: {e!r}")
     import atexit
+    atexit.register(lambda: (status_exp.stop() if status_exp else None, status_srv.stop() if status_srv else None))
     atexit.register(lambda: (console_srv.stop() if console_srv else None, push.stop()))
     if cfg.bot_token: monitor = run_bot(cfg, agents, journal, notify, started, health_notify=health_notify, claude=claude, alerts=alerts, codex=codex,
                                         repair=bot_repair, actions=actions, ema921e=lambda: e_wiring.get(e_holder))

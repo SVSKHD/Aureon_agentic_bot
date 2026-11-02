@@ -2,6 +2,15 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
+## Unreleased  (proposed MINOR: read-only status export; strategy rules unchanged)
+- **`aureon_mt5/status_export.py`** (off unless `AUREON_STATUS_EXPORT=1`): writes `logs/status.json` every 15 s from the
+  agents' cached snapshots, health, latest signals, the read-only part of `/console/state`, allowlisted journal events,
+  `halt.json`, the `ema921e_trades.csv` tail and `out/*.json` backtest summaries. Optional GET-only `GET /status` on
+  `127.0.0.1:8788` with its own token (`AUREON_STATUS_TOKEN`). No MT5 calls; never imports `broker` / `MetaTrader5`.
+  Contract: `docs/STATUS_EXPORT.md`. Consumer: Aureon_Agentic's `MT5Adapter`.
+- `main.py`: one guarded block after the console starts. `tests/test_status_export.py`.
+- Strategy rules changed: NO
+
 ## v3.0.0 — 2026-11-01  (MAJOR: new autonomous mode `ema921e`; the existing modes' rules unchanged)
 - **`ema921e`** — the backtested "E" 9/21 rule set on XAUUSD M30, run by `aureon_mt5/strategies/ema921e/engine.py`
   (delivered, unchanged) inside a bar-close runner (`mode.py`): enter at market with the 3×ATR disaster stop as the only
