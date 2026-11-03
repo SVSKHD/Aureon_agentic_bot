@@ -49,7 +49,9 @@ def connect() -> bool:
     with _lock:
         if _m is None:
             try:
-                import MetaTrader5 as m  # type: ignore
+                from . import mt5api  # native MetaTrader5, or the mt5linux bridge on Linux
+
+                m = mt5api.load()
                 _m = m if m.initialize() else False
             except Exception:
                 _m = False

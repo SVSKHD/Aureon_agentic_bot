@@ -1,0 +1,11 @@
+# docs/LINUX_SETUP.md — virtual display :1 for the MT5 terminal (Wine draws its windows here).
+[Unit]
+Description=Aureon MT5: virtual display :1 (Xvfb)
+
+[Service]
+ExecStart=/usr/bin/Xvfb :1 -screen 0 1280x800x24 -nolisten tcp
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,20 @@
+# The MetaTrader 5 terminal under Wine on display :1. Started by aureon-mt5-terminal.path once
+# terminal64.exe exists, so nothing fails in a loop before MT5 is installed. Log in once over VNC
+# with "Save password"; after that it logs in by itself on every start.
+[Unit]
+Description=Aureon MT5: MetaTrader 5 terminal (Wine, display :1)
+Requires=aureon-xvfb.service aureon-wineserver.service
+After=aureon-xvfb.service aureon-wineserver.service
+ConditionPathExists=%h/.mt5/drive_c/Program Files/MetaTrader 5/terminal64.exe
+
+[Service]
+Environment=WINEPREFIX=%h/.mt5
+Environment=WINEDEBUG=-all
+Environment=DISPLAY=:1
+ExecStart=/usr/bin/wine "C:\\Program Files\\MetaTrader 5\\terminal64.exe"
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

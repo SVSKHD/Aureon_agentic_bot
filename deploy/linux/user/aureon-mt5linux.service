@@ -1,0 +1,18 @@
+# The mt5linux server: an rpyc classic server in the Wine Python that holds MetaTrader5.
+# 127.0.0.1 ONLY: a classic rpyc server runs any code a client sends, so it must never listen on
+# another interface (the default --host "" would bind them all). Docker containers cannot reach it.
+[Unit]
+Description=Aureon MT5: mt5linux server (Wine Python, 127.0.0.1:18812)
+Requires=aureon-wineserver.service
+After=aureon-wineserver.service aureon-mt5-terminal.service
+
+[Service]
+Environment=WINEPREFIX=%h/.mt5
+Environment=WINEDEBUG=-all
+Environment=DISPLAY=:1
+ExecStart=/usr/bin/wine C:\\Python311\\python.exe -m mt5linux --host 127.0.0.1 -p 18812
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,15 @@
+# One wineserver for the ~/.mt5 prefix, owned by its own unit. Without it, the first Wine program
+# started (terminal or mt5linux) hosts the wineserver, and stopping that unit breaks the other.
+[Unit]
+Description=Aureon MT5: wineserver for ~/.mt5
+
+[Service]
+Environment=WINEPREFIX=%h/.mt5
+Environment=WINEDEBUG=-all
+ExecStart=/usr/bin/wineserver --foreground --persistent
+ExecStop=/usr/bin/wineserver --kill
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

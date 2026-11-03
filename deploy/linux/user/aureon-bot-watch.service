@@ -1,7 +1,8 @@
-# Hang check for aureon-bot.service: the launcher's rule on Windows (scripts/aureon_service.ps1).
+# Hang check for aureon-bot (the Windows launcher's rule, scripts/aureon_service.ps1).
 [Unit]
 Description=Aureon MT5 bot: restart if logs/heartbeat.txt is stale
 
 [Service]
 Type=oneshot
+Environment="AUREON_SYSTEMCTL=systemctl --user"
 ExecStart=/srv/projects/Aureon_agentic_bot/scripts/linux/heartbeat_watch.sh
