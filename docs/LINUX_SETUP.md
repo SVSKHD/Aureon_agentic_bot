@@ -17,8 +17,8 @@ Layout on the Aureon server (user `svskhd8`):
 
 | What | Where |
 |---|---|
-| Wine prefix | `/home/svskhd8/.wine` (64-bit, `wine` 9.0 + `wine32` from Ubuntu) |
-| Windows Python | `C:\Python311` = `~/.wine/drive_c/Python311` |
+| Wine prefix | `/home/svskhd8/.mt5` (64-bit, `wine` 9.0 + `wine32` from Ubuntu). Not `~/.wine`: every `wine` command below sets `WINEPREFIX`, because a bare `wine` uses `~/.wine` |
+| Windows Python | `C:\Python311` = `~/.mt5/drive_c/Python311` |
 | MT5 terminal | `C:\Program Files\MetaTrader 5\terminal64.exe` |
 | Bot checkout | `/srv/projects/Aureon_agentic_bot` (settings in its `.env`) |
 | Units | `deploy/linux/*.service`, `*.timer` → `/etc/systemd/system/` |
@@ -38,19 +38,19 @@ sudo apt install -y wine wine64 wine32 xvfb x11vnc     # wine/xvfb are already o
 ## 2. Windows Python 3.11 in the prefix
 
 ```bash
-export WINEPREFIX=$HOME/.wine WINEDEBUG=-all
+export WINEPREFIX=$HOME/.mt5 WINEDEBUG=-all
 cd /tmp && curl -fLO https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe
 md5sum python-3.11.9-amd64.exe          # must be e8dcd502e34932eebcaf1be056d5cbcd (python.org release page)
 xvfb-run -a wine python-3.11.9-amd64.exe /quiet InstallAllUsers=0 PrependPath=0 Include_test=0 TargetDir='C:\Python311'
-wine 'C:\Python311\python.exe' -c "import sys; print(sys.version)"      # 3.11.9 ...
+WINEPREFIX=$HOME/.mt5 wine 'C:\Python311\python.exe' -c "import sys; print(sys.version)"      # 3.11.9 ...
 ```
 
 ## 3. The bot and its dependencies
 
 ```bash
 cd /srv/projects/Aureon_agentic_bot && git checkout master && git pull --ff-only
-WINEDEBUG=-all wine 'C:\Python311\python.exe' -m pip install -r requirements.txt
-WINEDEBUG=-all wine 'C:\Python311\python.exe' -c "import MetaTrader5, pandas, discord; print('deps ok')"
+WINEPREFIX=$HOME/.mt5 WINEDEBUG=-all wine 'C:\Python311\python.exe' -m pip install -r requirements.txt
+WINEPREFIX=$HOME/.mt5 WINEDEBUG=-all wine 'C:\Python311\python.exe' -c "import MetaTrader5, pandas, discord; print('deps ok')"
 ```
 
 `MetaTrader5 ; platform_system == "Windows"` in `requirements.txt` is true under Wine's Python, so it installs.
@@ -62,7 +62,7 @@ Use your broker's MT5 installer if it has one (it pre-fills the server list); ot
 ```bash
 cd /tmp && curl -fLO https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe
 sudo systemctl start aureon-xvfb          # after step 5 installs the units; or: Xvfb :99 &
-DISPLAY=:99 WINEPREFIX=$HOME/.wine wine mt5setup.exe /auto
+DISPLAY=:99 WINEPREFIX=$HOME/.mt5 wine mt5setup.exe /auto
 ```
 
 Log in once with **Save password** ticked, so the terminal logs in by itself after every restart.
