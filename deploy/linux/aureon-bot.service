@@ -1,0 +1,26 @@
+# Aureon MT5 on Linux (docs/LINUX_SETUP.md): the bot (python main.py) under Wine's Windows Python,
+# because the MetaTrader5 package is Windows-only. The Linux twin of the Windows "Aureon" task:
+# starts 30 s after the terminal, and restarts on every exit (0 planned, 1 unplanned, 75 restart),
+# like the launcher loop. Hangs (stale logs/heartbeat.txt) are handled by aureon-bot-watch.timer.
+[Unit]
+Description=Aureon MT5 bot (Wine Python)
+Requires=aureon-mt5.service
+After=aureon-mt5.service
+
+[Service]
+User=svskhd8
+WorkingDirectory=/srv/projects/Aureon_agentic_bot
+Environment=DISPLAY=:99
+Environment=WINEPREFIX=/home/svskhd8/.wine
+Environment=WINEDEBUG=-all
+Environment=PYTHONUNBUFFERED=1
+# Settings come from the repo's .env (main.py calls load_dotenv); nothing secret is in this unit.
+ExecStartPre=/bin/sleep 30
+ExecStart=/usr/bin/wine C:\\Python311\\python.exe main.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=60
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target
