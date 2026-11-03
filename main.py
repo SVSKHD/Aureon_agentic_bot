@@ -588,7 +588,17 @@ def main():
                 state_fn=lambda: _cs.console_state(cfg, agents, actions, notify, started=started))
         except Exception as e:                                     # never stops the bot
             print(f"status export off: {e!r}")
+    push_bridge = None                                             # read-only push to the Aureon server
+    if os.environ.get("AUREON_PUSH_ENABLED", "0").strip() == "1":    # (off by default; docs/PUSH_BRIDGE.md)
+        try:
+            from aureon_mt5 import console as _cs2, push_bridge as _pb
+            push_bridge = _pb.start(
+                cfg, agents, notify=notify, started=started, ema921e_fn=lambda: e_wiring.get(e_holder),
+                state_fn=lambda: _cs2.console_state(cfg, agents, actions, notify, started=started))
+        except Exception as e:                                     # never stops the bot (the token is never in e)
+            print(f"aureon push off: {type(e).__name__}")
     import atexit
+    atexit.register(lambda: push_bridge.stop() if push_bridge else None)
     atexit.register(lambda: (status_exp.stop() if status_exp else None, status_srv.stop() if status_srv else None))
     atexit.register(lambda: (console_srv.stop() if console_srv else None, push.stop()))
     if cfg.bot_token: monitor = run_bot(cfg, agents, journal, notify, started, health_notify=health_notify, claude=claude, alerts=alerts, codex=codex,
