@@ -80,6 +80,15 @@ Notes:
 - **Secrets**: any key containing `token`, `auth`, `password`, `secret`, `webhook`, `url`, `login` or `account` is
   dropped at every depth before sending. No account number, balance or login is in the document.
 
+## Linux (the Aureon server itself)
+
+When the bot runs on the Aureon server under Wine, follow [LINUX_SETUP.md](LINUX_SETUP.md) and push
+over loopback, not Tailscale:
+
+```
+AUREON_PUSH_URL=http://127.0.0.1:8000/api/trading/mt5/ingest
+```
+
 ## Windows setup
 
 Do these on the Windows PC that runs the bot (PowerShell as the same Windows user that runs the bot / NSSM service).
