@@ -2,7 +2,17 @@
 
 Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are always called out explicitly.
 
-## Unreleased  (proposed MINOR: read-only status export; strategy rules unchanged)
+## Unreleased  (proposed MINOR: read-only status export + push bridge; strategy rules unchanged)
+- **`aureon_mt5/push_bridge.py`** (off unless `AUREON_PUSH_ENABLED=1`): POSTs an `aureon.mt5.push/v1` document (a
+  superset of `aureon.mt5.status/v1`: + `health`, `guardian`, `signals_latest`, `events`, `tracebacks`, `strategy`,
+  `candles`) to the Aureon server (`AUREON_PUSH_URL`, default `https://svskhd8.taila439d5.ts.net/api/trading/mt5/ingest`)
+  every `AUREON_PUSH_INTERVAL_S` with `Authorization: Bearer $MT5_INGEST_TOKEN` (32+ chars, never logged), gzip by
+  default. Own daemon thread, 10 s timeout, failures printed once a minute. Journal events are delivered from an
+  acknowledged cursor (`logs/push_cursor.json`, moves only on 2xx) with stable ids; the body is capped at 1.5 MiB
+  (candles trimmed first, then the newest events wait for the next push). Candles come from the bars the agents already
+  cache — no MT5 calls; never imports `broker` / `MetaTrader5`; secret-looking keys dropped at every depth.
+  Contract + Windows setup (Tailscale, `.env` / `setx`, verify): `docs/PUSH_BRIDGE.md`.
+- `main.py`: one guarded block after the status export. `tests/test_push_bridge.py`. `.env.example`: the new variables.
 - **`aureon_mt5/status_export.py`** (off unless `AUREON_STATUS_EXPORT=1`): writes `logs/status.json` every 15 s from the
   agents' cached snapshots, health, latest signals, the read-only part of `/console/state`, allowlisted journal events,
   `halt.json`, the `ema921e_trades.csv` tail and `out/*.json` backtest summaries. Optional GET-only `GET /status` on
