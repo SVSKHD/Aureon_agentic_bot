@@ -11,7 +11,7 @@ After=aureon-mt5.service
 User=svskhd8
 WorkingDirectory=/srv/projects/Aureon_agentic_bot
 Environment=DISPLAY=:99
-Environment=WINEPREFIX=/home/svskhd8/.wine
+Environment=WINEPREFIX=/home/svskhd8/.mt5
 Environment=WINEDEBUG=-all
 Environment=PYTHONUNBUFFERED=1
 # Settings come from the repo's .env (main.py calls load_dotenv); nothing secret is in this unit.
