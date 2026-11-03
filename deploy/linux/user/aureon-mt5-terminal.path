@@ -1,0 +1,10 @@
+# Start the terminal as soon as the MT5 installer has put terminal64.exe in place.
+[Unit]
+Description=Aureon MT5: start the terminal once it is installed
+
+[Path]
+PathExists=%h/.mt5/drive_c/Program Files/MetaTrader 5/terminal64.exe
+Unit=aureon-mt5-terminal.service
+
+[Install]
+WantedBy=default.target

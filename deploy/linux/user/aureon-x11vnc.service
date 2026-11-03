@@ -1,0 +1,14 @@
+# VNC view of display :1, bound to 127.0.0.1 only: reach it through an SSH tunnel
+# (ssh -L 5900:127.0.0.1:5900 <server>), for the broker login and to look at the terminal.
+[Unit]
+Description=Aureon MT5: VNC on 127.0.0.1:5900 for display :1
+Requires=aureon-xvfb.service
+After=aureon-xvfb.service
+
+[Service]
+ExecStart=/usr/bin/x11vnc -display :1 -localhost -rfbport 5900 -forever -shared -nopw -noxdamage -quiet
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -7,5 +7,6 @@ discord.py
 python_dotenv
 PyYAML
 MetaTrader5 ; platform_system == "Windows"
+rpyc==5.2.3 ; platform_system != "Windows"   # AUREON_MT5_BACKEND=mt5linux (aureon_mt5/mt5api.py)
 fastapi
 uvicorn

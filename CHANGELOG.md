@@ -19,6 +19,13 @@ Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are a
   `127.0.0.1:8788` with its own token (`AUREON_STATUS_TOKEN`). No MT5 calls; never imports `broker` / `MetaTrader5`.
   Contract: `docs/STATUS_EXPORT.md`. Consumer: Aureon_Agentic's `MT5Adapter`.
 - `main.py`: one guarded block after the console starts. `tests/test_status_export.py`.
+- **Linux (`docs/LINUX_SETUP.md`)**: the bot runs on the Aureon server on native Linux Python;
+  `aureon_mt5/mt5api.py` picks the MetaTrader5 API — `AUREON_MT5_BACKEND=native` (default, unchanged on Windows) or
+  `mt5linux` (the mt5linux rpyc server in Windows Python under Wine, `127.0.0.1:18812`; JSON arguments, local named-tuple
+  results, no automatic retry so an `order_send` is never sent twice). `broker.connect()` and both `fetch_mt5` loaders use
+  it. systemd **user** units in `deploy/linux/user/` (Xvfb :1, x11vnc on localhost, wineserver, terminal, mt5linux, bot,
+  hang watch); the earlier system units in `deploy/linux/` are removed. `requirements.txt`: `rpyc==5.2.3` off Windows.
+  `tests/test_mt5api.py`.
 - Strategy rules changed: NO
 
 ## v3.0.0 — 2026-11-01  (MAJOR: new autonomous mode `ema921e`; the existing modes' rules unchanged)

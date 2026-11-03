@@ -53,7 +53,9 @@ def day_range(day: _date) -> dict:
 
 
 def fetch_mt5(symbol: str, timeframe: str, bars: int, rng: dict | None = None) -> Bars:
-    import MetaTrader5 as mt5  # type: ignore
+    from ... import mt5api  # native MetaTrader5, or the mt5linux bridge on Linux
+
+    mt5 = mt5api.load()
 
     if not mt5.initialize():
         raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")

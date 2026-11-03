@@ -2,7 +2,7 @@
 Description=Aureon MT5 bot: hang check every minute
 
 [Timer]
-OnBootSec=2min
+OnActiveSec=2min
 OnUnitActiveSec=60s
 
 [Install]

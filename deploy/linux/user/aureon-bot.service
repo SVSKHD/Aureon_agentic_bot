@@ -1,0 +1,25 @@
+# The Aureon bot on native Linux Python, using MetaTrader5 through mt5linux
+# (AUREON_MT5_BACKEND=mt5linux, aureon_mt5/mt5api.py). Settings come from the repo's .env.
+# Restarts on every exit (0 planned, 1 unplanned, 75 restart) like the Windows launcher loop, and
+# together with the mt5linux server (PartOf), whose restart drops the bot's connection.
+[Unit]
+Description=Aureon MT5 bot (Linux, via mt5linux)
+Wants=aureon-mt5linux.service
+After=aureon-mt5linux.service network-online.target
+PartOf=aureon-mt5linux.service
+
+[Service]
+WorkingDirectory=/srv/projects/Aureon_agentic_bot
+Environment=AUREON_MT5_BACKEND=mt5linux
+Environment=AUREON_MT5LINUX_HOST=127.0.0.1
+Environment=AUREON_MT5LINUX_PORT=18812
+Environment=PYTHONUNBUFFERED=1
+# Wait (up to 3 min) for the mt5linux server to listen before starting.
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 90); do (exec 3<>/dev/tcp/127.0.0.1/18812) 2>/dev/null && exit 0; sleep 2; done; echo "mt5linux not listening on 127.0.0.1:18812"; exit 1'
+ExecStart=%h/.local/share/aureon-bot/venv/bin/python main.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target
