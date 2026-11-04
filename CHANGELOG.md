@@ -26,6 +26,13 @@ Format: `vMAJOR.MINOR.PATCH` · one entry per tag · strategy-rule changes are a
   it. systemd **user** units in `deploy/linux/user/` (Xvfb :1, x11vnc on localhost, wineserver, terminal, mt5linux, bot,
   hang watch); the earlier system units in `deploy/linux/` are removed. `requirements.txt`: `rpyc==5.2.3` off Windows.
   `tests/test_mt5api.py`.
+- **Trade origins (`docs/TRADE_ORIGINS.md`)**: every order the bot sends carries its magic number (`AUREON_MAGIC`,
+  default **261103**; market, pending, close, partial close: one extra request field, no decision changes). The push
+  bridge gains a `trades` section: deal history (incremental from the last acknowledged deal, plus a 7-day backfill at
+  start and every 24 h) and all open positions, each classified `bot` / `manual` / `unknown` with `guardian_touched`
+  for manual positions the guardian acted on. Read by `aureon_mt5/trade_history.py` (`history_deals_get`,
+  `history_orders_get`, `positions_get`, `account_info` only), injected by `main.py`; the bridge still imports no MT5.
+  `tests/test_trade_history.py`.
 - Strategy rules changed: NO
 
 ## v3.0.0 — 2026-11-01  (MAJOR: new autonomous mode `ema921e`; the existing modes' rules unchanged)

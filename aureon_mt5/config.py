@@ -83,6 +83,7 @@ class Config:
     allow_live: bool = os.environ.get("AUREON_ALLOW_LIVE", "0") == "1"
     filling: str = os.environ.get("AUREON_FILLING", "ioc").strip().lower()      # v2.16.1: ioc | fok | return (fallback on 10030)
     max_lots: float = _num("AUREON_MAX_LOTS", "1.0", float)
+    magic: int = _num("AUREON_MAGIC", "261103", int)                                # v2.x: tags every bot order (docs/TRADE_ORIGINS.md)
     entry_921: str = os.environ.get("AUREON_921_ENTRY", "ema9touch").strip().lower()    # v2.18.0 default ema9touch · market | limit (v2.17.0)
     lot: float = _num("AUREON_LOT", "1", float)
     max_symbols: int = _num("AUREON_MAX_SYMBOLS", "8", int)                           # v2.18.1: /attach cap                                       # v2.18.0: the lot the TRADE card prices TP / SL at

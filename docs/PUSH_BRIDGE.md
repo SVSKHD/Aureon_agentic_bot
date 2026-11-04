@@ -57,6 +57,7 @@ A superset of `aureon.mt5.status/v1` (every v1 key, same meaning — see `docs/S
 | `tracebacks` | exceptions since the last acknowledged push (max 20, text ≤ 8 KiB): `{id, t, where, type, message, traceback}` |
 | `strategy` | `{mode, symbols, exec_tf, timeframes, ema: {fast, slow}, params}` |
 | `candles` | `{SYM: {TF: [{t, o, h, l, c, v, ema: {"<fast>": x, "<slow>": y}}]}}` |
+| `trades` | deal history (incremental + a daily 7-day backfill) and all open positions, each with `origin` (`bot`/`manual`/`unknown`), `actor`, `magic`, `reason`, `guardian_touched`: docs/TRADE_ORIGINS.md. The one section read from MT5 (`aureon_mt5/trade_history.py`, read-only calls, injected by main.py) |
 
 Notes:
 
@@ -78,7 +79,8 @@ Notes:
   newest events are held back; the cursor stops before them so they go on the next push, in order. Nothing is lost.
   `errors.candles` / `errors.events` say when this happened.
 - **Secrets**: any key containing `token`, `auth`, `password`, `secret`, `webhook`, `url`, `login` or `account` is
-  dropped at every depth before sending. No account number, balance or login is in the document.
+  dropped at every depth before sending. No account number, balance or login is in the document (`trades.acct` is a
+  hash of server + login).
 
 ## Linux (the Aureon server itself)
 

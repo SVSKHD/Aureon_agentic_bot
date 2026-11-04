@@ -45,6 +45,9 @@ EVENTS = sx.EVENTS | frozenset({
     "trail_update", "structure_sl", "pending_filled", "pending_expired", "pending_cancelled", "agent_crash",
     "signal_suppressed", "cross_skipped", "pre_timeout_hold", "self_restart", "state_rebuilt", "entry_blocked_htf",
 })
+# Journal rows that mean the guardian acted on a ticket (a manual position with one becomes guardian_touched).
+GUARDIAN_EVENTS = frozenset({"protected", "secured", "trail_update", "structure_sl", "locked", "early_lock",
+                             "soft_lock_exit", "partial", "closed_by_rule", "exit", "pre_cross"})
 # A key containing any of these (case-insensitive) is dropped at every depth.
 SECRET_PARTS = tuple(sorted(set(sx.DROP_FIELDS) | {"token", "auth", "password", "secret", "webhook", "url", "login",
                                                    "account"}))
@@ -342,12 +345,34 @@ def candles_section(cfg, agents: dict, n: int) -> dict:
     return out
 
 
+def _server_offset(doc: dict) -> float:
+    """Broker server time − UTC in hours, as the agents measured it (status/v1 agents.*.offset_h)."""
+    for a in (doc.get("agents") or {}).values():
+        off = _num((a or {}).get("offset_h")) if isinstance(a, dict) else None
+        if off is not None:
+            return off
+    return 0.0
+
+
+def _touched(pend, guardian) -> set:
+    """Tickets the guardian acted on: guardian journal rows in this push, and tickets it holds state for right now."""
+    out = set()
+    for _, ev, _ in pend or []:
+        if ev.get("event") in GUARDIAN_EVENTS and ev.get("ticket") is not None:
+            out.add(ev["ticket"])
+    for rows in (guardian or {}).values():
+        for r in rows or []:
+            if r.get("ticket") is not None:
+                out.add(r["ticket"])
+    return out
+
+
 # ----------------------------------------------------------------------------- the bridge
 class PushBridge:
     """Daemon thread: build → trim → POST → advance the cursor on 2xx. stop() ends it."""
 
     def __init__(self, settings: Settings, build_base, *, cfg=None, agents=None, notify=None, log=None, opener=None,
-                 clock=_time.time):
+                 clock=_time.time, trades=None):
         self.settings, self.build_base = settings, build_base
         self.cfg, self.agents, self.notify = cfg, agents if agents is not None else {}, notify
         self.log = log or (lambda msg: None)
@@ -356,6 +381,9 @@ class PushBridge:
         self.seq = 0
         self.journal_path = os.path.join(settings.log_dir, "journal.jsonl")
         cur = self._load_cursor()
+        self.trades = trades                       # trade_history.Collector (injected by main.py: this module never reads MT5)
+        if trades is not None:
+            trades.restore(cur.get("trades") or {})
         self.cursor: int | None = cur.get("journal_offset")
         self.tb_acked_t: float = float(cur.get("tb_t") or clock())
         self.min_t: int | None = None if self.cursor is not None else int(clock()) - settings.journal_hours * 3600
@@ -379,7 +407,10 @@ class PushBridge:
 
     def _save_cursor(self) -> None:
         try:
-            sx.write_atomic(self.settings.cursor_path, {"journal_offset": self.cursor, "tb_t": self.tb_acked_t})
+            doc = {"journal_offset": self.cursor, "tb_t": self.tb_acked_t}
+            if self.trades is not None:
+                doc["trades"] = self.trades.state()
+            sx.write_atomic(self.settings.cursor_path, doc)
         except OSError:
             pass
 
@@ -475,6 +506,9 @@ class PushBridge:
         recent = section("tracebacks", self._recent_tracebacks, [])
         doc["strategy"] = section("strategy", lambda: strategy_section(self.cfg, self.agents), None)
         doc["candles"] = section("candles", lambda: candles_section(self.cfg, self.agents, self.settings.candles), {})
+        if self.trades is not None:
+            doc["trades"] = section("trades", lambda: self.trades.collect(
+                off_h=_server_offset(doc), touched=_touched(pend, doc.get("guardian"))), None)
 
         # size cap: candles first, then the newest events (the cursor stops before them, so they go next time)
         recent_tbs = [{k: v for k, v in r.items() if k != "_t"} for r in recent]
@@ -533,6 +567,8 @@ class PushBridge:
             self.last_status = code
             if 200 <= code < 300:
                 self.cursor, self.tb_acked_t, self.min_t = cut, tb_t, None
+                if self.trades is not None:
+                    self.trades.commit()
                 self._save_cursor()
                 self.last_ok = self.clock()
                 if self._failing:
@@ -564,7 +600,8 @@ class PushBridge:
         self._stop.set()
 
 
-def start(cfg, agents: dict, *, notify=None, state_fn=None, ema921e_fn=None, started=None, log=print, env=None, opener=None):
+def start(cfg, agents: dict, *, notify=None, state_fn=None, ema921e_fn=None, started=None, log=print, env=None, opener=None,
+          trades=None):
     """main.py's one call. Returns the running PushBridge, or None when AUREON_PUSH_ENABLED is not 1 or it cannot start."""
     log_dir = getattr(cfg, "log_dir", "logs") or "logs"
     settings = Settings(env, log_dir=log_dir)
@@ -579,7 +616,7 @@ def start(cfg, agents: dict, *, notify=None, state_fn=None, ema921e_fn=None, sta
     bt = sx.BacktestCache(st.backtest_dir)
     bridge = PushBridge(settings, lambda: sx.build_status(cfg, agents, settings=st, state_fn=state_fn, ema921e_fn=ema921e_fn,
                                                           backtests=bt, started=started),
-                        cfg=cfg, agents=agents, notify=notify, log=log, opener=opener)
+                        cfg=cfg, agents=agents, notify=notify, log=log, opener=opener, trades=trades)
     bridge.start()
     log(f"aureon push: POST every {settings.interval_s} s to {settings.url}" + (" (gzip)" if settings.gzip else ""))
     return bridge
