@@ -591,9 +591,10 @@ def main():
     push_bridge = None                                             # read-only push to the Aureon server
     if os.environ.get("AUREON_PUSH_ENABLED", "0").strip() == "1":    # (off by default; docs/PUSH_BRIDGE.md)
         try:
-            from aureon_mt5 import console as _cs2, push_bridge as _pb
+            from aureon_mt5 import console as _cs2, push_bridge as _pb, trade_history as _th
             push_bridge = _pb.start(
                 cfg, agents, notify=notify, started=started, ema921e_fn=lambda: e_wiring.get(e_holder),
+                trades=_th.Collector(),                            # read-only deal history + open positions
                 state_fn=lambda: _cs2.console_state(cfg, agents, actions, notify, started=started))
         except Exception as e:                                     # never stops the bot (the token is never in e)
             print(f"aureon push off: {type(e).__name__}")

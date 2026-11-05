@@ -2,6 +2,7 @@
 Degrades to synthetic bars / no-ops when MT5 is absent (dry runs). Never calls mt5.shutdown() except in close_connection()."""
 from __future__ import annotations
 
+import os
 import threading
 import time as _time
 from contextlib import contextmanager
@@ -247,6 +248,19 @@ def digits(symbol: str) -> int:
 
 # ----------------------------------------------------------------------------- orders
 # ----------------------------------------------------------------------------- v2.16.2 stops validation
+DEFAULT_MAGIC = 261103
+
+
+def bot_magic() -> int:
+    """The magic number on every order this bot sends (AUREON_MAGIC, default 261103). It only labels the bot's own
+    orders and deals so trades can be told apart from manual ones (docs/TRADE_ORIGINS.md); it changes no decision."""
+    try:
+        v = int(str(os.environ.get("AUREON_MAGIC", "") or DEFAULT_MAGIC).strip())
+    except ValueError:
+        return DEFAULT_MAGIC
+    return v if 0 < v < 2**63 else DEFAULT_MAGIC
+
+
 SINK = {"log": None, "alert": None}   # main wires journal.log and a red health card; broker itself never needs Discord
 INVALID_STOPS = 10016                 # TRADE_RETCODE_INVALID_STOPS
 STOPS_COOLDOWN_S = 300.0
@@ -431,7 +445,7 @@ def close(ticket: int, symbol: str, comment: str = "aureon") -> BrokerResult:
         is_buy = p.type == m.POSITION_TYPE_BUY
         req = {"action": m.TRADE_ACTION_DEAL, "position": ticket, "symbol": symbol, "volume": p.volume,
                "type": m.ORDER_TYPE_SELL if is_buy else m.ORDER_TYPE_BUY, "price": tick.bid if is_buy else tick.ask,
-               "deviation": 30, "comment": comment[:31]}
+               "deviation": 30, "magic": bot_magic(), "comment": comment[:31]}
         r, used = _send_filled(m, req)                     # v2.16.1: AUREON_FILLING, fallback on INVALID_FILL only
     if r is None:
         return BrokerResult(False, "BROKER_REJECTED", comment="order_send returned None", last_error=_err())
@@ -502,7 +516,7 @@ def place_market(symbol: str, side: str, lots: float, sl: float | None = None, c
                 return BrokerResult(False, "BROKER_REJECTED", comment="no tick", last_error=_err())
             req = {"action": m.TRADE_ACTION_DEAL, "symbol": symbol, "volume": float(lots),
                    "type": m.ORDER_TYPE_BUY if is_buy else m.ORDER_TYPE_SELL, "price": t.ask if is_buy else t.bid,
-                   "deviation": 30, "comment": comment[:31]}
+                   "deviation": 30, "magic": bot_magic(), "comment": comment[:31]}
             si = stops_info(m, symbol)                       # v2.16.2: clamp to the stops / freeze level, correct side
             req_sl = round(float(sl), si["digits"]) if sl is not None else None
             req_tp = round(float(tp), si["digits"]) if tp is not None else None
@@ -568,7 +582,7 @@ def place_pending(symbol: str, side: str, lots: float, level: float, sl: float |
         si = stops_info(m, symbol); d = si["digits"]
         req = {"action": getattr(m, "TRADE_ACTION_PENDING", 5), "symbol": symbol, "volume": float(lots),
                "type": getattr(m, "ORDER_TYPE_BUY_LIMIT", 2) if is_buy else getattr(m, "ORDER_TYPE_SELL_LIMIT", 3),
-               "price": round(float(level), d), "deviation": 30, "comment": comment[:31],
+               "price": round(float(level), d), "deviation": 30, "magic": bot_magic(), "comment": comment[:31],
                "type_time": getattr(m, "ORDER_TIME_SPECIFIED", 2), "expiration": int(expiration)}
         if sl is not None:
             req["sl"] = round(float(sl), d)
@@ -675,7 +689,7 @@ def close_partial(ticket: int, symbol: str, fraction: float, comment: str = "aur
         is_buy = p.type == m.POSITION_TYPE_BUY
         req = {"action": m.TRADE_ACTION_DEAL, "position": ticket, "symbol": symbol, "volume": vol,
                "type": m.ORDER_TYPE_SELL if is_buy else m.ORDER_TYPE_BUY, "price": tick_.bid if is_buy else tick_.ask,
-               "deviation": 30, "comment": comment[:31], "type_filling": m.ORDER_FILLING_IOC}
+               "deviation": 30, "magic": bot_magic(), "comment": comment[:31], "type_filling": m.ORDER_FILLING_IOC}
         r = m.order_send(req)
     if r is None:
         return BrokerResult(False, "BROKER_REJECTED", comment="order_send returned None", last_error=_err())
